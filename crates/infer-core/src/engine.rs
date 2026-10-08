@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -202,6 +202,36 @@ impl NgramModel {
             .collect();
     }
 
+    /// Fold another table into this one, adding counts.
+    ///
+    /// Used when the cache file on disk has moved on since it was read: without
+    /// this, writing this process's table over it discards whatever the other
+    /// one learned, and the larger cache the two of them should share never
+    /// forms.
+    pub(crate) fn merge(&mut self, other: &NgramModel) {
+        if other.order != self.order || other.entries.is_empty() {
+            return;
+        }
+        let mut merged: BTreeMap<Vec<i32>, BTreeMap<i32, u32>> = self
+            .entries
+            .drain(..)
+            .map(|(ctx, followers)| (ctx, followers.into_iter().collect()))
+            .collect();
+        for (ctx, followers) in &other.entries {
+            let slot = merged.entry(ctx.clone()).or_default();
+            for (tok, count) in followers {
+                *slot.entry(*tok).or_insert(0) += *count;
+            }
+        }
+        self.entries = merged
+            .into_iter()
+            .map(|(ctx, followers)| (ctx, followers.into_iter().collect()))
+            .collect();
+        // Merging can push past the cap; keeping the first `MAX` keeps the
+        // bound real instead of approximate.
+        self.entries.truncate(NGRAM_CACHE_MAX_CONTEXTS);
+    }
+
     fn followers(&self, ctx: &[i32]) -> Option<&Vec<(i32, u32)>> {
         self.entries
             .binary_search_by(|(key, _)| key.as_slice().cmp(ctx))
@@ -288,6 +318,29 @@ impl DraftCache {
         self.saturated = self.model.contexts() >= NGRAM_CACHE_MAX_CONTEXTS;
 
         let Some(path) = &self.path else { return };
+        // Before the lock: `create_new` will not make a missing directory, so
+        // asking for the lock first would fail on a first run and quietly skip
+        // every write.
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        if let Some(dir) = parent {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!(error = %e, path = %dir.display(), "could not create the n-gram cache directory");
+                return;
+            }
+        }
+        let Some(_lock) = lock_table(path) else {
+            // Another process is mid-write. The table is a cache, and this
+            // process will try again after its next reply, so skipping costs
+            // nothing — racing would cost both tables.
+            return;
+        };
+        // Fold in whatever landed on disk since this table was read, so the
+        // write adds to the shared cache instead of replacing it.
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if let Ok(on_disk) = serde_json::from_str::<NgramModel>(&raw) {
+                self.model.merge(&on_disk);
+            }
+        }
         let raw = match serde_json::to_string(&self.model) {
             Ok(raw) => raw,
             Err(e) => {
@@ -298,13 +351,6 @@ impl DraftCache {
         // Write via a temporary file so a crash mid-write cannot leave a
         // half-written table that fails to parse on the next start.
         let tmp = path.with_extension("tmp");
-        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-        if let Some(dir) = parent {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                tracing::warn!(error = %e, path = %dir.display(), "could not create the n-gram cache directory");
-                return;
-            }
-        }
         if let Err(e) = std::fs::write(&tmp, raw) {
             tracing::warn!(error = %e, path = %tmp.display(), "could not write the n-gram table");
             return;
@@ -318,6 +364,51 @@ impl DraftCache {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn contexts(&self) -> usize {
         self.model.contexts()
+    }
+}
+
+/// A lock file held while the n-gram table is rewritten.
+struct FileLock(PathBuf);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Take an exclusive lock beside `path`, or give up.
+///
+/// Two engines pointed at the same cache file both read, extend and rewrite it
+/// under the same temporary name. The lock makes an update exclusive; one left
+/// behind by a process that died is broken once it is old enough to be stale
+/// rather than active.
+fn lock_table(path: &Path) -> Option<FileLock> {
+    let lock = path.with_extension("lock");
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(_) => return Some(FileLock(lock)),
+            Err(_) => {
+                let age = std::fs::metadata(&lock)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok());
+                if let Some(age) = age {
+                    if age > std::time::Duration::from_secs(120) {
+                        let _ = std::fs::remove_file(&lock);
+                        continue;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
 }
 /// Static facts about a loaded model, resolved once at load time.
@@ -374,6 +465,9 @@ enum Command {
         documents: Vec<String>,
         reply: Sender<Result<RerankResult>>,
     },
+    /// Nothing to run: a liveness probe. The send only fails once the
+    /// receiving end is gone, which is what tells `/health` a worker has died.
+    Ping,
     Shutdown,
 }
 
@@ -411,6 +505,20 @@ pub struct EngineHandle {
 impl EngineHandle {
     pub fn info(&self) -> &EngineInfo {
         &self.info
+    }
+
+    /// Whether the worker thread is still there.
+    ///
+    /// The send only fails when the receiving end has been dropped, which is
+    /// exactly when the worker has exited — after a panic, or after a
+    /// shutdown. That is what lets a caller tell the difference between a model
+    /// that is loaded and a model that can still answer, instead of reporting
+    /// every request as "worker gone" with no idea when it happened.
+    pub fn is_alive(&self) -> bool {
+        self.tx
+            .lock()
+            .map(|tx| tx.send(Command::Ping).is_ok())
+            .unwrap_or(false)
     }
 
     /// Run one completion, invoking `on_token` for every decoded text chunk.
@@ -585,10 +693,15 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
         }
     };
 
-    let _ = ready.send(LoadEvent::Phase(format!(
-        "loading model {}",
-        cfg.model_path.display()
-    )));
+    // The file name, not the path: this line goes to a log that lives on disk
+    // indefinitely, and a full path is a piece of someone's directory layout
+    // that nothing here needs to remember.
+    let file = cfg
+        .model_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "model".to_string());
+    let _ = ready.send(LoadEvent::Phase(format!("loading model {file}")));
     let model_params = LlamaModelParams::default()
         .with_n_gpu_layers(cfg.n_gpu_layers)
         .with_main_gpu(cfg.main_gpu)
@@ -768,7 +881,23 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
     // one-float buffer as if it were `n_embd` floats wide, and generating from
     // an encoder samples logits that were never computed.
     while let Ok(cmd) = rx.recv() {
-        match cmd {
+        // Probes and shutdown are handled here, outside the catch: neither can
+        // panic worth catching, and `break` cannot be reached from inside the
+        // closure anyway.
+        if matches!(cmd, Command::Ping) {
+            continue;
+        }
+        if matches!(cmd, Command::Shutdown) {
+            break;
+        }
+
+        // A panic anywhere below — a sampler handed a context that cannot
+        // sample, a shape llama.cpp did not expect — used to take this thread
+        // down silently. The model stayed in the daemon's map, every later
+        // request failed with "worker gone", and nothing said when or why.
+        // Catching it keeps the thread alive and reports the failure instead.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match cmd {
+            Command::Ping => {}
             Command::Generate {
                 msgs,
                 params,
@@ -779,27 +908,23 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
                         class: class.as_str().to_string(),
                         what: "generate text; load a chat model (class llm)".into(),
                     }));
-                    continue;
-                }
-                if let Err(e) = params.validate() {
+                } else if let Err(e) = params.validate() {
                     let _ = reply.send(GenEvent::Error(e));
-                    continue;
-                }
-                if let Err(e) = run_generate(
+                } else if let Err(e) = run_generate(
                     &model, &mut ctx, &vision, &msgs, &params, &reply, &mut cache,
                 ) {
                     let _ = reply.send(GenEvent::Error(e));
                 }
             }
             Command::Embed { texts, reply } => {
-                if class != gguf_probe::ModelClass::Embedding {
-                    let _ = reply.send(Err(InferError::Unsupported {
+                let result = if class != gguf_probe::ModelClass::Embedding {
+                    Err(InferError::Unsupported {
                         class: class.as_str().to_string(),
                         what: "produce embeddings; load an embedding model".into(),
-                    }));
-                    continue;
-                }
-                let result = run_embed(&model, &mut ctx, &texts);
+                    })
+                } else {
+                    run_embed(&model, &mut ctx, &texts)
+                };
                 let _ = reply.send(result);
             }
             Command::Rerank {
@@ -807,19 +932,34 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
                 documents,
                 reply,
             } => {
-                if class != gguf_probe::ModelClass::Rerank {
-                    let _ = reply.send(Err(InferError::Unsupported {
+                let result = if class != gguf_probe::ModelClass::Rerank {
+                    Err(InferError::Unsupported {
                         class: class.as_str().to_string(),
                         what: "score documents; load a rerank model".into(),
-                    }));
-                    continue;
-                }
-                let result = run_rerank(&model, &mut ctx, &query, &documents);
+                    })
+                } else {
+                    run_rerank(&model, &mut ctx, &query, &documents)
+                };
                 let _ = reply.send(result);
             }
-            Command::Shutdown => break,
+            Command::Shutdown => {}
+        }));
+
+        if let Err(payload) = outcome {
+            tracing::error!("inference worker panicked: {}", panic_message(&payload));
         }
     }
+}
+
+/// The message a panic payload carries, if it has one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "no message".to_string()
 }
 
 /// How many floats one sequence's output buffer actually holds.
@@ -859,6 +999,17 @@ fn sequence_output(ctx: &LlamaContext, model: &LlamaModel) -> Result<Vec<f32>> {
     // SAFETY: `ptr` belongs to the context that was just decoded, and `n` is
     // the width llama.cpp allocated for this pooling type.
     Ok(unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec())
+}
+
+/// Scale a vector to unit length, leaving a zero vector alone.
+fn normalize(v: &mut [f32]) {
+    let sum: f32 = v.iter().map(|x| x * x).sum();
+    if sum > 0.0 && sum.is_finite() {
+        let inv = sum.sqrt().recip();
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
+    }
 }
 
 /// Embed a batch of texts, one forward pass each.
@@ -911,7 +1062,12 @@ fn run_embed(model: &LlamaModel, ctx: &mut LlamaContext, texts: &[String]) -> Re
             ))
         })?;
 
-        let vector = sequence_output(ctx, model)?;
+        let mut vector = sequence_output(ctx, model)?;
+        // Unit length, which is what the OpenAI-shaped API and llama.cpp's own
+        // server return. Raw pooled output makes a dot product depend on how
+        // long the text was, so two documents would compare differently than
+        // any client doing cosine similarity expects.
+        normalize(&mut vector);
         vectors.push(vector);
     }
 

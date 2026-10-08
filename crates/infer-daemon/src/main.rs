@@ -197,7 +197,10 @@ async fn main() -> anyhow::Result<()> {
         let n_ctx = cfg.n_ctx;
         let load_mtp = cfg.load_mtp;
 
-        tracing::info!(%id, ?path, "loading startup model");
+        // The file name reaches the log; the full path does not. A log that
+        // lives on disk indefinitely does not need a record of where the user
+        // keeps their models.
+        tracing::info!(%id, "loading startup model");
         let engine = tokio::task::spawn_blocking(move || {
             Engine::load(cfg, |ev| tracing::info!(?ev, "load"))
         })
@@ -221,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
                 mmproj: None,
                 draft_model: None,
                 loras: Vec::new(),
+                in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
         );
         if first {
@@ -243,7 +247,14 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Some(k) => Some(Arc::new(k.to_string())),
-        None => None,
+        // The desktop app passes the token this way: an environment variable
+        // is not visible in `ps` or the task manager, which an `--api-key`
+        // argument is.
+        None => std::env::var("NEXLLAMA_API_KEY")
+            .ok()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .map(Arc::new),
     };
     if api_key.is_none() && !is_loopback(&args.host) && !args.allow_unauthenticated {
         anyhow::bail!(

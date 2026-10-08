@@ -140,13 +140,47 @@ fn bind_host(settings: &serde_json::Value) -> String {
 }
 
 /// Bearer token handed to the daemon, if the user configured one.
+/// Where the daemon's access token is kept in the OS credential store.
+const SECRET_SERVICE: &str = "com.nexllama.desktop";
+const SECRET_ACCOUNT: &str = "daemon-api-key";
+
+/// Read the access token from the OS credential store.
+///
+/// Settings live in a JSON file beside the app, readable by anything running as
+/// this user — which is where the token used to sit. Credential Manager, the
+/// keychain and the Secret Service are what a secret is for.
+fn secret() -> Option<String> {
+    let entry = keyring::Entry::new(SECRET_SERVICE, SECRET_ACCOUNT).ok()?;
+    entry.get_password().ok().filter(|s| !s.trim().is_empty())
+}
+
+/// Write the access token to the credential store, or remove it when empty.
+fn store_secret(value: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(SECRET_SERVICE, SECRET_ACCOUNT).map_err(|e| e.to_string())?;
+    if value.is_empty() {
+        return match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            // Nothing stored yet is the ordinary case for clearing a token.
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        };
+    }
+    entry.set_password(value).map_err(|e| e.to_string())
+}
+
+/// The token to hand the daemon.
+///
+/// The credential store wins; the copy in `settings.json` is only a fallback
+/// for a token saved before it moved, and is migrated out on the next save.
 fn api_key(settings: &serde_json::Value) -> Option<String> {
-    settings
-        .get("apiKey")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    secret().or_else(|| {
+        settings
+            .get("apiKey")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// Whether the current bind address is reachable from off this machine.
@@ -396,10 +430,33 @@ fn daemon_running(state: tauri::State<DaemonProc>) -> bool {
 ///
 /// The app starts it without a console, so this file is the only record of why a
 /// load failed or why the process vanished on startup.
+/// Largest daemon log kept before it is rotated away.
+const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
+
 fn daemon_log(app: &tauri::AppHandle) -> Option<PathBuf> {
     let dir = app.path().app_data_dir().ok()?;
     std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("daemon.log"))
+    let path = dir.join("daemon.log");
+    rotate_log(&path);
+    Some(path)
+}
+
+/// Keep the log from growing without bound.
+///
+/// It is opened in append mode and was never trimmed, so a long-lived install
+/// accumulated every load and every error forever — including model paths,
+/// which is someone's directory layout sitting on disk indefinitely. One
+/// generation is enough: the point is a bound, not an archive.
+fn rotate_log(path: &Path) {
+    let Ok(size) = std::fs::metadata(path).map(|m| m.len()) else {
+        return;
+    };
+    if size < MAX_LOG_BYTES {
+        return;
+    }
+    let backup = path.with_extension("log.1");
+    let _ = std::fs::remove_file(&backup);
+    let _ = std::fs::rename(path, &backup);
 }
 
 fn spawn_daemon(
@@ -460,8 +517,11 @@ fn spawn_daemon(
     }
     cmd.arg("--port").arg(DEFAULT_PORT.to_string());
     cmd.arg("--host").arg(&host);
+    // Passed through the environment rather than on the command line: a
+    // process's arguments are readable by every other process on this machine,
+    // and this is the one value here worth keeping out of them.
     if let Some(key) = api_key(&settings) {
-        cmd.arg("--api-key").arg(key);
+        cmd.env("NEXLLAMA_API_KEY", key);
     }
     // Speculative decoding learns which n-grams tend to be followed by what;
     // keeping that next to the settings means drafts survive a restart.
@@ -722,27 +782,80 @@ fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 fn load_settings(app: &tauri::AppHandle) -> serde_json::Value {
-    settings_path(app)
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}))
+    let path = match settings_path(app) {
+        Ok(p) => p,
+        Err(_) => return serde_json::json!({}),
+    };
+    // Every failure used to collapse into "no settings": a half-written file, a
+    // permission problem and a first run all looked the same, and the UI would
+    // then write the defaults straight back over whatever was really there.
+    match std::fs::read_to_string(&path) {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "nexllama: settings at {} are not valid JSON: {e}",
+                    path.display()
+                );
+                serde_json::json!({})
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => {
+            eprintln!(
+                "nexllama: could not read settings at {}: {e}",
+                path.display()
+            );
+            serde_json::json!({})
+        }
+    }
 }
 
-#[tauri::command]
-fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    let path = settings_path(&app)?;
-    match std::fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| e.to_string()),
-        Err(_) => Ok(serde_json::json!({})),
+/// Write the settings file atomically.
+///
+/// Writing in place truncates first, so a crash or a restart at the wrong
+/// moment leaves half a JSON document behind — which then reads as "no
+/// settings" and gets overwritten with defaults. Writing alongside and renaming
+/// is atomic within a directory on every platform this runs on.
+fn write_settings(app: &tauri::AppHandle, settings: &serde_json::Value) -> Result<(), String> {
+    let path = settings_path(app)?;
+    let text = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    match std::fs::rename(&tmp, &path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e.to_string())
+        }
     }
 }
 
 #[tauri::command]
+fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let mut settings = load_settings(&app);
+    // The token is not in the file, but the UI still has to show and copy it.
+    if let Some(obj) = settings.as_object_mut() {
+        obj.insert(
+            "apiKey".to_string(),
+            serde_json::Value::String(secret().unwrap_or_default()),
+        );
+    }
+    Ok(settings)
+}
+
+#[tauri::command]
 fn set_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<(), String> {
-    let path = settings_path(&app)?;
-    let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(path, text).map_err(|e| e.to_string())
+    let mut stored = settings;
+    // The token never reaches the file: it goes to the OS credential store, and
+    // any copy left there by an earlier version is dropped here.
+    if let Some(key) = stored.get("apiKey").and_then(|v| v.as_str()) {
+        store_secret(key.trim())?;
+        if let Some(obj) = stored.as_object_mut() {
+            obj.remove("apiKey");
+        }
+    }
+    write_settings(&app, &stored)
 }
 
 #[tauri::command]

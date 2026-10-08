@@ -22,6 +22,7 @@ zip = "2"
 sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
+keyring = "3"
 
 [dev-dependencies]
 rand = "0.8"

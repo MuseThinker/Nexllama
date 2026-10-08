@@ -187,6 +187,12 @@ can load models and spend GPU time on them. Pass --api-key <token>, bind to
 proxy that authenticates callers itself. An empty `--api-key ""` is an error
 rather than a silent way to switch authentication off.
 
+The desktop app keeps the token in the OS credential store — Credential
+Manager, the keychain, the Secret Service — and passes it to the daemon through
+`NEXLLAMA_API_KEY`, so it is neither written next to the settings file nor
+visible in the process's command line. The same variable works for a daemon you
+start yourself.
+
 Cross-origin requests are answered only for this app's own origins (the WebView
 it serves and the Vite dev server); add others with `--cors-origin <origin>`.
 The point is that opening a web page should not hand that page a way to drive
@@ -302,6 +308,10 @@ curl http://127.0.0.1:15656/v1/embeddings -H "Content-Type: application/json" \
 - **Texts are embedded one forward pass at a time.** Parallel sequences would
   need `n_seq_max` and a per-sequence batch layout for no gain at these request
   sizes.
+- **Vectors are returned at unit length**, as the OpenAI-shaped API and
+  llama.cpp's own server do. Raw pooled output would make a dot product depend
+  on the length of the text, so a client comparing two documents by cosine
+  similarity would get a different answer than it expects.
 - A text longer than the context is an error naming the limit, not a silent
   truncation — encoder contexts are small (512 for bge-small) and quietly
   cutting a document in half would give a confidently wrong vector.

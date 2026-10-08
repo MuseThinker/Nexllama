@@ -20,7 +20,7 @@ use infer_core::{
     ChatMsg, Engine, EngineHandle, FlashAttn, InferError, LoadMode, LoraAdapter, SamplerParams,
 };
 
-use crate::state::{AppState, DaemonState, Loaded};
+use crate::state::{AppState, DaemonState, InFlight, Loaded};
 
 /// Shared secret required on every request when set.
 pub type ApiKey = Option<Arc<String>>;
@@ -302,8 +302,26 @@ impl From<tokio::task::JoinError> for ApiError {
     }
 }
 
-async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn health(State(state): State<AppState>) -> Response {
     let guard = state.inner.lock().await;
+    // A model can sit in the map and still be unable to answer: its worker
+    // thread may have exited. Asking costs nothing, and answering "ok" while
+    // every loaded model is dead is what makes a readiness probe useless — the
+    // orchestrator never learns to restart this.
+    let dead: Vec<String> = guard
+        .models
+        .iter()
+        .filter(|(_, l)| !l.engine.handle().is_alive())
+        .map(|(id, _)| id.clone())
+        .collect();
+    if !dead.is_empty() {
+        tracing::error!(?dead, "loaded models are no longer answering");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "degraded", "unresponsive": dead })),
+        )
+            .into_response();
+    }
     Json(json!({
         "status": "ok",
         "models_loaded": guard.models.len(),
@@ -311,6 +329,7 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "default_model": guard.default_model,
         "keep_alive_secs": guard.keep_alive.as_secs(),
     }))
+    .into_response()
 }
 
 async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -570,7 +589,11 @@ async fn load(
         guard.keep_alive = std::time::Duration::from_secs(secs);
     }
     let now = Instant::now();
-    guard.models.insert(
+    // `insert` hands back whatever it displaced. Dropping an `Engine` waits for
+    // its worker thread to finish the reply it is decoding, which on this
+    // thread would block the async runtime — so a concurrent load of the same
+    // id could stall every other request for as long as a generation takes.
+    let displaced = guard.models.insert(
         id.clone(),
         Loaded {
             id: id.clone(),
@@ -585,10 +608,15 @@ async fn load(
             mmproj: req.mmproj.clone(),
             draft_model: req.draft_model.clone(),
             loras: req.lora.clone().unwrap_or_default(),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         },
     );
     if guard.default_model.is_none() || req.set_default.unwrap_or(false) {
         guard.default_model = Some(id.clone());
+    }
+    drop(guard);
+    if let Some(old) = displaced {
+        let _ = tokio::task::spawn_blocking(move || drop(old)).await;
     }
 
     Ok(Json(
@@ -866,7 +894,7 @@ struct EmbedRequest {
 async fn chat_engine(
     state: &AppState,
     requested: Option<&str>,
-) -> ApiResult<(EngineHandle, String)> {
+) -> ApiResult<(EngineHandle, String, InFlight)> {
     let mut guard = state.inner.lock().await;
     let id = require_model(&guard, requested)?;
     // Encoder models decode nothing: their tokens are probabilities, not a
@@ -882,8 +910,8 @@ async fn chat_engine(
         )));
     }
     let engine = guard.models.get(&id).expect("resolved").engine.handle();
-    guard.touch(&id);
-    Ok((engine, id))
+    let active = guard.begin(&id).expect("resolved");
+    Ok((engine, id, active))
 }
 
 /// `YYYY-MM-DDThh:mm:ssZ` from the system clock.
@@ -1002,14 +1030,14 @@ async fn ollama_chat(
     State(state): State<AppState>,
     Json(req): Json<OllamaChatRequest>,
 ) -> Result<Response, ApiError> {
-    let (handle, model_id) = chat_engine(&state, req.model.as_deref()).await?;
+    let (handle, model_id, active) = chat_engine(&state, req.model.as_deref()).await?;
     let msgs: Vec<ChatMsg> = req
         .messages
         .iter()
         .map(|m| ChatMsg::new(m.role.clone(), m.content.clone()))
         .collect();
     let params = sampler_from_options(&SamplerParams::default(), req.options.as_ref());
-    Ok(ollama_stream(handle, model_id, msgs, params, req.stream, true).await)
+    Ok(ollama_stream(handle, model_id, active, msgs, params, req.stream, true).await)
 }
 
 /// `POST /api/generate` — Ollama's single-prompt route.
@@ -1020,14 +1048,14 @@ async fn ollama_generate(
     State(state): State<AppState>,
     Json(req): Json<OllamaGenerateRequest>,
 ) -> Result<Response, ApiError> {
-    let (handle, model_id) = chat_engine(&state, req.model.as_deref()).await?;
+    let (handle, model_id, active) = chat_engine(&state, req.model.as_deref()).await?;
     let mut msgs = Vec::new();
     if let Some(system) = req.system.filter(|s| !s.trim().is_empty()) {
         msgs.push(ChatMsg::new("system", system));
     }
     msgs.push(ChatMsg::new("user", req.prompt.clone()));
     let params = sampler_from_options(&SamplerParams::default(), req.options.as_ref());
-    Ok(ollama_stream(handle, model_id, msgs, params, req.stream, false).await)
+    Ok(ollama_stream(handle, model_id, active, msgs, params, req.stream, false).await)
 }
 
 /// Build one Ollama reply object. A present `stats` marks the final line.
@@ -1063,6 +1091,7 @@ fn ollama_reply(
 async fn ollama_stream(
     handle: EngineHandle,
     model_id: String,
+    active: InFlight,
     msgs: Vec<ChatMsg>,
     params: SamplerParams,
     stream: bool,
@@ -1070,6 +1099,9 @@ async fn ollama_stream(
 ) -> Response {
     if !stream {
         let generated = tokio::task::spawn_blocking(move || {
+            // Held until the reply is finished: the idle timer cannot be
+            // allowed to unload this model while it is still generating.
+            let _active = active;
             let mut out = String::new();
             let stats = handle.generate(&msgs, &params, |t| {
                 out.push_str(t);
@@ -1090,6 +1122,9 @@ async fn ollama_stream(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, Infallible>>(64);
     tokio::task::spawn_blocking(move || {
+        // Held for as long as the stream runs, which outlives this handler by
+        // however long the reply takes.
+        let _active = active;
         let stream_tx = tx.clone();
         let result = handle.generate(&msgs, &params, |t| {
             // Returning `false` stops the generation. The send fails exactly
@@ -1175,9 +1210,13 @@ async fn embeddings(
     Json(req): Json<EmbedRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let texts = embed_inputs(&req.input)?;
-    let (handle, model_id) = embed_engine(&state, req.model.as_deref()).await?;
+    let (handle, model_id, active) = embed_engine(&state, req.model.as_deref()).await?;
 
-    let result = tokio::task::spawn_blocking(move || handle.embed(&texts)).await??;
+    let result = tokio::task::spawn_blocking(move || {
+        let _active = active;
+        handle.embed(&texts)
+    })
+    .await??;
 
     let data: Vec<serde_json::Value> = result
         .vectors
@@ -1257,7 +1296,7 @@ async fn rerank(
         return Err(ApiError::NotFound("documents must not be empty".into()));
     }
 
-    let (handle, model_id) = {
+    let (handle, model_id, active) = {
         let mut guard = state.inner.lock().await;
         let id = require_model(&guard, req.model.as_deref())?;
         let class = guard
@@ -1271,13 +1310,17 @@ async fn rerank(
             )));
         }
         let handle = guard.models.get(&id).expect("resolved").engine.handle();
-        guard.touch(&id);
-        (handle, id)
+        let active = guard.begin(&id).expect("resolved");
+        (handle, id, active)
     };
 
     let query = req.query.clone();
     let documents = req.documents.clone();
-    let result = tokio::task::spawn_blocking(move || handle.rerank(&query, &documents)).await??;
+    let result = tokio::task::spawn_blocking(move || {
+        let _active = active;
+        handle.rerank(&query, &documents)
+    })
+    .await??;
 
     let ranked = rank_order(&result.scores, req.top_n);
 
@@ -1313,8 +1356,12 @@ async fn ollama_embed(
     Json(req): Json<OllamaEmbedRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let texts = embed_inputs(&req.input)?;
-    let (handle, model_id) = embed_engine(&state, req.model.as_deref()).await?;
-    let result = tokio::task::spawn_blocking(move || handle.embed(&texts)).await??;
+    let (handle, model_id, active) = embed_engine(&state, req.model.as_deref()).await?;
+    let result = tokio::task::spawn_blocking(move || {
+        let _active = active;
+        handle.embed(&texts)
+    })
+    .await??;
     Ok(Json(json!({
         "model": model_id,
         "embeddings": result.vectors,
@@ -1334,9 +1381,13 @@ async fn ollama_embeddings_legacy(
     State(state): State<AppState>,
     Json(req): Json<OllamaLegacyEmbedRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (handle, _) = embed_engine(&state, req.model.as_deref()).await?;
+    let (handle, _, active) = embed_engine(&state, req.model.as_deref()).await?;
     let texts = vec![req.prompt.clone()];
-    let result = tokio::task::spawn_blocking(move || handle.embed(&texts)).await??;
+    let result = tokio::task::spawn_blocking(move || {
+        let _active = active;
+        handle.embed(&texts)
+    })
+    .await??;
     let embedding = result.vectors.into_iter().next().unwrap_or_default();
     Ok(Json(json!({ "embedding": embedding })))
 }
@@ -1345,7 +1396,7 @@ async fn ollama_embeddings_legacy(
 async fn embed_engine(
     state: &AppState,
     requested: Option<&str>,
-) -> ApiResult<(EngineHandle, String)> {
+) -> ApiResult<(EngineHandle, String, InFlight)> {
     let mut guard = state.inner.lock().await;
     let id = require_model(&guard, requested)?;
     let class = guard
@@ -1359,21 +1410,22 @@ async fn embed_engine(
         )));
     }
     let engine = guard.models.get(&id).expect("resolved").engine.handle();
-    guard.touch(&id);
-    Ok((engine, id))
+    let active = guard.begin(&id).expect("resolved");
+    Ok((engine, id, active))
 }
 
 async fn chat(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
-    let (handle, model_id) = chat_engine(&state, req.model.as_deref()).await?;
+    let (handle, model_id, active) = chat_engine(&state, req.model.as_deref()).await?;
 
     let params = req.sampler();
     let msgs = req.chat_msgs()?;
 
     if !req.stream {
         let (text, stats) = tokio::task::spawn_blocking(move || {
+            let _active = active;
             let mut out = String::new();
             let stats = handle.generate(&msgs, &params, |t| {
                 out.push_str(t);
@@ -1410,6 +1462,9 @@ async fn chat(
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
     tokio::task::spawn_blocking(move || {
+        // Held for as long as the stream runs, which outlives this handler by
+        // however long the reply takes.
+        let _active = active;
         let stream_tx = tx.clone();
         let mut first_chunk = true;
         let result = handle.generate(&msgs, &params, |t| {

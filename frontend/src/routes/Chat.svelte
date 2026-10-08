@@ -1,5 +1,5 @@
 <script>
-import { onMount } from 'svelte';
+import { onDestroy, onMount } from 'svelte';
 import { daemon } from '../lib/api.js';
 import { t } from '../lib/i18n.js';
 
@@ -41,16 +41,37 @@ async function addImages(files) {
       error = `${file.name}: ${(file.size / 1048576).toFixed(1)} MB exceeds the 4 MB limit`;
       continue;
     }
-    const b64 = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result).split(',')[1]);
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(file);
-    });
+    let b64;
+    try {
+      b64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(',')[1]);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+    } catch {
+      // One unreadable file must not abandon the rest of the selection.
+      error = `${file.name}: could not be read`;
+      continue;
+    }
     images = [...images, { name: file.name, type: file.type, b64, url: URL.createObjectURL(file) }];
   }
   if (fileInput) fileInput.value = '';
 }
+
+/// An object URL pins the whole image in memory until it is revoked. Sent
+/// attachments used to be pinned for the life of the tab, so a long session
+/// with pictures held every one of them twice — once as the blob, once as the
+/// base64 in the request.
+function releaseUrls(list) {
+  for (const m of list ?? []) {
+    for (const img of m.images ?? []) {
+      if (img.url) URL.revokeObjectURL(img.url);
+    }
+  }
+}
+
+onDestroy(() => releaseUrls(messages));
 
 function removeImage(i) {
   const [dropped] = images.splice(i, 1);
@@ -155,16 +176,15 @@ async function send() {
         break;
       }
       if (ev.stats) {
-        const last = messages[messages.length - 1];
-        last.stats = ev.stats;
-        messages = [...messages];
+        messages[messages.length - 1].stats = ev.stats;
         continue;
       }
       const delta = ev?.choices?.[0]?.delta?.content;
       if (delta) {
-        const last = messages[messages.length - 1];
-        last.content += delta;
-        messages = [...messages];
+        // `$state` proxies deeply, so writing through the object is enough.
+        // Copying the whole array per token made a long reply cost O(n²) and
+        // re-diffed the entire transcript on every token.
+        messages[messages.length - 1].content += delta;
       }
     }
   } catch (e) {
@@ -212,7 +232,7 @@ onMount(() => {
     {#if messages.length === 0}
       <p class="muted">{$t('chat.empty')}</p>
     {/if}
-    {#each messages as m, i}
+    {#each messages as m, i (i)}
     <div class="bubble" class:user={m.role === 'user'}>
       <div class="role">{m.role}</div>
       {#if m.images?.length}
@@ -276,7 +296,7 @@ onMount(() => {
         accept="image/*"
         multiple
         hidden
-        onchange={(e) => addImages([...e.target.files])}
+        onchange={(e) => addImages([...e.target.files]).catch(() => {})}
       />
       <button
         class="ghost attach"

@@ -15,10 +15,14 @@ pub fn spawn_reaper(state: AppState, tick: Duration) {
                     continue;
                 }
                 let keep = guard.keep_alive;
+                // Idle *and* unheld. A model serving a reply has not been idle
+                // for `keep` seconds no matter what the clock says: `last_used`
+                // is stamped when the request starts, so a long generation
+                // looked stale the whole way through and was unloaded mid-reply.
                 let stale: Vec<String> = guard
                     .models
                     .iter()
-                    .filter(|(_, l)| l.last_used.elapsed() > keep)
+                    .filter(|(_, l)| l.last_used.elapsed() > keep && !l.is_busy())
                     .map(|(id, _)| id.clone())
                     .collect();
 
@@ -36,7 +40,11 @@ pub fn spawn_reaper(state: AppState, tick: Duration) {
             };
 
             if !removed.is_empty() {
-                let _ = tokio::task::spawn_blocking(move || drop(removed)).await;
+                // Freeing a model waits for its worker thread to finish
+                // whatever it is decoding, which can take seconds. Awaiting
+                // that here used to stall this loop for the duration — and
+                // while it stalled, no other model's idle timer ran at all.
+                tokio::task::spawn_blocking(move || drop(removed));
             }
         }
     });

@@ -33,10 +33,24 @@ pub(crate) async fn download_file(
     mut on_progress: impl FnMut(ProgressEvent),
 ) -> Result<()> {
     let part = part_path(dest);
-    let existing = tokio::fs::metadata(&part)
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0);
+
+    // Resume only from bytes that came from this URL. The partial file used to
+    // be keyed by its final name alone, so `model.gguf` interrupted in one repo
+    // could be resumed as `model.gguf` from a different one — appending one
+    // file onto the other and producing a model that looks complete and is not.
+    let stored = read_part_meta(dest).await;
+    let existing = match stored.as_ref() {
+        Some(meta) if meta.url == url => tokio::fs::metadata(&part)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0),
+        _ => {
+            if tokio::fs::metadata(&part).await.is_ok() {
+                let _ = tokio::fs::remove_file(&part).await;
+            }
+            0
+        }
+    };
 
     let mut req = http.get(url);
     if let Some(t) = token {
@@ -54,6 +68,28 @@ pub(crate) async fn download_file(
     }
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err(HubError::FileNotFound(url.to_string()));
+    }
+
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    if status == reqwest::StatusCode::PARTIAL_CONTENT && existing > 0 {
+        // The server is letting us resume. If it also names the entity and that
+        // name has changed, the file moved underneath the partial download;
+        // finishing it would produce a model made of two different files.
+        if let (Some(old), Some(new)) = (stored.as_ref().and_then(|m| m.etag.clone()), &etag) {
+            if old != *new {
+                let _ = tokio::fs::remove_file(&part).await;
+                let _ = tokio::fs::remove_file(meta_path(dest)).await;
+                return Err(HubError::Status {
+                    status: 409,
+                    url: url.to_string(),
+                });
+            }
+        }
     }
 
     let (mut downloaded, total, mut file) = if status == reqwest::StatusCode::PARTIAL_CONTENT {
@@ -103,11 +139,30 @@ pub(crate) async fn download_file(
 
     on_progress(ProgressEvent { downloaded, total });
 
+    // Remember what these bytes are before they become the real file, so a
+    // later download can tell whether it may continue them.
+    write_part_meta(
+        dest,
+        &PartMeta {
+            url: url.to_string(),
+            etag,
+        },
+    )
+    .await;
+
     if tokio::fs::try_exists(dest).await.unwrap_or(false) {
         tokio::fs::remove_file(dest).await?;
     }
     tokio::fs::rename(&part, dest).await?;
+    let _ = tokio::fs::remove_file(meta_path(dest)).await;
     Ok(())
+}
+
+/// What a partial download belongs to.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PartMeta {
+    url: String,
+    etag: Option<String>,
 }
 
 fn part_path(dest: &Path) -> PathBuf {
@@ -116,4 +171,23 @@ fn part_path(dest: &Path) -> PathBuf {
         .and_then(|n| n.to_str())
         .unwrap_or("model.gguf");
     dest.with_file_name(format!("{name}.part"))
+}
+
+fn meta_path(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("model.gguf");
+    dest.with_file_name(format!("{name}.part.json"))
+}
+
+async fn read_part_meta(dest: &Path) -> Option<PartMeta> {
+    let raw = tokio::fs::read_to_string(meta_path(dest)).await.ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+async fn write_part_meta(dest: &Path, meta: &PartMeta) {
+    if let Ok(text) = serde_json::to_string(meta) {
+        let _ = tokio::fs::write(meta_path(dest), text).await;
+    }
 }

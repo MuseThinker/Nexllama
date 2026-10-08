@@ -70,7 +70,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang libclang-dev llvm-dev cmake ninja-build pkg-config
+            clang libclang-dev llvm-dev cmake ninja-build pkg-config libdbus-1-dev
 
       - name: Test
         run: cargo test --workspace --all-targets
