@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nexllama daemon</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; padding: 2rem; max-width: 980px; margin-inline: auto;
+        background: #0a0b0d; color: #e6e7e9;
+        font: 14px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
+      h1 { font-size: 18px; margin: 0 0 4px; }
+      h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+           color: #8b9098; margin: 28px 0 8px; }
+      p.sub { color: #8b9098; margin: 0 0 12px; }
+      a { color: inherit; }
+      .auth {
+        display: flex; gap: 8px; align-items: center;
+        border: 1px solid #23252a; border-radius: 9px; padding: 10px 12px; margin: 16px 0 4px;
+      }
+      .auth input {
+        flex: 1; min-width: 0; background: #0a0b0d; color: #e6e7e9;
+        border: 1px solid #23252a; border-radius: 7px; padding: 7px 10px; font: inherit;
+      }
+      .op { border: 1px solid #23252a; border-radius: 9px; margin-bottom: 8px; overflow: hidden; }
+      .op > summary { cursor: pointer; padding: 9px 12px; display: flex; gap: 10px; align-items: baseline; }
+      .m { font-weight: 700; width: 46px; flex: none; }
+      .get { color: #6ea8fe; } .post { color: #b98a3c; }
+      .path { color: #fafafa; } .sum { color: #8b9098; }
+      .body { padding: 12px; border-top: 1px solid #23252a; }
+      textarea {
+        width: 100%; min-height: 120px; resize: vertical;
+        background: #0a0b0d; color: #e6e7e9; border: 1px solid #23252a;
+        border-radius: 8px; padding: 10px; font: inherit;
+      }
+      .actions { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+      button {
+        background: transparent; color: #e6e7e9; border: 1px solid #33363c;
+        border-radius: 8px; padding: 6px 14px; font: inherit; cursor: pointer;
+      }
+      button:disabled { opacity: .5; cursor: default; }
+      .status { color: #8b9098; }
+      .ok { color: #e6e7e9; } .bad { color: #c65a52; }
+      pre {
+        background: #111214; border: 1px solid #23252a; border-radius: 8px;
+        padding: 10px; overflow: auto; max-height: 340px; margin: 8px 0 0;
+        white-space: pre-wrap; word-break: break-word;
+      }
+      .hidden { display: none; }
+    </style>
+  </head>
+  <body>
+    <h1 id="title">Nexllama daemon</h1>
+    <p class="sub" id="sub"></p>
+    <p class="sub"><a href="/openapi.json">/openapi.json</a> · <a href="/">/</a></p>
+
+    <div class="auth">
+      <input id="token" type="password" placeholder="access token (leave empty if the daemon has none)" />
+      <button id="saveToken" type="button">Use</button>
+      <button id="forgetToken" type="button">Forget</button>
+    </div>
+    <p class="sub" id="authNote">The token is kept in this browser only, and sent as Authorization: Bearer.</p>
+
+    <div id="ops"></div>
+
+    <script>
+      const TOKEN_KEY = 'nexllama.docs.token';
+      const tokenInput = document.getElementById('token');
+      const authNote = document.getElementById('authNote');
+      const methodClass = (m) => (m === 'get' ? 'get' : 'post');
+
+      try {
+        tokenInput.value = localStorage.getItem(TOKEN_KEY) ?? '';
+      } catch {
+        authNote.textContent = 'This browser will not let the page remember the token; type it per session.';
+      }
+
+      document.getElementById('saveToken').onclick = () => {
+        try {
+          localStorage.setItem(TOKEN_KEY, tokenInput.value.trim());
+        } catch {
+          /* per session only */
+        }
+        authNote.textContent = tokenInput.value.trim()
+          ? 'Token saved for this browser.'
+          : 'No token set; requests go out unauthenticated.';
+        // Examples name a loaded model, and listing models needs the token.
+        refreshLoaded();
+      };
+      document.getElementById('forgetToken').onclick = () => {
+        try {
+          localStorage.removeItem(TOKEN_KEY);
+        } catch {
+          /* ignore */
+        }
+        tokenInput.value = '';
+        authNote.textContent = 'Token forgotten.';
+      };
+
+      const headers = () => {
+        const h = { 'Content-Type': 'application/json' };
+        const token = tokenInput.value.trim();
+        if (token) h.Authorization = `Bearer ${token}`;
+        return h;
+      };
+
+      /// Which class of model an operation's example should name.
+      ///
+      /// `/admin/load` takes a file path rather than a loaded id, so its example
+      /// is left exactly as written.
+      function modelTarget(path) {
+        if (path === '/admin/load') return null;
+        if (/rerank/.test(path)) return 'rerank';
+        if (/embed/.test(path)) return 'embedding';
+        return 'llm';
+      }
+
+      // Examples carry a placeholder name like "qwen2.5", which only exists if a
+      // model was loaded under that alias. Filling in a model that is actually
+      // loaded is the difference between an example you can press Send on and one
+      // that answers 400.
+      const modelFields = [];
+      let loadedByClass = {};
+      async function refreshLoaded() {
+        try {
+          const res = await fetch('/v1', { headers: headers() });
+          if (!res.ok) return false;
+          loadedByClass = {};
+          for (const m of (await res.json()).data ?? []) {
+            const cls = m.info?.model_class;
+            if (cls && !loadedByClass[cls]) loadedByClass[cls] = m.id;
+          }
+          for (const { el, cls } of modelFields) {
+            if (cls && loadedByClass[cls]) {
+              const body = JSON.parse(el.value);
+              body.model = loadedByClass[cls];
+              el.value = JSON.stringify(body, null, 2);
+            }
+          }
+          return true;
+        } catch {
+          return false;
+        }
+      }
+
+      /// Try an operation and show what came back.
+      ///
+      /// Streams are read chunk by chunk and appended, so SSE and NDJSON show
+      /// progress instead of appearing to hang until the reply finishes.
+      async function run(path, method, bodyEl, outEl, statusEl, button) {
+        const body = bodyEl && !bodyEl.classList.contains('hidden') ? bodyEl.value : undefined;
+        outEl.textContent = '';
+        statusEl.textContent = 'sending…';
+        statusEl.className = 'status';
+        button.disabled = true;
+
+        try {
+          const res = await fetch(path, { method, headers: headers(), body });
+          const type = res.headers.get('content-type') ?? '';
+          const streaming = type.includes('event-stream') || type.includes('ndjson');
+
+          statusEl.textContent = `${res.status} ${res.statusText || ''}${streaming ? ' · streaming' : ''}`;
+          statusEl.className = 'status ' + (res.ok ? 'ok' : 'bad');
+
+          if (!streaming) {
+            const text = await res.text();
+            try {
+              outEl.textContent = JSON.stringify(JSON.parse(text), null, 2);
+            } catch {
+              outEl.textContent = text;
+            }
+            return;
+          }
+
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            outEl.textContent += decoder.decode(value, { stream: true });
+            outEl.scrollTop = outEl.scrollHeight;
+          }
+        } catch (e) {
+          statusEl.textContent = 'request failed';
+          statusEl.className = 'status bad';
+          outEl.textContent = String(e);
+        } finally {
+          button.disabled = false;
+        }
+      }
+
+      fetch('/openapi.json')
+        .then((r) => r.json())
+        .then((spec) => {
+          document.getElementById('title').textContent = spec.info.title;
+          document.getElementById('sub').textContent =
+            `v${spec.info.version} · ${spec.servers?.[0]?.url ?? ''}`;
+
+          const groups = {};
+          for (const [path, methods] of Object.entries(spec.paths)) {
+            for (const [method, op] of Object.entries(methods)) {
+              (groups[op.tags?.[0] ?? 'other'] ??= []).push({ path, method, op });
+            }
+          }
+
+          const root = document.getElementById('ops');
+          for (const [tag, ops] of Object.entries(groups)) {
+            const h = document.createElement('h2');
+            h.textContent = tag;
+            root.appendChild(h);
+
+            for (const { path, method, op } of ops) {
+              const details = document.createElement('details');
+              details.className = 'op';
+
+              const summary = document.createElement('summary');
+              summary.innerHTML =
+                `<span class="m ${methodClass(method)}">${method.toUpperCase()}</span>` +
+                `<span class="path"></span><span class="sum"></span>`;
+              summary.querySelector('.path').textContent = path;
+              summary.querySelector('.sum').textContent = op.summary ?? '';
+              details.appendChild(summary);
+
+              const pane = document.createElement('div');
+              pane.className = 'body';
+
+              if (op.description) {
+                const p = document.createElement('p');
+                p.className = 'sub';
+                p.textContent = op.description;
+                pane.appendChild(p);
+              }
+
+              // A body editor only where a body is expected.
+              let bodyEl = null;
+              const media = op.requestBody?.content?.['application/json'];
+              if (media) {
+                bodyEl = document.createElement('textarea');
+                const example = media.example ?? media.schema?.example;
+                bodyEl.value = example ? JSON.stringify(example, null, 2) : '{}';
+                const cls = modelTarget(path);
+                if (cls && example && 'model' in example) {
+                  modelFields.push({ el: bodyEl, cls });
+                  if (loadedByClass[cls]) {
+                    const filled = { ...example, model: loadedByClass[cls] };
+                    bodyEl.value = JSON.stringify(filled, null, 2);
+                  }
+                }
+                pane.appendChild(bodyEl);
+              }
+
+              const actions = document.createElement('div');
+              actions.className = 'actions';
+              const button = document.createElement('button');
+              button.type = 'button';
+              button.textContent = media ? 'Send' : 'GET';
+              const statusEl = document.createElement('span');
+              statusEl.className = 'status';
+              actions.append(button, statusEl);
+              pane.appendChild(actions);
+
+              const outEl = document.createElement('pre');
+              outEl.className = 'hidden';
+              pane.appendChild(outEl);
+
+              button.onclick = () => {
+                outEl.classList.remove('hidden');
+                run(path, method.toUpperCase(), bodyEl, outEl, statusEl, button);
+              };
+
+              details.appendChild(pane);
+              root.appendChild(details);
+            }
+          }
+
+          // Runs after the list exists; the token may have changed since load.
+          refreshLoaded();
+        })
+        .catch((e) => {
+          document.getElementById('sub').textContent = `could not load /openapi.json: ${e}`;
+        });
+    </script>
+  </body>
+</html>

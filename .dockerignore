@@ -1,0 +1,10 @@
+target/
+models/
+frontend/
+crates/app/
+scripts/
+.git/
+.gitignore
+**/*.log
+Dockerfile*
+docker-compose*.yml

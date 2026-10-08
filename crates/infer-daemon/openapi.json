@@ -1,0 +1,627 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Nexllama daemon",
+    "version": "0.1.0",
+    "summary": "Local llama.cpp inference over HTTP",
+    "description": "Serves chat, embeddings and reranking for GGUF models loaded on this machine.\n\nTwo request surfaces are available and both are first-class:\n\n* **OpenAI** (`/v1/...`) — the shape most tools and SDKs already speak.\n* **Ollama** (`/api/...`) — the short paths and NDJSON streaming Ollama uses.\n\n`GET /` returns a banner, `GET /v1` and `GET /api/tags` list the loaded models, so pointing a client at the base URL is enough to see what is there.\n\n**Every `/v1` and `/api` route requires `model` explicitly.** One machine can hold a chat model, an embedder and a reranker at once, and guessing which one a request meant turns a typo into the wrong model answering. Omit it and the error names what is loaded. The desktop chat panel is the only place with a remembered default.\n\nIf the daemon was started with `--api-key`, every route below except `/`, `/health`, `/api/version`, `/openapi.json` and `/docs` requires `Authorization: Bearer <key>`."
+  },
+  "servers": [{ "url": "http://127.0.0.1:15656", "description": "local daemon" }],
+  "tags": [
+    { "name": "discovery", "description": "Open routes that describe the server" },
+    { "name": "openai", "description": "OpenAI-compatible surface" },
+    { "name": "ollama", "description": "Ollama-compatible surface" },
+    { "name": "admin", "description": "Loading and inspecting models" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Only required when the daemon was started with --api-key."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": { "error": { "type": "string" } },
+        "required": ["error"]
+      },
+      "Banner": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "version": { "type": "string" },
+          "status": { "type": "string" },
+          "models_loaded": { "type": "integer" },
+          "endpoints": {
+            "type": "object",
+            "additionalProperties": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string" },
+          "models_loaded": { "type": "integer" },
+          "models": { "type": "array", "items": { "type": "string" } },
+          "default_model": { "type": ["string", "null"] },
+          "keep_alive_secs": { "type": "integer" }
+        }
+      },
+      "ModelInfo": {
+        "type": "object",
+        "description": "Facts resolved when the model was loaded. `model_class` is one of llm, embedding or rerank and decides which routes accept the model.",
+        "properties": {
+          "description": { "type": "string" },
+          "model_class": { "type": "string", "enum": ["llm", "embedding", "rerank"] },
+          "vision": { "type": "boolean" },
+          "pooling": { "type": "string" },
+          "n_ctx": { "type": "integer" },
+          "n_embd": { "type": "integer" },
+          "n_params": { "type": "integer" },
+          "model_size": { "type": "integer" },
+          "ftype": { "type": ["string", "null"] }
+        },
+        "additionalProperties": true
+      },
+      "Model": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "object": { "type": "string", "const": "model" },
+          "path": { "type": "string" },
+          "info": { "$ref": "#/components/schemas/ModelInfo" }
+        }
+      },
+      "ModelList": {
+        "type": "object",
+        "properties": {
+          "object": { "type": "string" },
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/Model" } }
+        }
+      },
+      "TextPart": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string", "const": "text" },
+          "text": { "type": "string" }
+        },
+        "required": ["type", "text"]
+      },
+      "ImagePart": {
+        "type": "object",
+        "description": "Only data: URLs are accepted. An http(s) URL would make every request an SSRF primitive, and a bare path would name files on this machine; both are refused.",
+        "properties": {
+          "type": { "type": "string", "enum": ["image_url", "input_image"] },
+          "image_url": {
+            "type": "object",
+            "properties": { "url": { "type": "string", "pattern": "^data:" } }
+          }
+        },
+        "required": ["type", "image_url"]
+      },
+      "ChatMessage": {
+        "type": "object",
+        "properties": {
+          "role": { "type": "string", "enum": ["system", "user", "assistant"] },
+          "content": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "oneOf": [{ "$ref": "#/components/schemas/TextPart" }, { "$ref": "#/components/schemas/ImagePart" }] } }
+            ]
+          }
+        },
+        "required": ["role", "content"]
+      },
+      "ChatCompletionRequest": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "Required if more than one model is loaded; names an llm-class model." },
+          "messages": { "type": "array", "items": { "$ref": "#/components/schemas/ChatMessage" } },
+          "stream": { "type": "boolean", "default": false, "description": "true streams Server-Sent Events." },
+          "temperature": { "type": "number" },
+          "top_p": { "type": "number" },
+          "top_k": { "type": "integer" },
+          "min_p": { "type": "number" },
+          "repeat_penalty": { "type": "number" },
+          "repeat_last_n": { "type": "integer" },
+          "repeat_freq": { "type": "number" },
+          "repeat_present": { "type": "number" },
+          "seed": { "type": "integer" },
+          "max_tokens": { "type": "integer" },
+          "speculative": { "type": "boolean", "description": "n-gram speculative decoding; exact, but only pays off on repetitive text." },
+          "ngram_n": { "type": "integer" },
+          "ngram_m": { "type": "integer" }
+        },
+        "required": ["messages"]
+      },
+      "ChatCompletion": {
+        "type": "object",
+        "properties": {
+          "object": { "type": "string" },
+          "model": { "type": "string" },
+          "choices": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": { "type": "integer" },
+                "message": { "$ref": "#/components/schemas/ChatMessage" },
+                "finish_reason": { "type": "string" }
+              }
+            }
+          },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "prompt_tokens": { "type": "integer" },
+              "completion_tokens": { "type": "integer" }
+            }
+          },
+          "stats": { "$ref": "#/components/schemas/GenStats" }
+        }
+      },
+      "GenStats": {
+        "type": "object",
+        "description": "Timings and draft statistics for one request.",
+        "properties": {
+          "prompt_tokens": { "type": "integer" },
+          "generated_tokens": { "type": "integer" },
+          "prompt_ms": { "type": "number" },
+          "gen_ms": { "type": "number" },
+          "first_token_ms": { "type": "number" },
+          "draft_tokens": { "type": "integer" },
+          "accepted_draft_tokens": { "type": "integer" },
+          "draft_rounds": { "type": "integer" }
+        },
+        "additionalProperties": true
+      },
+      "OllamaMessage": {
+        "type": "object",
+        "properties": {
+          "role": { "type": "string" },
+          "content": { "type": "string" }
+        },
+        "required": ["role"]
+      },
+      "OllamaOptions": {
+        "type": "object",
+        "description": "Mapped onto the sampler: temperature, top_k, top_p, min_p, repeat_penalty, repeat_last_n, num_predict (cap on generated tokens; <= 0 means until it stops) and seed.",
+        "properties": {
+          "temperature": { "type": "number" },
+          "top_k": { "type": "integer" },
+          "top_p": { "type": "number" },
+          "min_p": { "type": "number" },
+          "repeat_penalty": { "type": "number" },
+          "repeat_last_n": { "type": "integer" },
+          "num_predict": { "type": "integer" },
+          "seed": { "type": "integer" }
+        },
+        "additionalProperties": true
+      },
+      "OllamaChatRequest": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string" },
+          "messages": { "type": "array", "items": { "$ref": "#/components/schemas/OllamaMessage" } },
+          "stream": { "type": "boolean", "default": true, "description": "true streams newline-delimited JSON." },
+          "options": { "$ref": "#/components/schemas/OllamaOptions" }
+        },
+        "required": ["messages"]
+      },
+      "OllamaGenerateRequest": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string" },
+          "prompt": { "type": "string" },
+          "system": { "type": "string" },
+          "stream": { "type": "boolean", "default": true },
+          "options": { "$ref": "#/components/schemas/OllamaOptions" }
+        },
+        "required": ["prompt"]
+      },
+      "OllamaChatReply": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "message": { "$ref": "#/components/schemas/OllamaMessage" },
+          "done": { "type": "boolean" },
+          "done_reason": { "type": "string" },
+          "prompt_eval_count": { "type": "integer" },
+          "eval_count": { "type": "integer" }
+        }
+      },
+      "OllamaGenerateReply": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "response": { "type": "string" },
+          "done": { "type": "boolean" },
+          "done_reason": { "type": "string" },
+          "prompt_eval_count": { "type": "integer" },
+          "eval_count": { "type": "integer" }
+        }
+      },
+      "EmbeddingsRequest": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "Names an embedding-class model." },
+          "input": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ]
+          }
+        },
+        "required": ["input"]
+      },
+      "EmbeddingsResponse": {
+        "type": "object",
+        "properties": {
+          "object": { "type": "string" },
+          "model": { "type": "string" },
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "object": { "type": "string" },
+                "index": { "type": "integer" },
+                "embedding": { "type": "array", "items": { "type": "number" } }
+              }
+            }
+          },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "prompt_tokens": { "type": "integer" },
+              "total_tokens": { "type": "integer" }
+            }
+          }
+        }
+      },
+      "RerankRequest": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "Names a rerank-class model." },
+          "query": { "type": "string" },
+          "documents": { "type": "array", "items": { "type": "string" } },
+          "top_n": { "type": "integer", "description": "Keep only the best N results." }
+        },
+        "required": ["query", "documents"]
+      },
+      "RerankResponse": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string" },
+          "results": {
+            "type": "array",
+            "description": "Ordered by relevance, highest first; ties keep submission order.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": { "type": "integer", "description": "Index into the request's documents." },
+                "relevance_score": { "type": "number" },
+                "document": { "type": "string" }
+              }
+            }
+          },
+          "usage": {
+            "type": "object",
+            "properties": { "total_tokens": { "type": "integer" } }
+          }
+        }
+      },
+      "LoadRequest": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "Path to the GGUF file." },
+          "name": { "type": "string", "description": "Alias to load it under; defaults to the file stem." },
+          "n_gpu_layers": { "type": "integer" },
+          "main_gpu": { "type": "integer" },
+          "n_ctx": { "type": "integer" },
+          "n_batch": { "type": "integer" },
+          "n_ubatch": { "type": "integer" },
+          "threads": { "type": "integer" },
+          "threads_batch": { "type": "integer" },
+          "load_mode": { "type": "string", "enum": ["auto", "none", "mmap", "mlock", "mmap_mlock", "dio"] },
+          "mmap": { "type": "boolean" },
+          "use_mlock": { "type": "boolean" },
+          "flash_attn": { "type": "string", "enum": ["auto", "on", "off"] },
+          "offload_kqv": { "type": "boolean" },
+          "rope_freq_base": { "type": "number" },
+          "rope_freq_scale": { "type": "number" },
+          "load_mtp": { "type": "boolean" },
+          "mmproj": { "type": "string", "description": "Multimodal projector, for image input." },
+          "lora": { "type": "array", "items": { "type": "string" } },
+          "keep_alive_secs": { "type": "integer" },
+          "set_default": { "type": "boolean" }
+        },
+        "required": ["model"]
+      },
+      "UnloadRequest": {
+        "type": "object",
+        "properties": { "model": { "type": "string" } },
+        "description": "An empty object unloads every model."
+      }
+    }
+  },
+  "paths": {
+    "/": {
+      "get": {
+        "tags": ["discovery"],
+        "summary": "Banner and endpoint index",
+        "description": "Open, and deliberately without model names, so exposing the port does not leak them.",
+        "responses": {
+          "200": { "description": "Server identity", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Banner" } } } }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": ["discovery"],
+        "summary": "Liveness and loaded models",
+        "responses": {
+          "200": { "description": "ok", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } }
+        }
+      }
+    },
+    "/api/version": {
+      "get": {
+        "tags": ["discovery", "ollama"],
+        "summary": "Version",
+        "responses": {
+          "200": {
+            "description": "version",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "version": { "type": "string" } } } } }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "tags": ["discovery"],
+        "summary": "This document",
+        "responses": { "200": { "description": "OpenAPI 3.1 specification", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/docs": {
+      "get": {
+        "tags": ["discovery"],
+        "summary": "Browsable endpoint list",
+        "description": "Self-contained HTML; needs no network access to render.",
+        "responses": { "200": { "description": "HTML page", "content": { "text/html": { "schema": { "type": "string" } } } } }
+      }
+    },
+    "/v1": {
+      "get": {
+        "tags": ["openai"],
+        "summary": "List loaded models",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "models", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelList" } } } }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": ["openai"],
+        "summary": "List loaded models",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "models", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModelList" } } } }
+        }
+      }
+    },
+    "/api/tags": {
+      "get": {
+        "tags": ["ollama"],
+        "summary": "List loaded models, Ollama shape",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "models",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "models": { "type": "array", "items": { "type": "object", "additionalProperties": true } } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/status": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "Per-model status and idle time",
+        "security": [{ "bearerAuth": [] }],
+        "responses": { "200": { "description": "status", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/admin/load": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Load a model",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoadRequest" }, "example": { "model": "D:\\models\\qwen2.5-0.5b-instruct-q4_k_m.gguf", "name": "qwen2.5", "n_gpu_layers": 999, "n_ctx": 4096 } } } },
+        "responses": {
+          "200": { "description": "loaded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Model" } } } },
+          "400": { "description": "bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/admin/unload": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Unload one model, or all with an empty body",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UnloadRequest" }, "example": { "model": "qwen2.5" } } } },
+        "responses": { "200": { "description": "unloaded", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "tags": ["openai"],
+        "summary": "Chat completion",
+        "security": [{ "bearerAuth": [] }],
+        "description": "With `stream: true` the response is `text/event-stream`. Every chunk carries `id`, `object`, `created` and `model` alongside `choices[0].delta`, the last one sets `finish_reason`, and the stream ends with `data: [DONE]` — the shape the OpenAI SDKs expect.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatCompletionRequest" }, "example": { "model": "qwen2.5", "messages": [{ "role": "user", "content": "Name three primary colors." }], "max_tokens": 64 } } } },
+        "responses": {
+          "200": { "description": "completion", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatCompletion" } } } },
+          "400": { "description": "unknown or non-chat model", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/chat": {
+      "post": {
+        "tags": ["ollama"],
+        "summary": "Chat completion, Ollama shape",
+        "security": [{ "bearerAuth": [] }],
+        "description": "With `stream: true` (the default) the response is newline-delimited JSON, one `OllamaChatReply` per line, the last with `done: true`.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OllamaChatRequest" }, "example": { "model": "qwen2.5", "stream": false, "messages": [{ "role": "user", "content": "Name three primary colors." }] } } } },
+        "responses": {
+          "200": {
+            "description": "reply, or NDJSON when streaming",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/OllamaChatReply" } },
+              "application/x-ndjson": { "schema": { "$ref": "#/components/schemas/OllamaChatReply" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/generate": {
+      "post": {
+        "tags": ["ollama"],
+        "summary": "Single-prompt completion, Ollama shape",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OllamaGenerateRequest" }, "example": { "model": "qwen2.5", "stream": false, "prompt": "Name two colors." } } } },
+        "responses": {
+          "200": {
+            "description": "reply, or NDJSON when streaming",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/OllamaGenerateReply" } },
+              "application/x-ndjson": { "schema": { "$ref": "#/components/schemas/OllamaGenerateReply" } }
+            }
+          }
+        }
+      }
+    },
+    "/v1/embeddings": {
+      "post": {
+        "tags": ["openai"],
+        "summary": "Embeddings",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EmbeddingsRequest" }, "example": { "model": "bge-small", "input": ["a cat is sleeping", "a kitten naps"] } } } },
+        "responses": {
+          "200": { "description": "vectors", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EmbeddingsResponse" } } } },
+          "400": { "description": "unknown or non-embedding model", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/embed": {
+      "post": {
+        "tags": ["ollama"],
+        "summary": "Embeddings, Ollama shape",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EmbeddingsRequest" }, "example": { "model": "bge-small", "input": ["a cat is sleeping", "a kitten naps"] } } } },
+        "responses": {
+          "200": {
+            "description": "vectors",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "model": { "type": "string" },
+                    "embeddings": { "type": "array", "items": { "type": "array", "items": { "type": "number" } } },
+                    "prompt_eval_count": { "type": "integer" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/embeddings": {
+      "post": {
+        "tags": ["ollama"],
+        "summary": "Embeddings, legacy single-prompt shape",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": { "model": { "type": "string" }, "prompt": { "type": "string" } },
+                "required": ["prompt"]
+              },
+              "example": { "model": "bge-small", "prompt": "hello world" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "one vector",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "embedding": { "type": "array", "items": { "type": "number" } } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/rerank": {
+      "post": {
+        "tags": ["openai"],
+        "summary": "Rerank documents against a query",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RerankRequest" }, "example": { "model": "bge-reranker", "query": "What is the capital of France?", "documents": ["Berlin is the capital of Germany.", "Paris is the capital of France."] } } } },
+        "responses": {
+          "200": { "description": "ranked results", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RerankResponse" } } } },
+          "400": { "description": "unknown or non-rerank model", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/rerank": {
+      "post": {
+        "tags": ["openai"],
+        "summary": "Alias of /v1/rerank",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RerankRequest" }, "example": { "model": "bge-reranker", "query": "What is the capital of France?", "documents": ["Berlin is the capital of Germany.", "Paris is the capital of France."] } } } },
+        "responses": { "200": { "description": "ranked results", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RerankResponse" } } } } }
+      }
+    },
+    "/v1/reranking": {
+      "post": {
+        "tags": ["openai"],
+        "summary": "Alias of /v1/rerank",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RerankRequest" }, "example": { "model": "bge-reranker", "query": "What is the capital of France?", "documents": ["Berlin is the capital of Germany.", "Paris is the capital of France."] } } } },
+        "responses": { "200": { "description": "ranked results", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RerankResponse" } } } } }
+      }
+    },
+    "/reranking": {
+      "post": {
+        "tags": ["openai"],
+        "summary": "Alias of /v1/rerank",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RerankRequest" }, "example": { "model": "bge-reranker", "query": "What is the capital of France?", "documents": ["Berlin is the capital of Germany.", "Paris is the capital of France."] } } } },
+        "responses": { "200": { "description": "ranked results", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RerankResponse" } } } } }
+      }
+    }
+  }
+}

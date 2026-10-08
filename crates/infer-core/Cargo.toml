@@ -1,0 +1,29 @@
+[package]
+name = "infer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gguf-probe = { path = "../gguf-probe" }
+llama-cpp-4 = { version = "0.7.0", default-features = false, features = ["openmp", "mtmd", "dynamic-link"] }
+# Needed for the rank-pooling output, which the safe wrapper sizes incorrectly.
+llama-cpp-sys-4 = "0.7.0"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+cuda = ["llama-cpp-4/cuda"]
+vulkan = ["llama-cpp-4/vulkan"]
+metal = ["llama-cpp-4/metal"]
+native = ["llama-cpp-4/native"]
+
+[dev-dependencies]
+anyhow.workspace = true
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"

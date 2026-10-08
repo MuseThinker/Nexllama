@@ -1,0 +1,45 @@
+# Third-party notices
+
+Nexllama is distributed under the MIT OR Apache-2.0 dual license
+(see `LICENSE-MIT` and `LICENSE-APACHE`). It builds on the work below.
+
+## llama.cpp / GGML
+
+Nexllama links [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
+through the Rust crates `llama-cpp-4` / `llama-cpp-sys-4`.
+
+- llama.cpp and GGML are licensed under the **MIT** license.
+- The upstream source is vendored by `llama-cpp-sys-4` at build time; the
+  resulting binary object is covered by that MIT license.
+- `crates/infer-core` calls `llama_cpp_sys_4::llama_get_embeddings_seq`
+  directly for rank pooling output, because the safe wrapper sizes that buffer
+  incorrectly. The call is still plain llama.cpp MIT-licensed API surface.
+
+## Runtime dependencies pulled in by the native build
+
+Depending on the selected feature, a built backend additionally links:
+
+- **OpenMP** (`libgomp`) — runtime exception of the GCC Runtime Library
+  Exception; used by the llama.cpp CPU backend.
+- **CUDA Toolkit** (`cudart`, `cublas`, ...) — NVIDIA CUDA Toolkit EULA,
+  only linked when building with the `cuda` feature.
+- **Vulkan** loader / LunarG SDK — Apache-2.0 (Vulkan-Loader) and the
+  LunarG SDK terms, only linked when building with the `vulkan` feature.
+- **Vulkan shader compiler `glslc`** — Apache-2.0, build-time only.
+
+These are **not** redistributed in this repository. Installing the Nexllama
+installer does not install any of them; a backend that needs one will simply
+fail to start on a machine that lacks it.
+
+## Rust crates
+
+The full dependency graph with versions is in `Cargo.lock`. Licenses of every
+transitive crate can be listed with:
+
+```bash
+cargo install cargo-deny && cargo deny list
+```
+
+## Fonts and icons
+
+`crates/app/icons/` contains the application icon packaged for Windows.

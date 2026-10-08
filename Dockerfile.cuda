@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1
+#
+# CUDA image for the Nexllama inference daemon.
+# Requires the NVIDIA Container Toolkit on the host.
+#
+# Build:
+#   docker build -f Dockerfile.cuda -t nexllama/infer-daemon:cuda .
+#
+# Run:
+#   docker run --rm --gpus all -p 8090:8090 -v "$PWD/models:/models:ro" \
+#     nexllama/infer-daemon:cuda --model /models/model.gguf --n-gpu-layers 999
+
+ARG CUDA_VERSION=12.6.3
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS builder
+
+ARG CRATES_MIRROR=
+ARG FEATURES=cuda
+ARG RUSTUP_DIST_SERVER=https://static.rust-lang.org
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      curl ca-certificates build-essential clang libclang-dev llvm-dev \
+      cmake ninja-build pkg-config git \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER}
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH=/usr/local/cargo/bin:$PATH
+
+RUN if [ -n "$CRATES_MIRROR" ]; then \
+      printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+%s"\n' "$CRATES_MIRROR" > "$CARGO_HOME/config.toml"; \
+    fi
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/infer-core ./crates/infer-core
+COPY crates/infer-daemon ./crates/infer-daemon
+RUN cargo build --release -p infer-daemon --features "$FEATURES"
+
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libgomp1 libstdc++6 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/infer-daemon /usr/local/bin/infer-daemon
+# The llama.cpp shared libraries go in a library directory, not in `bin`: the
+# dynamic loader does not search `bin`, so the binary only started by luck of
+# whatever fallback this base image happened to have.
+COPY --from=builder /src/target/release/*.so* /usr/local/lib/
+RUN ldconfig
+
+# Unprivileged: reading model files and serving a port needs no root, and the
+# daemon parses whatever GGUF it is pointed at.
+RUN useradd --system --no-create-home --uid 10001 nexllama
+USER nexllama
+
+ENV RUST_LOG=info
+EXPOSE 8090
+VOLUME ["/models"]
+
+ENTRYPOINT ["infer-daemon"]
+# Same opt-in as the CPU image: the daemon refuses to bind 0.0.0.0 without a
+# token unless it is told to.
+CMD ["--host", "0.0.0.0", "--port", "8090", "--n-gpu-layers", "999", "--allow-unauthenticated"]

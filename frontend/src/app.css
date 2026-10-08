@@ -1,0 +1,925 @@
+:root {
+  --bg: #0a0b0d;
+  --panel: #111214;
+  --panel-2: #17181b;
+  --border: #23252a;
+  --border-strong: #33363c;
+  --fg: #e6e7e9;
+  --fg-strong: #fafafa;
+  --muted: #8b9098;
+  --faint: #5b6067;
+  --danger: #c65a52;
+  --warn: #b98a3c;
+  --radius: 12px;
+  --radius-sm: 9px;
+  color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  --bg: #fafafb;
+  --panel: #ffffff;
+  --panel-2: #f4f5f6;
+  --border: #e7e8eb;
+  --border-strong: #d6d8dc;
+  --fg: #1b1c1f;
+  --fg-strong: #000000;
+  --muted: #6c7178;
+  --faint: #9aa0a7;
+  --danger: #b23b32;
+  --warn: #8a6318;
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue',
+    Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-size: 13.5px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  height: 100vh;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 216px 1fr;
+  height: 100vh;
+}
+
+/* ── Sidebar ───────────────────────────────────────────── */
+aside {
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+aside h1 {
+  font-size: 14px;
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-strong);
+}
+
+nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+nav button {
+  text-align: left;
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13.5px;
+  font-weight: 500;
+}
+
+nav button:hover {
+  background: var(--panel-2);
+  color: var(--fg);
+}
+
+nav button.active {
+  background: var(--panel-2);
+  color: var(--fg-strong);
+}
+
+.status {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.status .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.status.on .dot {
+  background: var(--fg);
+}
+
+.addr {
+  font-size: 11px;
+  color: var(--faint);
+  word-break: break-all;
+}
+
+/* ── Page shell ────────────────────────────────────────── */
+main {
+  overflow: hidden;
+}
+
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  padding: 20px 24px;
+  gap: 14px;
+  overflow-y: auto;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-right: 96px;
+}
+
+h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+h3 {
+  margin: 0 0 12px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+}
+
+/* ── Controls ──────────────────────────────────────────── */
+button {
+  background: var(--fg);
+  color: var(--bg);
+  border: 1px solid transparent;
+  padding: 7px 14px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13px;
+  line-height: 1.2;
+  transition: opacity 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+button:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+button.ghost {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  font-weight: 500;
+}
+
+button.ghost:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--border-strong);
+  opacity: 1;
+}
+
+/* ── Cards / forms ─────────────────────────────────────── */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+
+.facts {
+  margin: 8px 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.field > span {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+}
+
+.row .field {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+input,
+textarea,
+select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 11px;
+  font: inherit;
+  outline: none;
+}
+
+:root[data-theme='light'] input,
+:root[data-theme='light'] textarea,
+:root[data-theme='light'] select {
+  background: var(--panel);
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--border-strong);
+}
+
+textarea {
+  resize: none;
+}
+
+code {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.error {
+  background: transparent;
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+}
+
+.notice {
+  border: 1px solid var(--border-strong);
+  color: var(--muted);
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+}
+
+/* Security-relevant, so it earns the one non-red accent. */
+.warn {
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  background: transparent;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ok {
+  color: var(--muted);
+}
+
+strong.on {
+  color: var(--fg-strong);
+}
+
+.checkline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  color: var(--muted);
+}
+
+.checkline input {
+  width: auto;
+}
+
+/* Even columns for parameter groups.
+   Rows of two and rows of three used to each fill the card, so no column lined
+   up with the one above it. A grid gives every field the same width regardless
+   of how many share its row, and the row gap keeps the groups apart. */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  gap: 12px 14px;
+  margin-bottom: 4px;
+}
+
+.grid .field {
+  margin-bottom: 0;
+}
+
+.grid .field input,
+.grid .field select {
+  width: 100%;
+}
+
+.grid .checkline {
+  margin-top: 0;
+  align-self: center;
+}
+
+/* Boolean options are a group of their own: tucking them into the parameter
+   columns leaves them landing in whatever cell the field count happens to end on. */
+.grid.checks {
+  margin-top: 10px;
+}
+
+/* ── Chat ──────────────────────────────────────────────── */
+.chat .transcript {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 4px 2px;
+}
+
+.bubble {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  max-width: 78%;
+}
+
+.bubble.user {
+  align-self: flex-end;
+  background: var(--panel-2);
+}
+
+.bubble .role {
+  font-size: 10px;
+  color: var(--faint);
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  margin-bottom: 6px;
+}
+
+.bubble .content {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.bubble .meta {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.caret {
+  display: inline-block;
+  width: 6px;
+  height: 13px;
+  margin-left: 2px;
+  background: var(--fg);
+  vertical-align: text-bottom;
+  animation: blink 1s steps(2) infinite;
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--panel);
+  padding: 12px 14px 10px;
+}
+
+.composer textarea {
+  border: none;
+  background: transparent;
+  padding: 2px 0;
+  min-height: 64px;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+:root[data-theme='light'] .composer textarea {
+  background: transparent;
+}
+
+.composer .bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.composer .model {
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 5px 8px;
+  border-radius: 8px;
+  max-width: 260px;
+  outline: none;
+}
+
+.composer .model:hover:not(:disabled) {
+  background: var(--panel-2);
+}
+
+.composer .params {
+  position: relative;
+}
+
+.composer .params > summary {
+  list-style: none;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12.5px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  user-select: none;
+}
+
+.composer .params > summary::-webkit-details-marker {
+  display: none;
+}
+
+.composer .params > summary:hover,
+.composer .params[open] > summary {
+  color: var(--fg);
+  background: var(--panel-2);
+}
+
+.composer .params-panel {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 220px;
+  max-height: 62vh;
+  overflow-y: auto;
+  padding: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+}
+
+.composer .params-panel label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.composer .params-panel input {
+  width: 84px;
+}
+
+.composer .params-panel label.check {
+  justify-content: flex-start;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.composer .params-panel label.check input {
+  width: auto;
+  accent-color: var(--text);
+}
+
+.composer .attach {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 50%;
+  flex: none;
+}
+
+.composer .attach svg {
+  width: 16px;
+  height: 16px;
+}
+
+.composer .attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.attachment {
+  position: relative;
+  display: block;
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+}
+
+.attachment img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.attachment button {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.attachment button svg {
+  width: 11px;
+  height: 11px;
+}
+
+.thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.thumbs img {
+  width: 96px;
+  height: 96px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  display: block;
+}
+
+.composer .params-panel .seed {
+  display: flex;
+  gap: 6px;
+}
+
+/* A generated key is long; let it shrink so the buttons keep their width. */
+.keyrow {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.keyrow input {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.keyrow button {
+  flex: none;
+  white-space: nowrap;
+}
+
+.composer .params-panel .seed select {
+  padding: 5px 6px;
+}
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  margin-left: auto;
+  border-radius: 50%;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--fg);
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.composer .send {
+  margin-left: auto;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  background: var(--fg);
+  color: var(--bg);
+  border: none;
+}
+
+.spinner + .send {
+  margin-left: 0;
+}
+
+.composer .send svg {
+  width: 17px;
+  height: 17px;
+}
+
+.composer .send:disabled {
+  background: var(--border-strong);
+  color: var(--faint);
+  opacity: 1;
+}
+
+/* ── Lists ─────────────────────────────────────────────── */
+.repo-list,
+.file-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.repo-list .repo {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: var(--fg);
+  font-weight: 500;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+}
+
+.repo-list .repo:hover {
+  background: var(--panel-2);
+  opacity: 1;
+}
+
+.repo-list .repo.active {
+  border-color: var(--border-strong);
+  background: var(--panel-2);
+}
+
+.repo-meta {
+  color: var(--faint);
+  font-weight: 400;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.file-list li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--border);
+}
+
+.file-list li:last-child {
+  border-bottom: none;
+}
+
+.file-name {
+  flex: 1;
+  word-break: break-all;
+}
+
+.file-size {
+  color: var(--faint);
+  font-size: 12px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* API-served models: not for the chat panel, so they read differently. */
+.badge.api {
+  border-color: var(--border-strong);
+  color: var(--fg);
+}
+
+.progress {
+  margin-top: 10px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.progress .bar {
+  height: 100%;
+  background: var(--fg);
+  transition: width 0.2s ease;
+}
+
+details.advanced {
+  margin-top: 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+details.advanced summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  margin-bottom: 10px;
+  user-select: none;
+}
+
+.checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.search-row {
+  align-items: flex-end;
+}
+
+.searchbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--panel);
+  padding: 6px 6px 6px 14px;
+}
+
+.searchbar input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  padding: 8px 0;
+  font-size: 13.5px;
+}
+
+:root[data-theme='light'] .searchbar input {
+  background: transparent;
+}
+
+.page header {
+  padding-right: 96px;
+}
+
+/* ── Top-right corner menu ─────────────────────────────── */
+.corner {
+  position: fixed;
+  top: 12px;
+  right: 16px;
+  z-index: 50;
+}
+
+.corner-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  cursor: default;
+}
+
+.corner:hover .corner-trigger {
+  color: var(--fg);
+  border-color: var(--border-strong);
+}
+
+.corner-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 8px;
+  min-width: 200px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-4px);
+  transition: opacity 0.14s ease, transform 0.14s ease, visibility 0.14s;
+}
+
+.corner:hover .corner-menu {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
+
+.menu-group + .menu-group {
+  border-top: 1px solid var(--border);
+  margin-top: 8px;
+  padding-top: 10px;
+}
+
+.menu-title {
+  display: block;
+  font-size: 10px;
+  color: var(--faint);
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  margin-bottom: 8px;
+}
+
+.menu-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.menu-row button {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 5px 10px;
+  border-radius: 7px;
+  font-weight: 500;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.menu-row button:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--border-strong);
+  opacity: 1;
+}
+
+.menu-row button.active {
+  color: var(--fg-strong);
+  border-color: var(--border-strong);
+  background: var(--panel-2);
+}

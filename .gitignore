@@ -1,0 +1,26 @@
+/target
+node_modules/
+dist/
+build/
+*.log
+.DS_Store
+Thumbs.db
+.vite/
+models/
+crates/app/target/
+crates/app/gen/
+crates/app/binaries/
+crates/app/backends/
+
+# Model and cache artifacts: never commit these, they are hundreds of MB.
+*.gguf
+*.gguf.part
+*.bin
+*.safetensors
+
+# Local environment and editor settings.
+.env
+.env.*
+*.local
+.vscode/
+.idea/
