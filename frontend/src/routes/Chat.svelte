@@ -225,6 +225,29 @@ function tps(stats) {
   return (stats.generated_tokens / (stats.gen_ms / 1000)).toFixed(1);
 }
 
+// Qwen-style reasoning models wrap their chain of thought in ` thinking…`.
+// Shown raw those tags are noise in the reply, so the text is split into the
+// reasoning and the answer. `open` is true until the closing tag arrives, which
+// is how a live stream is told from a finished reply.
+const THINK_OPEN = ' thinking';
+const THINK_CLOSE = '<' + '/think' + '>';
+
+function splitThinking(text) {
+  const start = text.indexOf(THINK_OPEN);
+  if (start === -1) return { thinking: '', answer: text, has: false, open: false };
+  const from = start + THINK_OPEN.length;
+  const end = text.indexOf(THINK_CLOSE, from);
+  if (end === -1) {
+    return { thinking: text.slice(from), answer: '', has: true, open: true };
+  }
+  return {
+    thinking: text.slice(from, end),
+    answer: text.slice(end + THINK_CLOSE.length).replace(/^\n+/, ''),
+    has: true,
+    open: false,
+  };
+}
+
 onMount(() => {
   refreshModels();
   const id = setInterval(refreshModels, 5000);
@@ -257,11 +280,27 @@ onMount(() => {
           {/each}
         </div>
       {/if}
-      <div class="content"
-          >{m.content}{#if busy && i === messages.length - 1 && m.role === 'assistant'}<span
-              class="caret"
-            ></span>{/if}</div
+      {#if m.role === 'assistant'}
+        {@const think = splitThinking(m.content)}
+        {#if think.has && think.thinking.trim()}
+          {#if think.open}
+            <div class="thinking">
+              <div class="thinking-head">{$t('chat.thinking')}</div>
+              <div class="thinking-body">{think.thinking}</div>
+            </div>
+          {:else}
+            <details class="thinking">
+              <summary>{$t('chat.thinking')}</summary>
+              <div class="thinking-body">{think.thinking}</div>
+            </details>
+          {/if}
+        {/if}
+        <div class="content"
+          >{think.answer}{#if busy && i === messages.length - 1}<span class="caret"></span>{/if}</div
         >
+      {:else}
+        <div class="content">{m.content}</div>
+      {/if}
         {#if m.role === 'assistant' && m.stats}
           <div class="meta">
             {tps(m.stats)} tok/s · {m.stats.generated_tokens} tok · {$t('chat.firstToken')}

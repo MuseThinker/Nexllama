@@ -37,6 +37,10 @@ let busy = $state('');
 let loadingPath = $state('');
 
 let query = $state('');
+// Restricting a search to one author is the difference between hundreds of
+// repos of uneven quality and a list worth reading. Empty means "anywhere".
+let author = $state('');
+let authors = $state([]);
 let searching = $state(false);
 let results = $state([]);
 let activeRepo = $state('');
@@ -294,7 +298,11 @@ async function search() {
   files = [];
   activeRepo = '';
   try {
-    results = await invoke('hub_search', { query: query.trim(), limit: 20 });
+    results = await invoke('hub_search', {
+      query: query.trim(),
+      author: author || null,
+      limit: 20,
+    });
   } catch (e) {
     error = String(e);
   } finally {
@@ -361,6 +369,13 @@ onMount(() => {
   loadAdv();
   refreshModelsDir();
   refreshDaemon();
+  // The list of authors lives next to the search that uses it, so adding one
+  // does not mean editing the UI twice.
+  if (hasTauri) {
+    invoke('hub_trusted_authors')
+      .then((list) => (authors = list ?? []))
+      .catch(() => (authors = []));
+  }
   return () => {
     un1?.();
     un2?.();
@@ -445,6 +460,18 @@ onMount(() => {
         >{searching ? $t('models.searching') : $t('models.search')}</button
       >
     </div>
+
+    {#if authors.length > 0}
+      <div class="sources">
+        <span class="sources-label">{$t('models.sources')}</span>
+        <button class="chip" class:active={author === ''} onclick={() => (author = '')}>
+          {$t('models.anyAuthor')}
+        </button>
+        {#each authors as a}
+          <button class="chip" class:active={author === a} onclick={() => (author = a)}>{a}</button>
+        {/each}
+      </div>
+    {/if}
 
     {#if !hasTauri}
       <p class="muted">{$t('models.tDesktop')}</p>

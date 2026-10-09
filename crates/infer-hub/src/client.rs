@@ -8,6 +8,22 @@ use crate::error::{HubError, Result};
 
 pub const DEFAULT_ENDPOINT: &str = "https://hf-mirror.com";
 
+/// The authors whose GGUFs are worth reaching for first.
+///
+/// Quantising well is a craft — a bad quant costs accuracy that no amount of
+/// context or sampling gets back — and three names cover nearly everything
+/// worth running locally:
+///
+/// * **bartowski** — the broadest catalogue, one model at many sizes;
+/// * **Unsloth** — dynamic quants (`UD` series) and the releases that carry
+///   the extra heads MTP drafting needs;
+/// * **z-lab** — the DFlash draft models, which is how a dense model with no
+///   MTP head gets speculative decoding at all.
+///
+/// Nothing is restricted to these: they are what the download page offers
+/// first, and searching still covers the whole Hub.
+pub const TRUSTED_AUTHORS: [&str; 3] = ["bartowski", "Unsloth", "z-lab"];
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GgufFile {
     pub filename: String,
@@ -69,6 +85,51 @@ impl HubClient {
         let resp = self
             .auth(self.http.get(&url).query(&[
                 ("search", query),
+                ("limit", limit_s.as_str()),
+                ("sort", "downloads"),
+                ("direction", "-1"),
+                ("filter", "gguf"),
+            ]))
+            .send()
+            .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(HubError::AuthRequired);
+        }
+        if !status.is_success() {
+            return Err(HubError::Status {
+                status: status.as_u16(),
+                url,
+            });
+        }
+        let items: Vec<ApiModel> = resp.json().await?;
+        Ok(items
+            .into_iter()
+            .map(|m| RepoSummary {
+                id: m.id,
+                downloads: m.downloads.unwrap_or(0),
+                likes: m.likes.unwrap_or(0),
+            })
+            .collect())
+    }
+
+    /// Search within one author's repositories.
+    ///
+    /// Searching the Hub for "qwen" returns hundreds of repos of wildly uneven
+    /// quality, most of them someone's first attempt at a conversion. Naming the
+    /// author is the difference between that and a list a person can pick from.
+    pub async fn search_by_author(
+        &self,
+        author: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RepoSummary>> {
+        let url = format!("{}/api/models", self.endpoint);
+        let limit_s = limit.to_string();
+        let resp = self
+            .auth(self.http.get(&url).query(&[
+                ("search", query),
+                ("author", author),
                 ("limit", limit_s.as_str()),
                 ("sort", "downloads"),
                 ("direction", "-1"),

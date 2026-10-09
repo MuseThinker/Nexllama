@@ -1174,11 +1174,26 @@ fn list_local_models(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, St
 }
 
 #[tauri::command]
-async fn hub_search(query: String, limit: Option<usize>) -> Result<Vec<RepoSummary>, String> {
-    HubClient::new()
-        .search(&query, limit.unwrap_or(20))
-        .await
-        .map_err(|e| e.to_string())
+async fn hub_search(
+    query: String,
+    author: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<RepoSummary>, String> {
+    let client = HubClient::new();
+    let limit = limit.unwrap_or(20);
+    match author.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+        // Naming the author turns "hundreds of qwen repos" into a list worth
+        // reading; see `TRUSTED_AUTHORS` for why those three.
+        Some(author) => client.search_by_author(author, &query, limit).await,
+        None => client.search(&query, limit).await,
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// The authors the download page offers first.
+#[tauri::command]
+fn hub_trusted_authors() -> Vec<&'static str> {
+    infer_hub::TRUSTED_AUTHORS.to_vec()
 }
 
 #[tauri::command]
@@ -1655,6 +1670,7 @@ pub fn run() {
             hub_search,
             hub_list_gguf,
             hub_download,
+            hub_trusted_authors,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -420,6 +420,8 @@ struct LoadRequest {
     #[serde(default)]
     draft_model: Option<String>,
     #[serde(default)]
+    draft_n_max: Option<u32>,
+    #[serde(default)]
     lora: Option<Vec<String>>,
     #[serde(default)]
     keep_alive_secs: Option<u64>,
@@ -563,13 +565,29 @@ async fn load(
         }
         cfg.mmproj = Some(v.clone().into());
     }
+    // A separate checkpoint that drafts for this model — DFlash or EAGLE-3. It
+    // is the other half of speculative decoding: `load_mtp` uses heads bundled
+    // in the target, this uses a second set of weights trained to predict it.
+    if let Some(v) = req.draft_model.as_ref() {
+        if !Path::new(v).is_file() {
+            return Err(ApiError::NotFound(format!("draft model not found: {v}")));
+        }
+        cfg.draft_model = Some(v.clone().into());
+        if let Some(n) = req.draft_n_max {
+            cfg.draft_n_max = n;
+        }
+    }
     let n_gpu_layers = cfg.n_gpu_layers;
     let n_ctx = cfg.n_ctx;
     let load_mtp = cfg.load_mtp;
 
     let mut notes: Vec<String> = Vec::new();
     if req.draft_model.is_some() {
-        notes.push("a draft model was provided, but speculative decoding is not wired yet".into());
+        notes.push(
+            "a draft model is loaded; turn on speculative decoding per request to have it \
+             draft"
+                .into(),
+        );
     }
 
     // Drop any existing model with the same id before loading the new one.

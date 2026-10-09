@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use llama_cpp_4::common_sampler::{CommonSampler, CommonSamplerParams};
 use llama_cpp_4::context::params::LlamaContextType;
+use llama_cpp_4::eagle::{Eagle3Session, Eagle3SessionConfig};
 use llama_cpp_4::model::params::LlamaLoadMode;
 use llama_cpp_4::model::LlamaLoraAdapter;
 use llama_cpp_4::mtmd::{
@@ -108,6 +109,22 @@ pub struct LoadConfig {
     /// forces `load_mtp`, because the weights have to be resident to draft at all.
     #[serde(default)]
     pub mtp_n_max: u32,
+    /// A **separate** draft model whose proposals the target verifies.
+    ///
+    /// This is the other half of speculative decoding: `load_mtp` uses heads that
+    /// come bundled in the target, while this takes a second checkpoint — DFlash
+    /// (block diffusion, from Z-Lab) or EAGLE-3 — that was trained to draft for
+    /// it. They are complementary rather than interchangeable, because an MTP
+    /// head only exists on models that shipped one, and DFlash exists precisely
+    /// to cover the dense models that did not.
+    #[serde(default)]
+    pub draft_model: Option<PathBuf>,
+    /// How many tokens a separate draft model may propose per round.
+    ///
+    /// 0 picks a conservative default; the real bound is `n_batch`, since the
+    /// whole proposal has to be verified in one pass.
+    #[serde(default)]
+    pub draft_n_max: u32,
     /// LoRA adapters to apply.
     pub lora: Vec<LoraAdapter>,
     /// Where to keep learned n-gram draft statistics between runs.
@@ -140,6 +157,8 @@ impl LoadConfig {
             load_mtp: false,
             n_rs_seq: 0,
             mtp_n_max: 0,
+            draft_model: None,
+            draft_n_max: 0,
             lora: Vec::new(),
             ngram_cache: None,
             mmproj: None,
@@ -868,6 +887,69 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
         }
     };
 
+    // A separately published draft model is its own set of weights, so it gets
+    // its own model and context — built here rather than per request, because a
+    // second KV cache is not something to rebuild for every reply.
+    let draft_model = match cfg.draft_model.as_ref() {
+        Some(path) => {
+            if class != gguf_probe::ModelClass::Llm {
+                let _ = ready.send(LoadEvent::Error(
+                    "a separate draft model needs a chat model (class llm) to draft for".into(),
+                ));
+                return;
+            }
+            if mtp_n_max > 0 {
+                let _ = ready.send(LoadEvent::Error(
+                    "MTP and a separate draft model are two ways to draft; load one or the \
+                     other, not both"
+                        .into(),
+                ));
+                return;
+            }
+            let _ = ready.send(LoadEvent::Phase("loading draft model".into()));
+            match LlamaModel::load_from_file(
+                backend,
+                path,
+                &LlamaModelParams::default().with_n_gpu_layers(cfg.n_gpu_layers),
+            ) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    let _ = ready.send(LoadEvent::Error(format!("draft model load: {e:?}")));
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
+    let mut draft_ctx = match draft_model.as_ref() {
+        Some(dm) => {
+            let _ = ready.send(LoadEvent::Phase("creating draft context".into()));
+            // An ordinary context, not `LlamaContextType::Mtp`: that one is for a
+            // model drafting from heads bundled in itself, whereas this reads the
+            // target's hidden states through the session instead.
+            match dm.new_context(
+                backend,
+                build_ctx(None).with_n_ctx(NonZeroU32::new(cfg.n_ctx)),
+            ) {
+                Ok(mut c) => {
+                    c.set_warmup(false);
+                    Some(c)
+                }
+                Err(e) => {
+                    let _ = ready.send(LoadEvent::Error(format!("draft context: {e:?}")));
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
+    let draft_kind = cfg.draft_model.as_deref().map(draft_kind);
+    let draft_n_max = if cfg.draft_n_max > 0 {
+        cfg.draft_n_max
+    } else {
+        8
+    };
+
     // The context keeps a *list* of adapters, and the binding's setter replaces
     // that whole list with the single adapter it is handed — so looping over
     // the list used to leave only the last one applied, with nothing to show
@@ -1000,6 +1082,9 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
                     &drafting,
                     &mut mtp_draft_ctx,
                     mtp_n_max,
+                    &mut draft_ctx,
+                    draft_kind,
+                    draft_n_max,
                 ) {
                     let _ = reply.send(GenEvent::Error(e));
                 }
@@ -1166,7 +1251,7 @@ fn run_embed(model: &LlamaModel, ctx: &mut LlamaContext, texts: &[String]) -> Re
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_generate<'m>(
+fn run_generate<'m, 'd>(
     model: &LlamaModel,
     ctx: &mut LlamaContext<'m>,
     vision: &Option<MtmdContext>,
@@ -1175,9 +1260,12 @@ fn run_generate<'m>(
     reply: &Sender<GenEvent>,
     cache: &mut DraftCache,
     drafting: &AtomicBool,
-    draft_ctx: &mut Option<LlamaContext<'m>>,
+    mtp_draft_ctx: &mut Option<LlamaContext<'m>>,
     // (see `run_generate`)
     mtp_n_max: u32,
+    draft_ctx: &mut Option<LlamaContext<'d>>,
+    draft_kind: Option<DraftKind>,
+    draft_n_max: u32,
 ) -> Result<()> {
     let n_ctx = ctx.n_ctx() as usize;
     let n_batch = ctx.n_batch().max(1) as usize;
@@ -1189,7 +1277,7 @@ fn run_generate<'m>(
     // hand that over. Prefilling here first would leave the head with nothing
     // to draft from.
     if params.speculative && mtp_n_max > 0 {
-        if let Some(draft) = draft_ctx.as_mut() {
+        if let Some(draft) = mtp_draft_ctx.as_mut() {
             let stats = generate_mtp(
                 model,
                 ctx,
@@ -1200,6 +1288,27 @@ fn run_generate<'m>(
                 reply,
                 n_ctx,
                 mtp_n_max as i32,
+            )?;
+            let _ = reply.send(GenEvent::Done(stats));
+            return Ok(());
+        }
+    }
+
+    // A separate draft model outranks the n-gram drafter as well: it proposes
+    // from learned weights rather than from repeats in this conversation, so
+    // when one is loaded it is the better guess.
+    if params.speculative {
+        if let (Some(kind), Some(draft)) = (draft_kind, draft_ctx.as_mut()) {
+            let stats = generate_draft_model(
+                model,
+                ctx,
+                draft,
+                kind,
+                msgs,
+                params,
+                reply,
+                n_ctx,
+                draft_n_max as i32,
             )?;
             let _ = reply.send(GenEvent::Done(stats));
             return Ok(());
@@ -1847,6 +1956,327 @@ fn generate_mtp<'m>(
         // stop conditions. A draft may itself contain the end-of-generation
         // token, so the round has to be able to stop mid-prefix like the
         // n-gram path does.
+        let mut stop = false;
+        for &tok in kept_drafts {
+            if generated >= cap || model.is_eog_token(tok) {
+                stop = true;
+                break;
+            }
+            emit_token(model, tok, &mut pending, reply)?;
+            generated += 1;
+        }
+        if stop {
+            break;
+        }
+    }
+    emit_tail(&mut pending, reply)?;
+
+    Ok(GenStats {
+        prompt_tokens,
+        generated_tokens: generated,
+        prompt_ms,
+        gen_ms: t_gen.elapsed().as_secs_f64() * 1000.0,
+        first_token_ms,
+        draft_tokens,
+        accepted_draft_tokens: accepted_draft,
+        draft_rounds,
+        hit_token_cap: params.hit_token_cap(generated),
+    })
+}
+
+/// Which protocol a separately published draft model speaks.
+///
+/// The two are not interchangeable: they differ in what the checkpoint has to
+/// contain and in how the session validates it, so it has to be told which one
+/// it is driving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DraftKind {
+    /// Z-Lab's block-diffusion drafter. DFlash2 checkpoints — the ones that add
+    /// grouped dynamic convolution and a candidate selector — speak the same
+    /// protocol and are detected from the header, so there is no separate
+    /// variant for them.
+    DFlash,
+    /// EAGLE-3, which needs three target-extract layers in the draft model.
+    Eagle3,
+}
+
+impl DraftKind {
+    fn name(self) -> &'static str {
+        match self {
+            DraftKind::DFlash => "DFlash",
+            DraftKind::Eagle3 => "EAGLE-3",
+        }
+    }
+}
+
+/// Read the draft protocol off the checkpoint, falling back to its file name.
+///
+/// Both kinds are published with the protocol in the name, which would usually
+/// be enough — but the header is what decides, and an EAGLE-3 checkpoint handed
+/// to the DFlash session fails somewhere deep in the draft graph.
+fn draft_kind(path: &Path) -> DraftKind {
+    if let Ok(p) = gguf_probe::probe(path) {
+        let arch = p
+            .architecture
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if arch.contains("dflash") {
+            return DraftKind::DFlash;
+        }
+        if arch.contains("eagle") {
+            return DraftKind::Eagle3;
+        }
+    }
+    if path.to_string_lossy().to_lowercase().contains("dflash") {
+        DraftKind::DFlash
+    } else {
+        DraftKind::Eagle3
+    }
+}
+
+/// Speculative decoding driven by a **separate** draft model.
+///
+/// The counterpart to [`generate_mtp`]: there the proposals come from heads
+/// bundled in the target, here from a second checkpoint trained to draft for it.
+/// The loop is the same shape — prefill through the session so the drafter sees
+/// every prompt position, then per round: propose, verify the whole proposal in
+/// one batched target decode, keep the prefix the target agreed with, and trim
+/// both caches back to it.
+///
+/// Both exist because they cover different models rather than because one is
+/// better: an MTP head only exists on models that shipped one, and DFlash's
+/// block diffusion was built for dense models that did not — Qwen3.8-27B has no
+/// MTP head to load, but there is a DFlash2 checkpoint for it.
+#[allow(clippy::too_many_arguments)]
+fn generate_draft_model<'m, 'd>(
+    model: &LlamaModel,
+    ctx: &mut LlamaContext<'m>,
+    draft_ctx: &mut LlamaContext<'d>,
+    kind: DraftKind,
+    msgs: &[ChatMsg],
+    params: &SamplerParams,
+    reply: &Sender<GenEvent>,
+    n_ctx: usize,
+    n_draft_max: i32,
+) -> Result<GenStats> {
+    let who = kind.name();
+    let n_batch = ctx.n_batch().max(1) as usize;
+    let k_max = (n_draft_max.max(1) as usize).min(n_batch.saturating_sub(1));
+
+    // The drafter works from the target's hidden states, and image positions
+    // have none, so an image prompt is refused rather than silently drafting
+    // from a history that does not match what is in the cache.
+    let images: usize = msgs.iter().map(ChatMsg::image_count).sum();
+    if images > 0 {
+        return Err(InferError::Unsupported {
+            class: who.to_ascii_lowercase(),
+            what: format!("draft with images ({images} attached); {who} is text-only"),
+        });
+    }
+
+    let messages = msgs
+        .iter()
+        .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
+    let rendered = model
+        .apply_chat_template(None, &messages, true)
+        .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
+    let prompt = model
+        .str_to_token(&rendered, AddBos::Always)
+        .map_err(|e| InferError::Tokenize(e.to_string()))?;
+    if prompt.len() >= n_ctx {
+        return Err(InferError::ContextFull {
+            used: prompt.len(),
+            n_ctx,
+        });
+    }
+
+    let mut cs_params = CommonSamplerParams::new();
+    let mut sc = cs_params.scalars();
+    sc.min_keep = 1;
+    sc.temp = params.temperature;
+    sc.top_k = params.top_k;
+    sc.top_p = params.top_p;
+    sc.min_p = params.min_p;
+    sc.penalty_last_n = params.repeat_last_n;
+    sc.penalty_repeat = params.repeat_penalty;
+    sc.penalty_freq = params.repeat_freq;
+    sc.penalty_present = params.repeat_present;
+    sc.seed = params.seed;
+    cs_params.set_scalars(&sc);
+    let mut sampler =
+        CommonSampler::new(model, &mut cs_params).map_err(|e| InferError::Decode(e.to_string()))?;
+    for tok in &prompt {
+        sampler.accept(*tok, false);
+    }
+
+    let config = Eagle3SessionConfig::new(1, n_draft_max);
+    let mut session = match kind {
+        DraftKind::DFlash => Eagle3Session::new_dflash_with_config(ctx, draft_ctx, config),
+        DraftKind::Eagle3 => Eagle3Session::new_with_config(ctx, draft_ctx, config),
+    }
+    .map_err(|e| InferError::Decode(format!("{who} session: {e}")))?;
+
+    // A request that failed mid-round leaves the drafter ahead of the target,
+    // and the next prefill would then be rejected outright.
+    session
+        .clear_draft_kv_cache_seq(None, None, None)
+        .map_err(|e| InferError::Decode(format!("{who} draft cache reset: {e}")))?;
+
+    // The whole prompt has to pass through the session, not just its last
+    // ubatch: the drafter keeps a row per token, and one it never saw is a
+    // hole it cannot draft past.
+    let t_start = Instant::now();
+    let mut batch = LlamaBatch::new(n_batch.max(k_max + 1), 1);
+    let prompt_tokens = prompt.len();
+    let total = prompt.len();
+    let mut n_past = 0i32;
+    for (chunk_idx, chunk) in prompt.chunks(n_batch).enumerate() {
+        batch.clear();
+        let base = chunk_idx * n_batch;
+        for (i, &tok) in chunk.iter().enumerate() {
+            batch
+                .add(tok, (base + i) as i32, &[0], base + i == total - 1)
+                .map_err(|e| InferError::Decode(e.to_string()))?;
+        }
+        session.decode_target_and_process(&mut batch).map_err(|e| {
+            InferError::Decode(format!(
+                "{who} prefill ubatch {chunk_idx} (n_tokens={}, n_past={base}): {e}",
+                chunk.len()
+            ))
+        })?;
+        n_past = (base + chunk.len()) as i32;
+    }
+    let prompt_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+
+    session
+        .begin(0, &prompt)
+        .map_err(|e| InferError::Decode(format!("{who} begin: {e}")))?;
+
+    let t_gen = Instant::now();
+    let mut first_token_ms = 0.0f64;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut generated = 0usize;
+    let mut draft_tokens = 0usize;
+    let mut accepted_draft = 0usize;
+    let mut draft_rounds = 0usize;
+    let cap = params.token_cap();
+
+    let mut next = sampler
+        .sample(session.target_context_mut(), -1, false)
+        .map_err(|e| InferError::Decode(format!("{who} sample first token: {e}")))?;
+    sampler.accept(next, true);
+
+    loop {
+        if generated >= cap || model.is_eog_token(next) {
+            break;
+        }
+
+        emit_token(model, next, &mut pending, reply)?;
+        if generated == 0 {
+            first_token_ms = t_gen.elapsed().as_secs_f64() * 1000.0;
+        }
+        generated += 1;
+
+        let room = (n_ctx as i32 - n_past - 1).max(0) as usize;
+        if room == 0 {
+            break;
+        }
+
+        let proposals = if generated < cap {
+            session
+                .draft(0, n_past, next)
+                .map_err(|e| InferError::Decode(format!("{who} draft: {e}")))?
+        } else {
+            Vec::new()
+        };
+        let k = proposals.len().min(room).min(k_max);
+
+        // `draft` pushed the proposal positions into the drafter's own cache,
+        // but those rows were speculative: `process` has to rebuild them from
+        // the target's hidden states, which is also what records the rows
+        // `accept` reads back.
+        session
+            .clear_draft_kv_cache_seq(Some(0), Some(n_past as u32), None)
+            .map_err(|e| InferError::Decode(format!("{who} draft kv reset: {e}")))?;
+
+        if k == 0 {
+            batch.clear();
+            batch
+                .add(next, n_past, &[0], true)
+                .map_err(|e| InferError::Decode(e.to_string()))?;
+            session
+                .decode_target_and_process(&mut batch)
+                .map_err(|e| InferError::Decode(format!("{who} decode: {e}")))?;
+            n_past += 1;
+            next = sampler
+                .sample(session.target_context_mut(), -1, false)
+                .map_err(|e| InferError::Decode(format!("{who} sample: {e}")))?;
+            sampler.accept(next, true);
+            continue;
+        }
+
+        let draft = &proposals[..k];
+        batch.clear();
+        batch
+            .add(next, n_past, &[0], true)
+            .map_err(|e| InferError::Decode(e.to_string()))?;
+        for (i, &tok) in draft.iter().enumerate() {
+            batch
+                .add(tok, n_past + 1 + i as i32, &[0], true)
+                .map_err(|e| InferError::Decode(e.to_string()))?;
+        }
+        session
+            .decode_target_and_process(&mut batch)
+            .map_err(|e| InferError::Decode(format!("{who} verify: {e}")))?;
+
+        draft_tokens += k;
+        draft_rounds += 1;
+
+        // Row 0 produced the proposal, so row j validates draft j-1, and the
+        // row after the last draft yields the token that follows.
+        let out = verify_draft(&mut sampler, session.target_context_mut(), draft)
+            .map_err(|e| InferError::Decode(format!("{who} verify sample: {e}")))?;
+        if out.is_empty() {
+            return Err(InferError::Decode(format!(
+                "{who}: verification returned no tokens"
+            )));
+        }
+        let accepted = out.len() - 1;
+        let (kept_drafts, sampled) = out.split_at(accepted);
+        next = sampled[0];
+
+        let kept = 1 + accepted as i32;
+        if accepted < k {
+            let p0 = (n_past + kept) as u32;
+            // Both caches walked through the rejected tokens and both have to
+            // give them back, or the drafter's positions stop lining up with
+            // the target's and the next `process` is refused.
+            let trimmed = session
+                .clear_target_kv_cache_seq(Some(0), Some(p0), None)
+                .map_err(|e| InferError::Decode(format!("{who} target kv trim: {e}")))?;
+            let trimmed_draft = session
+                .clear_draft_kv_cache_seq(Some(0), Some(p0), None)
+                .map_err(|e| InferError::Decode(format!("{who} draft kv trim: {e}")))?;
+            if !trimmed || !trimmed_draft {
+                return Err(InferError::Decode(format!(
+                    "{who}: the KV cache would not drop {} rejected draft token(s) \
+                     (target={trimmed}, draft={trimmed_draft}); raise --n-rs-seq or lower \
+                     the draft length",
+                    k - accepted
+                )));
+            }
+        }
+
+        session
+            .accept(0, accepted as u16)
+            .map_err(|e| InferError::Decode(format!("{who} accept: {e}")))?;
+
+        accepted_draft += accepted;
+        n_past += kept;
+
         let mut stop = false;
         for &tok in kept_drafts {
             if generated >= cap || model.is_eog_token(tok) {

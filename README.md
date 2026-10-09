@@ -512,8 +512,54 @@ for the remainder of the generation; now the following request starts within a
 second.
 
 This is self-speculation, so it needs no draft model. A bundled MTP head is
-loaded via `load_mtp`, and `draft`/`eagle` models are recognised but not yet
-wired into generation.
+loaded via `load_mtp`.
+
+### Draft models: DFlash and EAGLE-3
+
+Self-speculation only pays off on repetitive text, because there has to be a
+repeat to copy. A **draft model** is the other way: a second, smaller checkpoint
+trained to predict the target, so proposals come from learned weights instead of
+from this conversation.
+
+```bash
+curl http://127.0.0.1:15656/admin/load -H "Content-Type: application/json" -d '{
+  "model": "/models/Qwen3.8-27B-Q4_K_M.gguf",
+  "draft_model": "/models/Qwen3.8-27B-DFlash2.gguf",
+  "draft_n_max": 8
+}'
+```
+
+Then ask for it per request with `"speculative": true` (or tick *Speculative* in
+Chat → Params). The two routes are complementary rather than competing:
+
+| | MTP (`load_mtp`) | DFlash / EAGLE-3 (`draft_model`) |
+|---|---|---|
+| Where the weights come from | heads bundled in the target | a separate checkpoint |
+| Which models can use it | only ones that shipped MTP heads | any dense model with a matching drafter |
+| Typical source | Unsloth releases | **z-lab** for DFlash |
+
+Qwen3.8-27B has no MTP head to load, which is exactly the case DFlash exists
+for — `z-lab/Qwen3.8-27B-DFlash2-GGUF` is the drafter for it. DFlash2
+checkpoints are detected from their own GGUF metadata, so nothing extra has to
+be declared beyond pointing at the file.
+
+Both drafters work from the target's hidden states, so neither is used for image
+prompts; a request with images falls back to ordinary decoding rather than
+drafting from a history that does not match what is in the cache.
+
+## Where models come from
+
+Search is unrestricted, but three authors cover nearly everything worth running
+locally, and the download page offers them as one-click filters:
+
+- **bartowski** — the broadest catalogue, one model at many sizes;
+- **Unsloth** — dynamic quants and the releases carrying the extra heads MTP
+  needs;
+- **z-lab** — the DFlash draft models (UCSD's Z-Lab, who proposed and lead it).
+
+Quantising well is a craft, and a bad quant costs accuracy that no amount of
+context or sampling buys back. Everything on the Hub still works; these are what
+gets offered first.
 
 ## Backend updates
 

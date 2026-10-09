@@ -337,6 +337,8 @@
           "rope_freq_scale": { "type": "number" },
           "load_mtp": { "type": "boolean" },
           "mmproj": { "type": "string", "description": "Multimodal projector, for image input." },
+          "draft_model": { "type": "string", "description": "A separate draft checkpoint — DFlash or EAGLE-3 — that proposes continuations for the target to verify. The other half of speculative decoding from `load_mtp`, which uses heads bundled in the target." },
+          "draft_n_max": { "type": "integer", "description": "Tokens the draft model may propose per round. 0 uses a default; the real bound is n_batch, since the proposal is verified in one pass." },
           "lora": { "type": "array", "items": { "type": "string" } },
           "keep_alive_secs": { "type": "integer" },
           "set_default": { "type": "boolean" }

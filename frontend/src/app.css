@@ -511,6 +511,33 @@ strong.on {
   word-break: break-word;
 }
 
+/* The reasoning block, kept apart from the answer: collapsed once it is done,
+   and shown live while it is still being written. */
+.bubble .thinking {
+  margin-bottom: 10px;
+}
+
+.bubble .thinking summary,
+.bubble .thinking-head {
+  cursor: pointer;
+  color: var(--faint);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  user-select: none;
+}
+
+.bubble .thinking-body {
+  margin-top: 6px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
 .bubble .meta {
   margin-top: 8px;
   font-size: 11px;
@@ -970,4 +997,39 @@ details.advanced summary {
   color: var(--fg-strong);
   border-color: var(--border-strong);
   background: var(--panel-2);
+}
+
+/* Download sources: the authors whose quantisations are worth searching first. */
+.sources {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.sources-label {
+  font-size: 12px;
+  color: var(--muted);
+  margin-right: 2px;
+}
+
+.chip {
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.chip:hover {
+  border-color: var(--muted);
+}
+
+.chip.active {
+  background: var(--fg);
+  border-color: var(--fg);
+  color: var(--bg);
 }
