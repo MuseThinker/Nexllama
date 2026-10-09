@@ -76,10 +76,27 @@ aside h1 {
   color: var(--fg-strong);
 }
 
+/* The wordmark is mostly deep navy, which sinks into the dark panel; a lift
+   keeps the official artwork legible without recolouring it. */
+aside .brand {
+  display: block;
+  width: 148px;
+  height: auto;
+  margin: 2px 0 4px;
+}
+
+:root[data-theme='dark'] aside .brand {
+  filter: brightness(1.45) saturate(1.05);
+}
+
+/* The rule separates the mark from the navigation, which otherwise ran straight
+   into it. */
 nav {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  border-top: 1px solid var(--border-strong);
+  padding-top: 14px;
 }
 
 nav button {
@@ -87,10 +104,10 @@ nav button {
   background: transparent;
   color: var(--muted);
   border: none;
-  padding: 8px 10px;
+  padding: 10px 12px;
   border-radius: var(--radius-sm);
   cursor: pointer;
-  font-size: 13.5px;
+  font-size: 15px;
   font-weight: 500;
 }
 
@@ -148,7 +165,6 @@ header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding-right: 96px;
 }
 
 h2 {
@@ -357,6 +373,106 @@ strong.on {
    columns leaves them landing in whatever cell the field count happens to end on. */
 .grid.checks {
   margin-top: 10px;
+}
+
+/* ── Daemon status ─────────────────────────────────────── */
+/* The service state is the one thing worth reading at a glance, so it gets a
+   lamp and a line of its own rather than a run-on sentence of `key: value`. */
+.daemon-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.daemon-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--faint);
+  flex: none;
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.daemon-dot.on {
+  background: var(--fg);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--fg) 13%, transparent);
+}
+
+.daemon-status-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  line-height: 1.35;
+  min-width: 0;
+}
+
+.daemon-status-text strong {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.daemon-status-text strong.on {
+  color: var(--fg-strong);
+}
+
+.daemon-status-text > span {
+  font-size: 12px;
+  color: var(--faint);
+}
+
+.daemon-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+
+/* The raw facts sit under a hairline so they read as detail, not as headline. */
+.daemon-facts {
+  display: flex;
+  gap: 34px;
+  margin: 14px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.daemon-facts div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.daemon-facts dt {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--faint);
+}
+
+.daemon-facts dd {
+  margin: 0;
+  font-size: 13px;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Hint text with its action button pinned to the right. */
+.restart-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.restart-row p {
+  flex: 1;
+  margin: 0;
+  font-size: 12px;
+}
+
+.restart-row button {
+  flex: none;
 }
 
 /* ── Chat ──────────────────────────────────────────────── */
@@ -826,75 +942,7 @@ details.advanced summary {
   background: transparent;
 }
 
-.page header {
-  padding-right: 96px;
-}
-
-/* ── Top-right corner menu ─────────────────────────────── */
-.corner {
-  position: fixed;
-  top: 12px;
-  right: 16px;
-  z-index: 50;
-}
-
-.corner-trigger {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  border-radius: var(--radius-sm);
-  background: var(--panel);
-  border: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 12px;
-  letter-spacing: 0.02em;
-  cursor: default;
-}
-
-.corner:hover .corner-trigger {
-  color: var(--fg);
-  border-color: var(--border-strong);
-}
-
-.corner-menu {
-  position: absolute;
-  top: 100%;
-  right: 0;
-  margin-top: 8px;
-  min-width: 200px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 10px;
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
-  opacity: 0;
-  visibility: hidden;
-  transform: translateY(-4px);
-  transition: opacity 0.14s ease, transform 0.14s ease, visibility 0.14s;
-}
-
-.corner:hover .corner-menu {
-  opacity: 1;
-  visibility: visible;
-  transform: translateY(0);
-}
-
-.menu-group + .menu-group {
-  border-top: 1px solid var(--border);
-  margin-top: 8px;
-  padding-top: 10px;
-}
-
-.menu-title {
-  display: block;
-  font-size: 10px;
-  color: var(--faint);
-  text-transform: uppercase;
-  letter-spacing: 0.09em;
-  margin-bottom: 8px;
-}
-
+/* ── Choice rows (theme, language) ─────────────────────── */
 .menu-row {
   display: flex;
   gap: 6px;

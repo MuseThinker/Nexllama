@@ -1,17 +1,20 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use llama_cpp_4::common_sampler::{CommonSampler, CommonSamplerParams};
+use llama_cpp_4::context::params::LlamaContextType;
 use llama_cpp_4::model::params::LlamaLoadMode;
 use llama_cpp_4::model::LlamaLoraAdapter;
 use llama_cpp_4::mtmd::{
     MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunks, MtmdInputText,
 };
+use llama_cpp_4::mtp::{MtpSession, MtpSessionConfig};
 use llama_cpp_4::ngram::ngram_simple_draft;
 use llama_cpp_4::prelude::*;
 
@@ -95,6 +98,16 @@ pub struct LoadConfig {
     pub rope_freq_scale: f32,
     /// Load the model's bundled MTP (NextN) head for speculative decoding.
     pub load_mtp: bool,
+    /// Recurrent-state snapshots kept per sequence so a rejected draft can be
+    /// rolled back. Hybrid/recurrent caches refuse partial rollback at 0.
+    #[serde(default)]
+    pub n_rs_seq: u32,
+    /// MTP draft tokens per round (upstream `--spec-draft-n-max`).
+    ///
+    /// 0 turns MTP off. Anything above it needs a second (draft) context and
+    /// forces `load_mtp`, because the weights have to be resident to draft at all.
+    #[serde(default)]
+    pub mtp_n_max: u32,
     /// LoRA adapters to apply.
     pub lora: Vec<LoraAdapter>,
     /// Where to keep learned n-gram draft statistics between runs.
@@ -125,6 +138,8 @@ impl LoadConfig {
             rope_freq_base: 0.0,
             rope_freq_scale: 0.0,
             load_mtp: false,
+            n_rs_seq: 0,
+            mtp_n_max: 0,
             lora: Vec::new(),
             ngram_cache: None,
             mmproj: None,
@@ -440,6 +455,11 @@ pub struct EngineInfo {
     /// Pooling the context actually ended up with, e.g. `cls` or `rank`.
     #[serde(default)]
     pub pooling: String,
+    /// Whether the GGUF ships a multi-token-prediction (NextN) head.
+    ///
+    /// Capability, not state: `load_mtp` says whether it was loaded.
+    #[serde(default)]
+    pub mtp: bool,
 }
 
 /// Progress emitted while a model is loading.
@@ -707,7 +727,7 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
         .with_main_gpu(cfg.main_gpu)
         .with_load_mode(cfg.load_mode.into())
         .with_use_mlock(cfg.use_mlock)
-        .with_load_mtp(cfg.load_mtp);
+        .with_load_mtp(cfg.load_mtp || cfg.mtp_n_max > 0);
     let model = match LlamaModel::load_from_file(backend, &cfg.model_path, &model_params) {
         Ok(m) => m,
         Err(e) => {
@@ -725,8 +745,10 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
     // The family decides how the context is built, so it has to be known before
     // the context exists: encoders need embeddings enabled and, for rankers, the
     // ranking head attached.
-    let class = gguf_probe::probe(&cfg.model_path)
-        .map(|p| p.classify())
+    let probed = gguf_probe::probe(&cfg.model_path).ok();
+    let class = probed
+        .as_ref()
+        .map(gguf_probe::Probe::classify)
         .unwrap_or(gguf_probe::ModelClass::Llm);
 
     let build_ctx = |pooling: Option<LlamaPoolingType>| {
@@ -735,7 +757,8 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
             .with_n_batch(cfg.n_batch)
             .with_n_ubatch(cfg.n_ubatch)
             .with_flash_attn_type(flash)
-            .with_offload_kqv(cfg.offload_kqv);
+            .with_offload_kqv(cfg.offload_kqv)
+            .with_n_rs_seq(cfg.n_rs_seq);
         if class != gguf_probe::ModelClass::Llm {
             ctx_params = ctx_params.with_embeddings(true);
         }
@@ -793,6 +816,58 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
     }
     ctx.set_warmup(false);
 
+    // MTP drafts with a second context over the same weights, so it is built
+    // here rather than per request: it costs a second KV cache, and rebuilding
+    // it per request would throw that allocation away every time.
+    //
+    // Both sides need recurrent-state snapshots sized to the draft length, or
+    // a rejected draft cannot be rolled back and verification cannot commit it.
+    let mtp_n_max = cfg.mtp_n_max;
+    let mut mtp_draft_ctx = if mtp_n_max == 0 {
+        None
+    } else {
+        if class != gguf_probe::ModelClass::Llm {
+            let _ = ready.send(LoadEvent::Error(
+                "MTP speculative decoding needs a chat model (class llm)".into(),
+            ));
+            return;
+        }
+        if !probed.as_ref().is_some_and(gguf_probe::Probe::has_mtp) {
+            let _ = ready.send(LoadEvent::Error(format!(
+                "{} ships no MTP head, so there is nothing to draft with",
+                cfg.model_path.display()
+            )));
+            return;
+        }
+        let n_rs = (mtp_n_max as i32).max(4) as u32;
+        let need = mtp_n_max + 1;
+        if cfg.n_batch < need || cfg.n_ubatch < need {
+            let _ = ready.send(LoadEvent::Error(format!(
+                "MTP with n_max={mtp_n_max} needs --n-batch and --n-ubatch of at least {need}"
+            )));
+            return;
+        }
+
+        let _ = ready.send(LoadEvent::Phase(format!(
+            "creating MTP draft context (n_max={mtp_n_max})"
+        )));
+        let mut draft_params = build_ctx(None)
+            .with_ctx_type(LlamaContextType::Mtp)
+            .with_n_rs_seq(n_rs)
+            .with_n_seq_max(1);
+        draft_params = draft_params.with_n_ctx(NonZeroU32::new(cfg.n_ctx));
+        match model.new_context(backend, draft_params) {
+            Ok(mut c) => {
+                c.set_warmup(false);
+                Some(c)
+            }
+            Err(e) => {
+                let _ = ready.send(LoadEvent::Error(format!("MTP draft context: {e:?}")));
+                return;
+            }
+        }
+    };
+
     // The context keeps a *list* of adapters, and the binding's setter replaces
     // that whole list with the single adapter it is handed — so looping over
     // the list used to leave only the last one applied, with nothing to show
@@ -824,6 +899,9 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
     }
 
     let mut cache = DraftCache::load(cfg.ngram_cache.clone());
+    // Latched off the first time the KV cache refuses to drop rejected draft
+    // tokens (hybrid models), so only one request pays for finding out.
+    let drafting = Arc::new(AtomicBool::new(true));
 
     // The projector has to be built against the already-loaded text model, and it
     // is optional: without one the model simply cannot see images.
@@ -873,6 +951,7 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
         // model's internal `n_embd` would disagree with the vectors served.
         n_embd: sequence_floats(&model, ctx.pooling_type()) as i32,
         pooling: format!("{:?}", ctx.pooling_type()).to_ascii_lowercase(),
+        mtp: probed.as_ref().is_some_and(gguf_probe::Probe::has_mtp),
     };
     let _ = ready.send(LoadEvent::Ready(info));
 
@@ -911,7 +990,16 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
                 } else if let Err(e) = params.validate() {
                     let _ = reply.send(GenEvent::Error(e));
                 } else if let Err(e) = run_generate(
-                    &model, &mut ctx, &vision, &msgs, &params, &reply, &mut cache,
+                    &model,
+                    &mut ctx,
+                    &vision,
+                    &msgs,
+                    &params,
+                    &reply,
+                    &mut cache,
+                    &drafting,
+                    &mut mtp_draft_ctx,
+                    mtp_n_max,
                 ) {
                     let _ = reply.send(GenEvent::Error(e));
                 }
@@ -1077,19 +1165,46 @@ fn run_embed(model: &LlamaModel, ctx: &mut LlamaContext, texts: &[String]) -> Re
     })
 }
 
-fn run_generate(
+#[allow(clippy::too_many_arguments)]
+fn run_generate<'m>(
     model: &LlamaModel,
-    ctx: &mut LlamaContext,
+    ctx: &mut LlamaContext<'m>,
     vision: &Option<MtmdContext>,
     msgs: &[ChatMsg],
     params: &SamplerParams,
     reply: &Sender<GenEvent>,
     cache: &mut DraftCache,
+    drafting: &AtomicBool,
+    draft_ctx: &mut Option<LlamaContext<'m>>,
+    // (see `run_generate`)
+    mtp_n_max: u32,
 ) -> Result<()> {
     let n_ctx = ctx.n_ctx() as usize;
     let n_batch = ctx.n_batch().max(1) as usize;
 
     ctx.clear_kv_cache();
+
+    // MTP prefills through its own session, because the draft head needs the
+    // target's hidden state for *every* prompt token and only the session can
+    // hand that over. Prefilling here first would leave the head with nothing
+    // to draft from.
+    if params.speculative && mtp_n_max > 0 {
+        if let Some(draft) = draft_ctx.as_mut() {
+            let stats = generate_mtp(
+                model,
+                ctx,
+                draft,
+                vision,
+                msgs,
+                params,
+                reply,
+                n_ctx,
+                mtp_n_max as i32,
+            )?;
+            let _ = reply.send(GenEvent::Done(stats));
+            return Ok(());
+        }
+    }
 
     let t_start = Instant::now();
     let (prompt_tokens, n_past, hist) = fill_prompt(model, ctx, vision, msgs, n_ctx, n_batch)?;
@@ -1107,6 +1222,7 @@ fn run_generate(
             prompt_tokens,
             prompt_ms,
             cache,
+            drafting,
         )?
     } else {
         generate_plain(
@@ -1422,8 +1538,10 @@ fn generate_plain(
     let mut first_token_ms = 0.0f64;
     let mut pending: Vec<u8> = Vec::new();
     let mut generated = 0usize;
+    // Zero means "until the model stops"; the context length is the real bound.
+    let cap = params.token_cap();
 
-    while generated < params.max_tokens && (n_past as usize) < n_ctx {
+    while generated < cap && (n_past as usize) < n_ctx {
         let token = sampler.sample(ctx, -1);
         sampler.accept(token);
         if model.is_eog_token(token) {
@@ -1453,7 +1571,307 @@ fn generate_plain(
         prompt_ms,
         gen_ms: t_gen.elapsed().as_secs_f64() * 1000.0,
         first_token_ms,
+        hit_token_cap: params.hit_token_cap(generated),
         ..Default::default()
+    })
+}
+
+/// Speculative decoding with the model's own MTP (next-token-prediction) head.
+///
+/// This is the same shape as the n-gram path, but the proposals come from the
+/// extra layer the model was trained with rather than from a lookup, so they are
+/// cheap *and* accurate: the head is one layer of a model that already predicts
+/// its own continuation. Each round asks the head for up to `mtp_n_max` tokens,
+/// decodes them together with the sampled token in a single target pass, and
+/// keeps only the prefix the target agreed with.
+///
+/// Three things make this correct rather than merely fast:
+///
+/// * `process` is called after every target decode so the draft context's
+///   recurrent state tracks the target's KV cache.
+/// * `accept` reports how many drafts survived, which is what rolls the draft
+///   head's recurrent state back to the committed point.
+/// * the target KV cache is trimmed back to the accepted prefix. That trim is
+///   why the contexts were built with `n_rs_seq` snapshots: a hybrid model's
+///   recurrent state has no other way to rewind.
+#[allow(clippy::too_many_arguments)]
+fn generate_mtp<'m>(
+    model: &LlamaModel,
+    ctx: &mut LlamaContext<'m>,
+    draft_ctx: &mut LlamaContext<'m>,
+    vision: &Option<MtmdContext>,
+    msgs: &[ChatMsg],
+    params: &SamplerParams,
+    reply: &Sender<GenEvent>,
+    n_ctx: usize,
+    mtp_n_max: i32,
+) -> Result<GenStats> {
+    let n_batch = ctx.n_batch().max(1) as usize;
+    let k_max = (mtp_n_max.max(1) as usize).min(n_batch.saturating_sub(1));
+
+    // The MTP head consumes the target's hidden states, and image tokens have
+    // none, so image prompts are refused outright rather than silently
+    // generating from a draft head that never saw them.
+    let images: usize = msgs.iter().map(ChatMsg::image_count).sum();
+    if images > 0 {
+        return Err(InferError::Unsupported {
+            class: "mtp".into(),
+            what: format!("draft with images ({images} attached); MTP is text-only"),
+        });
+    }
+    let _ = vision;
+
+    let messages = msgs
+        .iter()
+        .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
+    let rendered = model
+        .apply_chat_template(None, &messages, true)
+        .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
+    let prompt = model
+        .str_to_token(&rendered, AddBos::Always)
+        .map_err(|e| InferError::Tokenize(e.to_string()))?;
+    if prompt.len() >= n_ctx {
+        return Err(InferError::ContextFull {
+            used: prompt.len(),
+            n_ctx,
+        });
+    }
+
+    // Verification has to sample from every position in the batch, so this
+    // reuses the n-gram path's reasoning: the plain hand-rolled chain cannot
+    // read a row other than -1.
+    let mut cs_params = CommonSamplerParams::new();
+    let mut sc = cs_params.scalars();
+    sc.min_keep = 1;
+    sc.temp = params.temperature;
+    sc.top_k = params.top_k;
+    sc.top_p = params.top_p;
+    sc.min_p = params.min_p;
+    sc.penalty_last_n = params.repeat_last_n;
+    sc.penalty_repeat = params.repeat_penalty;
+    sc.penalty_freq = params.repeat_freq;
+    sc.penalty_present = params.repeat_present;
+    sc.seed = params.seed;
+    cs_params.set_scalars(&sc);
+    let mut sampler =
+        CommonSampler::new(model, &mut cs_params).map_err(|e| InferError::Decode(e.to_string()))?;
+    for tok in &prompt {
+        sampler.accept(*tok, false);
+    }
+
+    let config = MtpSessionConfig::new(1, mtp_n_max);
+    let mut session = MtpSession::new_with_config(ctx, draft_ctx, config)
+        .map_err(|e| InferError::Decode(format!("MTP session: {e}")))?;
+
+    // The session borrows both contexts, so the draft cache can only be emptied
+    // through it. A request that failed mid-round leaves the head's positions
+    // ahead of the target's, and the next prefill would then be rejected.
+    session
+        .clear_draft_kv_cache_seq(None, None, None)
+        .map_err(|e| InferError::Decode(format!("MTP draft cache reset: {e}")))?;
+
+    // The draft head needs the whole prompt to have gone through the target, so
+    // prefill goes through the session rather than straight to the context.
+    // Every ubatch has to pass `process`, not just the last one: the head keeps
+    // a hidden-state row per token, and a ubatch it never saw is a hole in it.
+    let t_start = Instant::now();
+    let mut batch = LlamaBatch::new(n_batch.max(k_max + 1), 1);
+    let prompt_tokens = prompt.len();
+    let total = prompt.len();
+    let mut n_past = 0i32;
+    for (chunk_idx, chunk) in prompt.chunks(n_batch).enumerate() {
+        batch.clear();
+        let base = chunk_idx * n_batch;
+        for (i, &tok) in chunk.iter().enumerate() {
+            batch
+                .add(tok, (base + i) as i32, &[0], base + i == total - 1)
+                .map_err(|e| InferError::Decode(e.to_string()))?;
+        }
+        session.decode_target_and_process(&mut batch).map_err(|e| {
+            InferError::Decode(format!(
+                "MTP prefill ubatch {chunk_idx} (n_tokens={}, n_past={base}): {e}",
+                chunk.len()
+            ))
+        })?;
+        n_past = (base + chunk.len()) as i32;
+    }
+    let prompt_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+
+    session
+        .begin(0, &prompt)
+        .map_err(|e| InferError::Decode(format!("MTP begin: {e}")))?;
+
+    let t_gen = Instant::now();
+    let mut first_token_ms = 0.0f64;
+    let mut pending: Vec<u8> = Vec::new();
+    let mut generated = 0usize;
+    let mut draft_tokens = 0usize;
+    let mut accepted_draft = 0usize;
+    let mut draft_rounds = 0usize;
+    // Zero means "until the model stops"; the context length is the real bound.
+    let cap = params.token_cap();
+
+    // `next` is sampled but not yet in the target cache.
+    let mut next = sampler
+        .sample(session.target_context_mut(), -1, false)
+        .map_err(|e| InferError::Decode(format!("MTP sample first token: {e}")))?;
+    sampler.accept(next, true);
+
+    loop {
+        if generated >= cap || model.is_eog_token(next) {
+            break;
+        }
+
+        emit_token(model, next, &mut pending, reply)?;
+        if generated == 0 {
+            first_token_ms = t_gen.elapsed().as_secs_f64() * 1000.0;
+        }
+        generated += 1;
+
+        // One slot must stay free for the token that comes after this round.
+        let room = (n_ctx as i32 - n_past - 1).max(0) as usize;
+        if room == 0 {
+            break;
+        }
+
+        let proposals = if generated < cap {
+            session
+                .draft(0, n_past, next)
+                .map_err(|e| InferError::Decode(format!("MTP draft: {e}")))?
+        } else {
+            Vec::new()
+        };
+        let k = proposals.len().min(room).min(k_max);
+
+        // `draft` already pushed the proposal positions into the head's own
+        // cache, but those rows were speculative: `process` has to rebuild them
+        // from the target's shifted hidden states, which is also what records
+        // the rows `accept` later reads. Without this reset the two writers
+        // collide and the head is rejected outright.
+        session
+            .clear_draft_kv_cache_seq(Some(0), Some(n_past as u32), None)
+            .map_err(|e| InferError::Decode(format!("MTP draft kv reset: {e}")))?;
+
+        if k == 0 {
+            // No proposal: fall through to the single-token decode below.
+            batch.clear();
+            batch
+                .add(next, n_past, &[0], true)
+                .map_err(|e| InferError::Decode(e.to_string()))?;
+            session
+                .decode_target_and_process(&mut batch)
+                .map_err(|e| InferError::Decode(format!("MTP decode: {e}")))?;
+            n_past += 1;
+            next = sampler
+                .sample(session.target_context_mut(), -1, false)
+                .map_err(|e| InferError::Decode(format!("MTP sample: {e}")))?;
+            sampler.accept(next, true);
+            continue;
+        }
+
+        let draft = &proposals[..k];
+        batch.clear();
+        batch
+            .add(next, n_past, &[0], true)
+            .map_err(|e| InferError::Decode(e.to_string()))?;
+        for (i, &tok) in draft.iter().enumerate() {
+            batch
+                .add(tok, n_past + 1 + i as i32, &[0], true)
+                .map_err(|e| InferError::Decode(e.to_string()))?;
+        }
+        // The target decode has to be followed by `process`: it is the only
+        // place that reads the target's hidden states back and stores the rows
+        // `accept` picks the new pending row from. It runs against the head's
+        // cache, not the target's, so the logits the verification below reads
+        // are untouched.
+        session
+            .decode_target_and_process(&mut batch)
+            .map_err(|e| InferError::Decode(format!("MTP verify: {e}")))?;
+
+        draft_tokens += k;
+        draft_rounds += 1;
+
+        // Row 0 of the batch is the token that produced the proposal, so row j
+        // validates draft j-1, and the row after the last draft gives the token
+        // that follows. `verify_draft` is the same routine the n-gram path
+        // relies on, so both draughters stay under one verified implementation.
+        let out = verify_draft(&mut sampler, session.target_context_mut(), draft)
+            .map_err(|e| InferError::Decode(format!("MTP verify sample: {e}")))?;
+        if out.is_empty() {
+            return Err(InferError::Decode(
+                "MTP: verification returned no tokens".into(),
+            ));
+        }
+        // `out` is the accepted drafts followed by the token sampled after the
+        // last confirmed position, so it always ends in the new `next`.
+        let accepted = out.len() - 1;
+        let (kept_drafts, sampled) = out.split_at(accepted);
+        next = sampled[0];
+
+        // Drop the rejected tail from the target cache. `p1 = None` means "to
+        // the end", which is the only form a recurrent cache can honour.
+        let kept = 1 + accepted as i32;
+        if accepted < k {
+            let p0 = (n_past + kept) as u32;
+            // Both caches advanced through the rejected tokens and both have to
+            // give them back, or the draft head's positions stop lining up with
+            // the target's and the next `process` is rejected.
+            let trimmed = session
+                .clear_target_kv_cache_seq(Some(0), Some(p0), None)
+                .map_err(|e| InferError::Decode(format!("MTP target kv trim: {e}")))?;
+            let trimmed_draft = session
+                .clear_draft_kv_cache_seq(Some(0), Some(p0), None)
+                .map_err(|e| InferError::Decode(format!("MTP draft kv trim: {e}")))?;
+            if !trimmed || !trimmed_draft {
+                return Err(InferError::Decode(format!(
+                    "MTP: the KV cache would not drop {} rejected draft token(s) even with \
+                     n_rs_seq snapshots (target={trimmed}, draft={trimmed_draft}); raise \
+                     --n-rs-seq or lower the draft length",
+                    k - accepted
+                )));
+            }
+        }
+
+        // Roll the draft head's recurrent state to what survived.
+        session
+            .accept(0, accepted as u16)
+            .map_err(|e| InferError::Decode(format!("MTP accept: {e}")))?;
+
+        accepted_draft += accepted;
+        n_past += kept;
+
+        // Emit the accepted drafts; the trailing sampled token goes out at the
+        // top of the next round, which is where it is also checked against the
+        // stop conditions. A draft may itself contain the end-of-generation
+        // token, so the round has to be able to stop mid-prefix like the
+        // n-gram path does.
+        let mut stop = false;
+        for &tok in kept_drafts {
+            if generated >= cap || model.is_eog_token(tok) {
+                stop = true;
+                break;
+            }
+            emit_token(model, tok, &mut pending, reply)?;
+            generated += 1;
+        }
+        if stop {
+            break;
+        }
+    }
+    emit_tail(&mut pending, reply)?;
+
+    Ok(GenStats {
+        prompt_tokens,
+        generated_tokens: generated,
+        prompt_ms,
+        gen_ms: t_gen.elapsed().as_secs_f64() * 1000.0,
+        first_token_ms,
+        draft_tokens,
+        accepted_draft_tokens: accepted_draft,
+        draft_rounds,
+        hit_token_cap: params.hit_token_cap(generated),
     })
 }
 
@@ -1482,6 +1900,7 @@ fn generate_speculative(
     prompt_tokens: usize,
     prompt_ms: f64,
     cache: &mut DraftCache,
+    drafting: &AtomicBool,
 ) -> Result<GenStats> {
     let n = params.ngram_n.max(1);
     let m = params.ngram_m.max(1);
@@ -1525,6 +1944,8 @@ fn generate_speculative(
     // A round that gets nothing accepted has already paid for a forward pass,
     // so wait a step before drafting again instead of paying twice per token.
     let mut draft_pause = 0usize;
+    // Zero means "until the model stops"; the context length is the real bound.
+    let cap = params.token_cap();
 
     // Every committed token, searched for repeats. `next` is deliberately kept
     // out of it: `ngram_simple_draft` appends the sampled token to the pattern.
@@ -1536,7 +1957,7 @@ fn generate_speculative(
     sampler.accept(next, true);
 
     loop {
-        if generated >= params.max_tokens || model.is_eog_token(next) {
+        if generated >= cap || model.is_eog_token(next) {
             break;
         }
 
@@ -1561,7 +1982,9 @@ fn generate_speculative(
 
         // `ngram_simple_draft` needs more history than the pattern it searches
         // for, otherwise there is nothing to match against.
-        let can_draft = draft_pause == 0 && hist.len() > n as usize + m as usize;
+        let can_draft = drafting.load(Ordering::Relaxed)
+            && draft_pause == 0
+            && hist.len() > n as usize + m as usize;
         if can_draft {
             // Two drafters, unioned. The stateless one finds repeats inside this
             // conversation; the cache knows what followed these n-grams in earlier
@@ -1612,35 +2035,46 @@ fn generate_speculative(
                 draft_pause = usize::from(accepted == 0);
 
                 if accepted < k {
-                    // The draft tokens the model rejected are still sitting in
-                    // the KV cache above the accepted prefix, and llama.cpp
-                    // requires every batch to start exactly one position past
-                    // the cache's last one. Dropping the rejected tail is what
-                    // makes the next decode legal; without it the cache would
-                    // hold positions we are about to renumber.
+                    // The rejected draft tokens are still sitting in the KV
+                    // cache above the accepted prefix, and llama.cpp requires
+                    // every batch to start exactly one position past the cache's
+                    // last one. The rejected tail is always at the *end* of the
+                    // sequence, so this is an open-ended removal ("to the end").
                     let p0 = (n_past + 1 + accepted as i32) as u32;
-                    let p1 = (n_past + k as i32 + 1) as u32;
                     let trimmed = ctx
-                        .clear_kv_cache_seq(Some(0), Some(p0), Some(p1))
+                        .clear_kv_cache_seq(Some(0), Some(p0), None)
                         .map_err(|e| {
                             InferError::Decode(format!("speculative: kv cache trim: {e}"))
                         })?;
-                    if !trimmed {
-                        return Err(InferError::Decode(
-                            "speculative decoding: this model's KV cache cannot drop rejected \
-                             draft tokens, so turn speculative decoding off"
-                                .into(),
-                        ));
-                    }
-                }
 
-                // `next` plus the accepted prefix are already correct in the
-                // cache; the trailing token still has to be decoded.
-                n_past += 1 + accepted as i32;
+                    if trimmed {
+                        n_past += 1 + accepted as i32;
+                    } else {
+                        // Hybrid models (recurrent + attention layers) refuse to
+                        // drop a range from the cache, so there is no way to
+                        // undo a rejected draft. That is not a failure worth
+                        // failing the request over: rebuild the cache from what
+                        // has actually been committed, stop drafting for this
+                        // engine, and finish the reply one token at a time.
+                        drafting.store(false, Ordering::Relaxed);
+
+                        let mut replay: Vec<LlamaToken> = hist[..hist.len() - 1].to_vec();
+                        if let Some(&last) = hist.last() {
+                            replay.push(last);
+                        }
+                        replay.extend_from_slice(&out[..accepted]);
+
+                        ctx.clear_kv_cache();
+                        decode_sequence(ctx, &replay)?;
+                        n_past = replay.len() as i32;
+                    }
+                } else {
+                    n_past += 1 + accepted as i32;
+                }
 
                 let mut stop = false;
                 for &tok in &out {
-                    if generated >= params.max_tokens || model.is_eog_token(tok) {
+                    if generated >= cap || model.is_eog_token(tok) {
                         stop = true;
                         break;
                     }
@@ -1701,6 +2135,7 @@ fn generate_speculative(
         draft_tokens,
         accepted_draft_tokens: accepted_draft,
         draft_rounds,
+        hit_token_cap: params.hit_token_cap(generated),
     })
 }
 
@@ -1742,6 +2177,30 @@ fn verify_draft(
     sampler.accept(token, true);
     out.push(token);
     Ok(out)
+}
+
+/// Decode a whole token sequence into the context, logits on the last token.
+///
+/// Used to rebuild the KV cache from committed tokens when a speculative round
+/// has to be undone and the cache cannot drop the rejected tail.
+fn decode_sequence(ctx: &mut LlamaContext, tokens: &[LlamaToken]) -> Result<()> {
+    let n_batch = ctx.n_batch().max(1) as usize;
+    let mut batch = LlamaBatch::new(n_batch, 1);
+    let total = tokens.len();
+    for (chunk_idx, chunk) in tokens.chunks(n_batch).enumerate() {
+        batch.clear();
+        let base = chunk_idx * n_batch;
+        for (i, &tok) in chunk.iter().enumerate() {
+            let pos = (base + i) as i32;
+            let logits = base + i == total - 1;
+            batch
+                .add(tok, pos, &[0], logits)
+                .map_err(|e| InferError::Decode(e.to_string()))?;
+        }
+        ctx.decode(&mut batch)
+            .map_err(|e| InferError::Decode(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Clamp a draft to what one verification batch can hold.

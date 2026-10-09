@@ -11,9 +11,9 @@ let temperature = $state(0.8);
 let topK = $state(40);
 let topP = $state(0.95);
 let minP = $state(0.05);
-let repeatPenalty = $state(1.1);
+let repeatPenalty = $state(1.0);
 let repeatLastN = $state(64);
-let maxTokens = $state(512);
+let maxTokens = $state(0);
 let seedMode = $state('random');
 let seed = $state(0);
 let speculative = $state(false);
@@ -28,6 +28,15 @@ let fileInput;
 // what lets the daemon stop generating instead of finishing the reply into a
 // socket that is no longer being read.
 let controller = null;
+
+// The sampling panel. A native <details> only closes on its own summary, so
+// once it was open it stayed open through every click elsewhere on the page.
+let paramsOpen = $state(false);
+let paramsEl = null;
+
+function closeParamsIfOutside(e) {
+  if (paramsEl && !paramsEl.contains(e.target)) paramsOpen = false;
+}
 
 // Largest attachment we will inline. Vision models re-read the image on every
 // turn of a conversation, so the bytes are sent again with each request.
@@ -219,7 +228,13 @@ function tps(stats) {
 onMount(() => {
   refreshModels();
   const id = setInterval(refreshModels, 5000);
-  return () => clearInterval(id);
+  // `pointerdown` rather than `click` so the panel is gone by the time the
+  // click lands, instead of one frame after it.
+  document.addEventListener('pointerdown', closeParamsIfOutside);
+  return () => {
+    clearInterval(id);
+    document.removeEventListener('pointerdown', closeParamsIfOutside);
+  };
 });
 </script>
 
@@ -324,7 +339,7 @@ onMount(() => {
         {/each}
       </select>
 
-      <details class="params">
+      <details class="params" bind:open={paramsOpen} bind:this={paramsEl}>
         <summary>{$t('chat.params')}</summary>
         <div class="params-panel">
           <label>{$t('chat.temp')} <input type="number" step="0.05" min="0" max="2" bind:value={temperature} /></label>
@@ -337,7 +352,7 @@ onMount(() => {
           <label
             >{$t('chat.repeatLastN')} <input type="number" step="1" min="0" bind:value={repeatLastN} /></label
           >
-          <label>{$t('chat.maxtok')} <input type="number" step="1" min="1" bind:value={maxTokens} /></label>
+          <label>{$t('chat.maxtok')} <input type="number" step="1" min="0" bind:value={maxTokens} /></label>
           <label class="check">
             <input type="checkbox" bind:checked={speculative} />
             <span>{$t('chat.speculative')}</span>

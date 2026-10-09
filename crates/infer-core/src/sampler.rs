@@ -31,6 +31,12 @@ pub struct SamplerParams {
     pub repeat_freq: f32,
     pub repeat_present: f32,
     pub seed: u32,
+    /// Tokens to generate before stopping, or `0` for "until the model stops".
+    ///
+    /// Zero is the default and the ordinary case: a reply ends on an
+    /// end-of-generation token or when the context fills, whichever comes
+    /// first. A positive value is a hard budget, reported back to the caller
+    /// as a truncated reply rather than a finished one.
     pub max_tokens: usize,
     /// Verify self-drafted n-gram continuations in one batched decode.
     ///
@@ -50,12 +56,19 @@ impl Default for SamplerParams {
             top_k: 40,
             top_p: 0.95,
             min_p: 0.05,
-            repeat_penalty: 1.1,
+            // 1.0 is llama.cpp's default (disabled), and MTP needs it that way:
+            // the draft head samples with top-k only, so any penalty makes it
+            // disagree with the target it is supposed to imitate (81.5% -> 68.6%
+            // acceptance on Qwen3.6-35B). The penalty sampler itself walks every
+            // vocab id through a hash map, which costs ~8 ms per sampled row.
+            repeat_penalty: 1.0,
             repeat_last_n: 64,
             repeat_freq: 0.0,
             repeat_present: 0.0,
             seed: 0xFFFF_FFFF,
-            max_tokens: 512,
+            // 0 = until the model stops. Capping this at all is a deliberate
+            // choice; capping it by default cut replies off mid-sentence.
+            max_tokens: 0,
             speculative: false,
             ngram_n: 4,
             ngram_m: 8,
@@ -139,6 +152,31 @@ impl SamplerParams {
         }
         Ok(())
     }
+
+    /// The number of tokens a generation loop is allowed to produce.
+    ///
+    /// `max_tokens` doubles as a sentinel: zero means "until the model stops",
+    /// and the loops bound themselves on the context length instead. Returning
+    /// the sentinel straight out would make every loop read as if zero tokens
+    /// were allowed, which is exactly how an early version silently answered
+    /// with nothing.
+    pub fn token_cap(&self) -> usize {
+        if self.max_tokens == 0 {
+            usize::MAX
+        } else {
+            self.max_tokens
+        }
+    }
+
+    /// Whether a generation that produced `generated` tokens ran out of budget
+    /// rather than stopping on its own.
+    ///
+    /// This is the difference between `finish_reason: "length"` and `"stop"`:
+    /// a reply cut off at the cap is not a finished reply, and callers that
+    /// stitch the pieces together need to know which they got.
+    pub fn hit_token_cap(&self, generated: usize) -> bool {
+        self.max_tokens > 0 && generated >= self.max_tokens
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +221,28 @@ mod tests {
             ..Default::default()
         };
         p.validate().unwrap();
+    }
+
+    #[test]
+    fn zero_budget_means_no_budget() {
+        let p = SamplerParams::default();
+        assert_eq!(p.max_tokens, 0);
+        // The loops bound themselves on this, so handing back the zero
+        // sentinel would stop before the first token and answer with nothing.
+        assert_eq!(p.token_cap(), usize::MAX);
+        assert!(!p.hit_token_cap(1));
+        assert!(!p.hit_token_cap(100_000));
+    }
+
+    #[test]
+    fn a_positive_budget_stops_and_says_so() {
+        let p = SamplerParams {
+            max_tokens: 512,
+            ..Default::default()
+        };
+        assert_eq!(p.token_cap(), 512);
+        assert!(!p.hit_token_cap(511));
+        assert!(p.hit_token_cap(512));
+        assert!(p.hit_token_cap(513));
     }
 }

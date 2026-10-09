@@ -1,7 +1,9 @@
 <script>
 import { onMount } from 'svelte';
-import { invoke, hasTauri, pickFolder } from '../lib/tauri.js';
-import { t } from '../lib/i18n.js';
+import { invoke, hasTauri } from '../lib/tauri.js';
+import { t, locale } from '../lib/i18n.js';
+import { theme } from '../lib/theme.js';
+import { restartDaemon as daemonRestart } from '../lib/daemonctl.js';
 
 const KEY = 'nexllama.settings';
 
@@ -12,6 +14,9 @@ const defaults = {
   autoStartDaemon: true,
   model: '',
   autoLoad: [],
+  // `modelsDir` and the load parameters below are edited on the Models page, but
+  // they still have to ride along in this object: `set_settings` replaces the
+  // whole settings file, so a key this page forgets to carry is deleted from it.
   modelsDir: '',
   nGpuLayers: 999,
   nCtx: 4096,
@@ -43,11 +48,10 @@ let settings = $state(local());
 let saved = $state(false);
 let error = $state('');
 let daemonInfo = $state({ running: false, binary: null, port: 15656, backend: 'cpu' });
+let daemonBusy = $state(false);
 let backendInfo = $state(null);
-let modelsDirPath = $state('');
 let localModels = $state([]);
 let autoStart = $state(local().autoStartDaemon ?? true);
-let busy = $state(false);
 let backendUpdate = $state({ current: '', manifest_url: null, available: [] });
 let updateInfo = $state(null);
 let checking = $state(false);
@@ -144,23 +148,6 @@ async function refreshBackend() {
   }
 }
 
-async function refreshModelsDir() {
-  if (!hasTauri) return;
-  try {
-    modelsDirPath = await invoke('models_dir_cmd');
-  } catch (e) {
-    error = String(e);
-  }
-}
-
-async function openFolder() {
-  try {
-    await invoke('open_models_dir');
-  } catch (e) {
-    error = String(e);
-  }
-}
-
 async function refreshModels() {
   if (!hasTauri) return;
   try {
@@ -175,16 +162,6 @@ function toggleAutoLoad(path, checked) {
   if (checked) set.add(path);
   else set.delete(path);
   settings.autoLoad = [...set];
-}
-
-async function selectFolder() {
-  const dir = await pickFolder($t('settings.selectFolder'));
-  if (!dir) return;
-  settings.modelsDir = dir;
-  await persist();
-  await refreshModelsDir();
-  await refreshModels();
-  await refresh();
 }
 
 async function load() {
@@ -202,7 +179,6 @@ async function load() {
   autoStart = settings.autoStartDaemon;
   refreshStatus();
   refreshBackend();
-  refreshModelsDir();
   refreshModels();
   refreshBackendUpdate();
 }
@@ -257,39 +233,25 @@ $effect(() => {
   saveTimer = setTimeout(() => persist(), 600);
 });
 
-async function startDaemon() {
-  busy = true;
-  error = '';
-  try {
-    await invoke('daemon_start', {
-      model: null,
-      keep_alive_secs: settings.keepAliveSecs,
-      n_gpu_layers: settings.nGpuLayers,
-      n_ctx: settings.nCtx,
-    });
-    await refreshStatus();
-  } catch (e) {
-    error = String(e);
-  } finally {
-    busy = false;
-  }
-}
-
-async function stopDaemon() {
-  busy = true;
-  try {
-    await invoke('daemon_stop');
-    await refreshStatus();
-  } catch (e) {
-    error = String(e);
-  } finally {
-    busy = false;
-  }
-}
-
 function applyMode() {
   if (settings.mode === 'resident') settings.keepAliveSecs = 0;
   else if (settings.keepAliveSecs === 0) settings.keepAliveSecs = 300;
+}
+
+// The bind address and access token only reach the daemon when it spawns, so
+// changing either needs a restart. The button sits in the card that makes the
+// change rather than sending the user to the Models page for the same action.
+async function restartDaemon() {
+  daemonBusy = true;
+  error = '';
+  try {
+    await daemonRestart();
+    await refreshStatus();
+  } catch (e) {
+    error = String(e);
+  } finally {
+    daemonBusy = false;
+  }
 }
 
 onMount(load);
@@ -298,26 +260,25 @@ onMount(load);
 <div class="page settings">
   <header>
     <h2>{$t('settings.title')}</h2>
-    <button onclick={persist}>{$t('settings.save')}</button>
   </header>
 
   <section class="card">
-    <h3>{$t('settings.daemon')}</h3>
-    <p>
-      {$t('settings.status')}:
-      <strong class:on={daemonInfo.running}
-        >{daemonInfo.running ? $t('settings.running') : $t('settings.stopped')}</strong
-      >
-      · {$t('settings.backend')} <strong>{daemonInfo.backend}</strong>
-      · {$t('settings.port')} {daemonInfo.port}
-    </p>
-    {#if daemonInfo.binary}<p class="muted"><code>{daemonInfo.binary}</code></p>{/if}
-    <div class="row">
-      <button onclick={startDaemon} disabled={busy || !hasTauri}>{$t('settings.start')}</button>
-      <button class="ghost" onclick={stopDaemon} disabled={busy || !hasTauri}>{$t('settings.stop')}</button>
-      <button class="ghost" onclick={refreshStatus} disabled={!hasTauri}>{$t('models.refresh')}</button>
+    <h3>{$t('settings.appearance')}</h3>
+    <div class="field">
+      <span>{$t('ui.theme')}</span>
+      <div class="menu-row">
+        <button class:active={$theme === 'light'} onclick={() => theme.set('light')}>{$t('ui.themeLight')}</button>
+        <button class:active={$theme === 'dark'} onclick={() => theme.set('dark')}>{$t('ui.themeDark')}</button>
+        <button class:active={$theme === 'auto'} onclick={() => theme.set('auto')}>{$t('ui.themeAuto')}</button>
+      </div>
     </div>
-    {#if !hasTauri}<p class="muted">{$t('settings.tDesktop')}</p>{/if}
+    <div class="field">
+      <span>{$t('ui.language')}</span>
+      <div class="menu-row">
+        <button class:active={$locale === 'zh'} onclick={() => locale.set('zh')}>中文</button>
+        <button class:active={$locale === 'en'} onclick={() => locale.set('en')}>English</button>
+      </div>
+    </div>
   </section>
 
   <section class="card">
@@ -361,15 +322,16 @@ onMount(load);
         </p>
       {/if}
     {/if}
-    <p class="muted">{$t('settings.networkRestart')}</p>
-  </section>
-
-  <section class="card">
-    <h3>{$t('settings.modelsDir')}</h3>
-    <p class="muted"><code>{modelsDirPath || '—'}</code></p>
-    <div class="row">
-      <button onclick={selectFolder} disabled={!hasTauri}>{$t('settings.selectFolder')}</button>
-      <button class="ghost" onclick={openFolder} disabled={!hasTauri}>{$t('settings.openFolder')}</button>
+    <div class="restart-row">
+      <p class="muted">{$t('settings.networkRestart')}</p>
+      <button
+        class="ghost"
+        onclick={restartDaemon}
+        disabled={daemonBusy || !hasTauri}
+        title={$t('settings.restartHint')}
+      >
+        {$t('settings.restart')}
+      </button>
     </div>
   </section>
 
@@ -469,77 +431,6 @@ onMount(load);
       {/if}
     {/if}
     {#if updateMsg}<p class="ok">{$t('settings.updateDone')}: {updateMsg}</p>{/if}
-  </section>
-
-  <section class="card">
-    <h3>{$t('settings.advanced')}</h3>
-    <div class="grid">
-      <label class="field">
-        <span>{$t('models.gpuLayers')}</span>
-        <input type="number" min="0" bind:value={settings.nGpuLayers} />
-      </label>
-      <label class="field">
-        <span>{$t('settings.mainGpu')}</span>
-        <input type="number" min="0" bind:value={settings.mainGpu} />
-      </label>
-      <label class="field">
-        <span>{$t('models.context')}</span>
-        <input type="number" min="0" step="512" bind:value={settings.nCtx} />
-      </label>
-      <label class="field">
-        <span>{$t('settings.nBatch')}</span>
-        <input type="number" min="1" bind:value={settings.nBatch} />
-      </label>
-      <label class="field">
-        <span>{$t('settings.nUbatch')}</span>
-        <input type="number" min="1" bind:value={settings.nUbatch} />
-      </label>
-      <label class="field">
-        <span>{$t('settings.threads')}</span>
-        <input type="number" min="0" bind:value={settings.threads} />
-      </label>
-      <label class="field">
-        <span>{$t('settings.threadsBatch')}</span>
-        <input type="number" min="0" bind:value={settings.threadsBatch} />
-      </label>
-      <label class="field">
-        <span>{$t('settings.loadMode')}</span>
-        <select bind:value={settings.loadMode}>
-          <option value="auto">auto</option>
-          <option value="mmap">mmap</option>
-          <option value="none">none</option>
-          <option value="mlock">mlock</option>
-          <option value="mmap_mlock">mmap_mlock</option>
-          <option value="dio">dio</option>
-        </select>
-      </label>
-      <label class="field">
-        <span>{$t('settings.flashAttn')}</span>
-        <select bind:value={settings.flashAttn}>
-          <option value="auto">auto</option>
-          <option value="on">on</option>
-          <option value="off">off</option>
-        </select>
-      </label>
-      <label class="field">
-        <span>{$t('settings.ropeFreqBase')}</span>
-        <input type="number" min="0" step="1000" bind:value={settings.ropeFreqBase} />
-      </label>
-      <label class="field">
-        <span>{$t('settings.ropeFreqScale')}</span>
-        <input type="number" min="0" step="0.1" bind:value={settings.ropeFreqScale} />
-      </label>
-    </div>
-    <div class="grid checks">
-      <label class="checkline">
-        <input type="checkbox" bind:checked={settings.useMlock} />
-        <span>{$t('settings.useMlock')}</span>
-      </label>
-      <label class="checkline">
-        <input type="checkbox" bind:checked={settings.offloadKqv} />
-        <span>{$t('settings.offloadKqv')}</span>
-      </label>
-    </div>
   </section>
 
   {#if saved}<div class="ok">{$t('settings.saved')}</div>{/if}

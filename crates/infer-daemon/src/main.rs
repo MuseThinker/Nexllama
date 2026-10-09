@@ -96,6 +96,16 @@ struct Args {
     #[arg(long, default_value_t = false)]
     load_mtp: bool,
 
+    /// Recurrent-state snapshots per sequence for draft rollback.
+    #[arg(long, default_value_t = 0)]
+    n_rs_seq: u32,
+
+    /// MTP speculative decoding: draft tokens per round (upstream
+    /// --spec-draft-n-max). 0 disables it. Implies --load-mtp and
+    /// --n-rs-seq.
+    #[arg(long, default_value_t = 0)]
+    mtp_n_max: u32,
+
     /// Multimodal projector that lets the model read images.
     #[arg(long)]
     mmproj: Option<PathBuf>,
@@ -162,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    watch_parent();
 
     let mut base = LoadConfig::new("");
     base.n_gpu_layers = args.n_gpu_layers;
@@ -176,6 +187,12 @@ async fn main() -> anyhow::Result<()> {
     base.flash_attn = parse_flash(&args.flash_attn);
     base.offload_kqv = !args.no_offload_kqv;
     base.load_mtp = args.load_mtp;
+    base.n_rs_seq = args.n_rs_seq;
+    base.mtp_n_max = args.mtp_n_max;
+    if args.mtp_n_max > 0 {
+        base.n_rs_seq = base.n_rs_seq.max((args.mtp_n_max as i32).max(4) as u32);
+        base.load_mtp = true;
+    }
     base.rope_freq_base = args.rope_freq_base;
     base.rope_freq_scale = args.rope_freq_scale;
     base.ngram_cache = args.ngram_cache.clone();
@@ -276,6 +293,35 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Exit when the process that started us is gone.
+///
+/// A desktop app that is killed rather than closed used to leave its daemon
+/// running: the model stayed in memory and the port stayed taken. On Windows a
+/// job object handles that from outside; the other platforms have no equivalent
+/// we can attach to a child, so the daemon watches for its parent instead.
+#[cfg(unix)]
+fn watch_parent() {
+    let parent = std::env::var("NEXLLAMA_PARENT_PID")
+        .ok()
+        .and_then(|s| s.parse::<libc::pid_t>().ok())
+        .filter(|p| *p > 1);
+    let Some(parent) = parent else {
+        return;
+    };
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(2));
+        // Re-parented to init once the starter is gone, so the id simply stops
+        // matching; no signal handling needed.
+        if unsafe { libc::getppid() } != parent {
+            tracing::info!("the app that started this daemon is gone; shutting down");
+            std::process::exit(0);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn watch_parent() {}
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;

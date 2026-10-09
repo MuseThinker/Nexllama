@@ -49,6 +49,11 @@ pub struct GenStats {
     pub accepted_draft_tokens: usize,
     /// Decodes that carried a draft.
     pub draft_rounds: usize,
+    /// The reply stopped because it ran out of token budget, not because the
+    /// model chose to stop. The caller reports this as `finish_reason:
+    /// "length"` — a truncated reply and a finished one look identical from
+    /// the text alone.
+    pub hit_token_cap: bool,
 }
 
 impl GenStats {

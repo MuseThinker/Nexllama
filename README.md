@@ -26,12 +26,15 @@ The UI talks to the daemon over local HTTP (default `http://127.0.0.1:15656`).
 
 ## One-click installer with GPU auto-detection
 
-A single installer can ship **every backend** (`cpu`, `cuda`, `vulkan`). At launch the
-app probes the machine and starts the matching daemon, so users don't choose anything:
+A single installer can ship several backends (`cpu`, `cuda`, `vulkan`, `metal`). At
+launch the app probes the machine and starts the matching daemon, so users don't choose
+anything:
 
-1. NVIDIA GPU (nvidia-smi / WMI) → `cuda`
-2. other GPU (AMD/Intel) → `vulkan`
-3. otherwise → `cpu`
+1. NVIDIA GPU (`nvidia-smi`, WMI) → `cuda`
+2. Apple GPU (`system_profiler`) → `metal` — Metal reaches Apple's GPUs directly,
+   where Vulkan would be MoltenVK translating on top of it
+3. other GPU (AMD/Intel, from `lspci`) → `vulkan`
+4. otherwise → `cpu`
 
 Each backend is a self-contained folder `backends/<name>/{infer-daemon.exe, *.dll}`, so
 different backends never clash over DLL names. Users can override the choice in Settings
@@ -78,7 +81,7 @@ npm --prefix frontend run dev
 .\scripts\build.ps1 run -p infer-core --features native --example bench -- models\model.gguf 0
 ```
 
-### Desktop installer (NSIS)
+### Desktop installer
 
 ```powershell
 npm --prefix frontend install                     # once, provides the Tauri CLI
@@ -86,8 +89,32 @@ npm --prefix frontend install                     # once, provides the Tauri CLI
 # -> crates\app\target\release\bundle\nsis\Nexllama_0.1.0_x64-setup.exe
 ```
 
+| Platform | What you get | How to build |
+|---|---|---|
+| Windows | NSIS `.exe` | `.\scripts\package.ps1 -Backends cpu,cuda` |
+| macOS | `.app` and `.dmg` | `./scripts/package.sh metal cpu` |
+| Linux | `.deb` and `.AppImage` | `./scripts/package.sh cpu vulkan` |
+
 `scripts/build-daemon.ps1 -Backend <cpu|vulkan|cuda> [-Native] [-Release]` stages the
-sidecar plus its runtime DLLs into `crates/app/binaries/` for the desktop bundle.
+sidecar plus its runtime libraries into `crates/app/backends/<name>/` for the
+desktop bundle; `scripts/build-daemon.sh` is the same thing for macOS and Linux,
+where the runtime libraries are `.dylib` and `.so` instead of `.dll`.
+
+The macOS and Linux scripts need `cmake`, `ninja` and a C++ toolchain. Linux
+additionally needs `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev` and
+`libayatana-appindicator3-dev`.
+
+**Nothing is signed by default.** Windows shows a SmartScreen prompt; macOS
+refuses to open an unsigned app until the user right-clicks it once. Signing and
+notarising a macOS build needs an Apple Developer account and these secrets,
+which the packaging step picks up when they are present:
+
+```bash
+APPLE_SIGNING_IDENTITY   # e.g. "Developer ID Application: …"
+APPLE_CERTIFICATE        # base64 .p12
+APPLE_CERTIFICATE_PASSWORD
+APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID   # for notarisation
+```
 
 ## HTTP API (daemon)
 
@@ -451,6 +478,32 @@ exact optimisation — not an approximation. Two practical notes:
   byte-identical output.
 
 Every reply reports the hit rate, e.g. `draft 6/32 (19%)`.
+
+### MTP (built-in NextN head)
+
+Some models ship a multi-token-prediction head inside the same GGUF — Qwen3.6's
+`qwen35moe.nextn_predict_layers`, for instance. llama.cpp will only load that head
+when asked, and it is what the reference command uses to go fast:
+
+```bash
+llama-server -m model.gguf -ngl 99 --spec-type draft-mtp --spec-draft-n-max 3
+```
+
+The app detects the head from the GGUF (`nextn_predict_layers`, or `nextn` tensor
+names) and reports it as `info.mtp` in `/admin/status`, with a badge in the
+library. **Loading it is a separate step**, and `load_mtp` says whether it
+happened — the honest state today is usually `mtp=true, load_mtp=false`.
+
+That is deliberate for now. `--load-mtp` only loads the head; the speedup comes
+from *drafting* with it and verifying against the model, and that loop is not
+implemented yet. Enabling the flag without the loop would spend the head's memory
+for no gain, so the app neither auto-enables it nor hides the fact that the model
+has it. `mtp=true` is the signal that the draft loop would pay off.
+
+Note also that the n-gram drafter above is refused on models whose KV cache cannot
+drop rejected draft tokens (Qwen3.6's hybrid cache is one), so speculative
+decoding is off there until the MTP path exists — the daemon says so instead of
+returning wrong tokens.
 
 An abandoned stream is abandoned properly: when the reader goes away the engine
 stops at its next emitted token instead of finishing `max_tokens` into a socket

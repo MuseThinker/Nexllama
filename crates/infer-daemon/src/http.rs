@@ -324,6 +324,9 @@ async fn health(State(state): State<AppState>) -> Response {
     }
     Json(json!({
         "status": "ok",
+        // Lets the app check that the process answering here is the one it
+        // started, rather than a leftover holding the port.
+        "pid": std::process::id(),
         "models_loaded": guard.models.len(),
         "models": guard.ids(),
         "default_model": guard.default_model,
@@ -1441,7 +1444,10 @@ async fn chat(
             "choices": [{
                 "index": 0,
                 "message": { "role": "assistant", "content": text },
-                "finish_reason": "stop",
+                // A reply cut off by `max_tokens` is not a finished reply, and
+                // a client that stitches the pieces together has to be able to
+                // tell the two apart.
+                "finish_reason": if stats.hit_token_cap { "length" } else { "stop" },
             }],
             "usage": {
                 "prompt_tokens": stats.prompt_tokens,
@@ -1496,17 +1502,25 @@ async fn chat(
             return;
         }
         let final_ev = match result {
-            Ok(stats) => Event::default().data(
-                json!({
-                    "id": chat_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_id,
-                    "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
-                    "stats": stats,
-                })
-                .to_string(),
-            ),
+            Ok(stats) => {
+                // See the non-streaming path: a truncated reply reports itself.
+                let finish_reason = if stats.hit_token_cap {
+                    "length"
+                } else {
+                    "stop"
+                };
+                Event::default().data(
+                    json!({
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
+                        "stats": stats,
+                    })
+                    .to_string(),
+                )
+            }
             // Still an `event: error`, but the body is JSON now: a plain-text
             // payload cannot be parsed by the reader that is waiting for
             // chunks, so the failure would arrive as silence.
@@ -1775,10 +1789,11 @@ mod tests {
     #[test]
     fn ollama_options_never_shrink_the_token_budget_to_nothing() {
         let base = SamplerParams::default();
-        // Ollama treats num_predict <= 0 as "until it stops"; that is not a
-        // literal zero-token budget here.
+        // Ollama treats num_predict <= 0 as "until it stops", and so does a
+        // max_tokens of 0 here: neither is a literal zero-token budget.
         let p = sampler_from_options(&base, Some(&json!({ "num_predict": 0 })));
         assert_eq!(p.max_tokens, base.max_tokens);
+        assert_eq!(p.token_cap(), usize::MAX);
         let p = sampler_from_options(&base, Some(&json!({ "num_predict": -1 })));
         assert_eq!(p.max_tokens, base.max_tokens);
         // No options at all is the base as-is.

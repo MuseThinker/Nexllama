@@ -19,6 +19,12 @@ fn main() {
             println!("name         : {:?}", p.name);
             println!("rerank_heads : {:?}", p.rerank_heads);
             println!("pooling_type : {:?}", p.pooling_type);
+            println!(
+                "mtp (nextn)  : {}  (layers {:?}, tensors {})",
+                p.has_mtp(),
+                p.nextn_layers,
+                p.nextn_tensors
+            );
             println!("class        : {}", p.classify().as_str());
         }
         Err(e) => {

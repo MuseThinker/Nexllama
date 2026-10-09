@@ -84,7 +84,12 @@ mod job {
 }
 
 const DEFAULT_PORT: u16 = 15656;
-const BACKENDS: [&str; 3] = ["cuda", "vulkan", "cpu"];
+/// Backends this app knows how to build a path for.
+///
+/// `metal` is Apple's own GPU API. On Apple silicon it is the only path that
+/// runs a model on the GPU directly; Vulkan there is MoltenVK translating on
+/// top of Metal, which works and costs a layer.
+const BACKENDS: [&str; 4] = ["cuda", "vulkan", "metal", "cpu"];
 
 /// Daemon executable name for the current platform.
 #[cfg(windows)]
@@ -284,27 +289,80 @@ static PREFERRED: OnceLock<&'static str> = OnceLock::new();
 fn gpu_names() -> Vec<String> {
     GPU_NAMES
         .get_or_init(|| {
-            let out = hidden_command("powershell")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "(Get-CimInstance Win32_VideoController).Name",
-                ])
-                .output();
-            match out {
-                Ok(o) => String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .map(|s| s.trim().to_lowercase())
-                    .filter(|s| !s.is_empty())
-                    .collect(),
-                Err(_) => Vec::new(),
-            }
+            let text = platform_gpu_text();
+            text.lines()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
         })
         .clone()
 }
 
+/// Ask this platform what graphics hardware it has.
+///
+/// Every platform answers a different question in a different shape, and the
+/// whole point of asking is to pick a backend without making the user choose,
+/// so each one gets its own incantation rather than a lowest common denominator.
+#[cfg(windows)]
+fn platform_gpu_text() -> String {
+    // CIM over PowerShell: no extra dependency, and present on every supported
+    // Windows.
+    let out = hidden_command("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-CimInstance Win32_VideoController).Name",
+        ])
+        .output();
+    out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn platform_gpu_text() -> String {
+    // `system_profiler` reports each display controller, with the interesting
+    // lines shaped like "Chipset Model: Apple M2 Pro".
+    let out = hidden_command("system_profiler")
+        .args(["SPDisplaysDataType"])
+        .output();
+    let raw = out
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    raw.lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim(), value.trim()))
+        .filter(|(key, _)| *key == "Chipset Model" || *key == "Vendor")
+        .map(|(_, value)| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(target_os = "linux")]
+fn platform_gpu_text() -> String {
+    // `lspci` is the closest thing Linux has to a standard answer. The lines
+    // worth reading name a VGA, 3D or display controller.
+    let out = hidden_command("lspci").args(["-nn"]).output();
+    let raw = out
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    raw.lines()
+        .filter(|line| {
+            let l = line.to_ascii_lowercase();
+            l.contains("vga") || l.contains("3d controller") || l.contains("display controller")
+        })
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn platform_gpu_text() -> String {
+    String::new()
+}
+
 fn has_nvidia() -> bool {
+    // `nvidia-smi` ships with the driver on every platform that has one.
     let smi = hidden_command("nvidia-smi")
         .args(["--query-gpu=name", "--format=csv,noheader"])
         .output();
@@ -314,6 +372,11 @@ fn has_nvidia() -> bool {
 fn preferred_backend() -> &'static str {
     PREFERRED.get_or_init(|| {
         let names = gpu_names();
+        // Apple's own GPU: Metal reaches it directly, so prefer it to Vulkan's
+        // translation layer whenever the bundle actually carries it.
+        if cfg!(target_os = "macos") && names.iter().any(|n| n.contains("apple")) {
+            return "metal";
+        }
         let nvidia = names.iter().any(|n| n.contains("nvidia")) || has_nvidia();
         if nvidia {
             return "cuda";
@@ -343,10 +406,12 @@ fn resolve_backend(app: &tauri::AppHandle, requested: &str) -> String {
         return requested.to_string();
     }
     let preferred = preferred_backend();
-    let order: [&str; 3] = match preferred {
-        "cuda" => ["cuda", "vulkan", "cpu"],
-        "vulkan" => ["vulkan", "cuda", "cpu"],
-        _ => ["cuda", "vulkan", "cpu"],
+    // Try the platform's own answer first, then whatever else is bundled.
+    let order: [&str; 4] = match preferred {
+        "metal" => ["metal", "vulkan", "cuda", "cpu"],
+        "cuda" => ["cuda", "vulkan", "metal", "cpu"],
+        "vulkan" => ["vulkan", "metal", "cuda", "cpu"],
+        _ => ["metal", "cuda", "vulkan", "cpu"],
     };
     for b in order {
         if backend_exe(app, b).is_some() {
@@ -610,6 +675,10 @@ fn spawn_daemon(
         }
     }
 
+    // Lets the daemon notice when this app goes away, even when it is killed
+    // rather than closed. Windows additionally puts the child in a job object
+    // below; elsewhere this is the only mechanism there is.
+    cmd.env("NEXLLAMA_PARENT_PID", std::process::id().to_string());
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     #[cfg(windows)]
     job::assign(child.id());
@@ -655,14 +724,61 @@ fn wait_ready(child: &mut Child, host: &str, timeout: Duration) -> Result<(), St
                 "the daemon exited before it was ready (status: {status}); see daemon.log"
             ));
         }
-        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
-            return Ok(());
+
+        // Reachability is not enough. A leftover daemon from a hard kill answers
+        // the port just as readily, and adopting it silently means every setting
+        // the user just changed — the access token, the bind address — quietly
+        // fails to apply, because that process was started long before them.
+        if let Some(pid) = health_pid(addr) {
+            return match pid {
+                Some(pid) if pid == child.id() => Ok(()),
+                Some(pid) => Err(format!(
+                    "port {DEFAULT_PORT} is already served by another process (pid {pid}); \
+                     close the other Nexllama window or stop that daemon, then start again"
+                )),
+                // A server that is not ours answering without a pid is still not ours.
+                None => Err(format!(
+                    "port {DEFAULT_PORT} is already in use by a process that is not this \
+                     daemon's; stop it, then start again"
+                )),
+            };
         }
+
         if Instant::now() >= deadline {
+            // Alive but not answering: give it the benefit of the doubt rather
+            // than failing a start that is merely slow to load a model.
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// `Some(Some(pid))` when a Nexllama daemon answers, `Some(None)` when something
+/// else does, `None` when nothing answers yet.
+fn health_pid(addr: std::net::SocketAddr) -> Option<Option<u32>> {
+    use std::io::{Read, Write};
+
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.write_all(
+        format!("GET /health HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+    );
+    let mut body = String::new();
+    let _ = stream.read_to_string(&mut body);
+    Some(parse_pid(&body))
+}
+
+/// Pull the pid out of a health response body.
+fn parse_pid(body: &str) -> Option<u32> {
+    let rest = body.split("\"pid\"").nth(1)?;
+    let rest = rest.split(':').nth(1)?;
+    let digits: String = rest
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// Stop the daemon and reap it.
@@ -895,11 +1011,18 @@ fn models_dir_cmd(app: tauri::AppHandle) -> Result<String, String> {
 #[tauri::command]
 fn open_models_dir(app: tauri::AppHandle) -> Result<(), String> {
     let dir = models_dir(&app)?;
-    Command::new("explorer")
-        .arg(&dir)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    reveal_in_file_manager(&dir).map_err(|e| e.to_string())
+}
+
+/// Open a folder in whatever this desktop uses to show folders.
+fn reveal_in_file_manager(dir: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let opener = "explorer";
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let opener = "xdg-open";
+    Command::new(opener).arg(dir).spawn().map(|_| ())
 }
 
 fn role_of(filename: &str) -> &'static str {
@@ -967,11 +1090,15 @@ fn bundle(name: &str, dir: &str, files: Vec<serde_json::Value>) -> serde_json::V
     let size: u64 = files.iter().filter_map(|f| f["size"].as_u64()).sum();
     // Read the family out of the main file's header so the library can group it
     // and chat can refuse the models that cannot chat.
-    let class = main
+    let probe = main
         .as_ref()
         .and_then(|p| p.as_str())
-        .map(gguf_probe::probe_class)
+        .and_then(|p| gguf_probe::probe(p).ok());
+    let class = probe
+        .as_ref()
+        .map(|p| p.classify().as_str().to_string())
         .unwrap_or_else(|| gguf_probe::ModelClass::Llm.as_str().to_string());
+    let mtp = probe.as_ref().is_some_and(gguf_probe::Probe::has_mtp);
     serde_json::json!({
         "name": name,
         "dir": dir,
@@ -981,6 +1108,7 @@ fn bundle(name: &str, dir: &str, files: Vec<serde_json::Value>) -> serde_json::V
         "draft": pick("draft"),
         "loras": loras,
         "class": class,
+        "mtp": mtp,
         "kind": if pick("projector").is_some() {
             "vision"
         } else if pick("draft").is_some() {
@@ -1543,6 +1671,15 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    /// A runtime library name, so the fixtures below name a real file on
+    /// whatever platform the test is running on.
+    #[cfg(windows)]
+    const TEST_LIB: &str = "llama.dll";
+    #[cfg(target_os = "macos")]
+    const TEST_LIB: &str = "libllama.dylib";
+    #[cfg(not(any(windows, target_os = "macos")))]
+    const TEST_LIB: &str = "libllama.so";
+
     #[test]
     fn sha256_matches_known_vector() {
         assert_eq!(
@@ -1557,20 +1694,17 @@ mod tests {
         {
             let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
             let opts = zip::write::SimpleFileOptions::default();
-            w.start_file("infer-daemon.exe", opts).unwrap();
+            w.start_file(DAEMON_EXE, opts).unwrap();
             std::io::Write::write_all(&mut w, b"binary").unwrap();
-            w.start_file("llama.dll", opts).unwrap();
+            w.start_file(TEST_LIB, opts).unwrap();
             std::io::Write::write_all(&mut w, b"lib").unwrap();
             w.finish().unwrap();
         }
         let dir = std::env::temp_dir().join("nexllama-zip-test");
         let _ = std::fs::remove_dir_all(&dir);
         extract_zip(&buf, &dir).unwrap();
-        assert_eq!(
-            std::fs::read(dir.join("infer-daemon.exe")).unwrap(),
-            b"binary"
-        );
-        assert_eq!(std::fs::read(dir.join("llama.dll")).unwrap(), b"lib");
+        assert_eq!(std::fs::read(dir.join(DAEMON_EXE)).unwrap(), b"binary");
+        assert_eq!(std::fs::read(dir.join(TEST_LIB)).unwrap(), b"lib");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1715,5 +1849,21 @@ mod tests {
             api_key(&serde_json::json!({ "apiKey": " secret " })).as_deref(),
             Some("secret")
         );
+    }
+
+    #[test]
+    fn health_pid_is_read_from_a_real_response() {
+        let body = "HTTP/1.1 200 OK\r\n\r\n{\"status\":\"ok\",\"pid\":39504,\"models_loaded\":0}";
+        assert_eq!(parse_pid(body), Some(39504));
+        // Ordered differently, and with no spaces.
+        assert_eq!(parse_pid("{\"pid\":7,\"status\":\"ok\"}"), Some(7));
+    }
+
+    #[test]
+    fn health_pid_is_none_for_other_servers() {
+        assert_eq!(parse_pid("{}"), None);
+        assert_eq!(parse_pid("<html>hello</html>"), None);
+        // A `pid` that is not a number is not a pid.
+        assert_eq!(parse_pid("{\"pid\": \"abc\"}"), None);
     }
 }

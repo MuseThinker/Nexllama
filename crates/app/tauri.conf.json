@@ -27,7 +27,13 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.ico"],
-    "resources": ["backends/**/*"]
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "resources": ["backends/**/*"],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
+      }
+    }
   }
 }

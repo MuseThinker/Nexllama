@@ -3,7 +3,15 @@ import { onMount } from 'svelte';
 import { daemon } from '../lib/api.js';
 import { t } from '../lib/i18n.js';
 import { invoke, listen, hasTauri, pickFolder } from '../lib/tauri.js';
+import {
+  startDaemon as daemonStart,
+  stopDaemon as daemonStop,
+  restartDaemon as daemonRestart,
+} from '../lib/daemonctl.js';
 
+// Load parameters. They are edited here because this is where they are used;
+// on the desktop they are also written into the app settings, which is where
+// the daemon picks them up from when it is spawned.
 const advDefaults = {
   nGpuLayers: 999,
   nCtx: 4096,
@@ -19,8 +27,8 @@ const advDefaults = {
   ropeFreqBase: 0,
   ropeFreqScale: 0,
 };
+const LOAD_KEY = 'nexllama.load';
 
-let modelPath = $state('');
 let adv = $state({ ...advDefaults });
 let status = $state({ models: [], default_model: null });
 let error = $state('');
@@ -38,6 +46,10 @@ let downloading = $state('');
 let progress = $state({ downloaded: 0, total: 0 });
 let lastDownloaded = $state('');
 let localModels = $state([]);
+// The inference service the models run on. It used to live on the Settings
+// page, but starting it is the first thing this page needs, so it lives here.
+let daemonInfo = $state({ running: false, port: 15656, backend: 'cpu' });
+let daemonBusy = $state(false);
 
 // Chat models first, then everything a user might keep for attachments later;
 // the classes that cannot generate sit at the bottom where the Load button is
@@ -46,7 +58,8 @@ const classRank = (b) => ({ vision: 1, llm: 2, speculative: 3, embedding: 4, rer
 const orderedModels = $derived([...localModels].sort((a, b) => classRank(a) - classRank(b)));
 let modelsDir = $state('');
 
-async function loadDefaults() {
+let hydrated = false;
+async function loadAdv() {
   let stored = null;
   if (hasTauri) {
     try {
@@ -56,12 +69,46 @@ async function loadDefaults() {
     }
   } else {
     try {
-      stored = JSON.parse(localStorage.getItem('nexllama.settings') ?? 'null');
+      stored = JSON.parse(localStorage.getItem(LOAD_KEY) ?? 'null');
     } catch {
       /* ignore */
     }
   }
-  if (stored) adv = { ...advDefaults, ...stored };
+  if (!stored) return;
+  const picked = {};
+  for (const k of Object.keys(advDefaults)) {
+    if (stored[k] !== undefined && stored[k] !== null) picked[k] = stored[k];
+  }
+  // The effect below may flush before or after this assignment depending on the
+  // platform path; dropping the flag here makes the run it causes count as the
+  // load rather than as an edit, either way round.
+  hydrated = false;
+  adv = { ...advDefaults, ...picked };
+}
+
+let saveTimer;
+$effect(() => {
+  JSON.stringify(adv); // touch every field, so a keystroke anywhere retriggers
+  if (!hydrated) {
+    // The first run is the initial state, and the run right after a load is
+    // the load itself — neither is a user edit.
+    hydrated = true;
+    return;
+  }
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(persistAdv, 400);
+});
+
+function persistAdv() {
+  if (hasTauri) {
+    // The daemon is spawned with whatever is in this file, so the two have to
+    // agree. Re-read first: the settings file holds keys this page does not own.
+    invoke('get_settings')
+      .then((s) => invoke('set_settings', { settings: { ...(s ?? {}), ...adv } }))
+      .catch(() => {});
+  } else {
+    localStorage.setItem(LOAD_KEY, JSON.stringify(adv));
+  }
 }
 
 async function refreshModelsDir() {
@@ -103,6 +150,64 @@ async function refresh() {
   }
 }
 
+async function refreshDaemon() {
+  if (!hasTauri) return;
+  try {
+    daemonInfo = await invoke('daemon_status');
+  } catch (e) {
+    error = String(e);
+  }
+}
+
+// The header's Refresh covers the whole page: the loaded models and the service
+// they run on. One button that refreshes everything beats two that differ by
+// which card they sit in.
+async function refreshAll() {
+  await refresh();
+  await refreshDaemon();
+}
+
+async function startDaemon() {
+  daemonBusy = true;
+  error = '';
+  try {
+    await daemonStart();
+    await refreshDaemon();
+    await refresh();
+  } catch (e) {
+    error = String(e);
+  } finally {
+    daemonBusy = false;
+  }
+}
+
+async function stopDaemon() {
+  daemonBusy = true;
+  try {
+    await daemonStop();
+    await refreshDaemon();
+    await refresh();
+  } catch (e) {
+    error = String(e);
+  } finally {
+    daemonBusy = false;
+  }
+}
+
+async function restartDaemon() {
+  daemonBusy = true;
+  error = '';
+  try {
+    await daemonRestart();
+    await refreshDaemon();
+    await refresh();
+  } catch (e) {
+    error = String(e);
+  } finally {
+    daemonBusy = false;
+  }
+}
+
 async function loadLocal() {
   if (!hasTauri) return;
   try {
@@ -129,25 +234,6 @@ function loadBody(path) {
     rope_freq_base: Number(adv.ropeFreqBase),
     rope_freq_scale: Number(adv.ropeFreqScale),
   };
-}
-
-async function load(path) {
-  const p = (path ?? modelPath).trim();
-  if (!p || busy) return;
-  busy = 'load';
-  loadingPath = p;
-  error = '';
-  notice = '';
-  try {
-    const res = await daemon.load(loadBody(p));
-    if (res?.notes?.length) notice = res.notes.join('; ');
-    await refresh();
-  } catch (e) {
-    error = String(e);
-  } finally {
-    busy = '';
-    loadingPath = '';
-  }
 }
 
 async function loadBundle(b) {
@@ -272,8 +358,9 @@ onMount(() => {
   }).then((f) => (un2 = f));
   refresh();
   loadLocal();
-  loadDefaults();
+  loadAdv();
   refreshModelsDir();
+  refreshDaemon();
   return () => {
     un1?.();
     un2?.();
@@ -285,16 +372,59 @@ onMount(() => {
   <header>
     <h2>{$t('models.title')}</h2>
     <div class="row">
-      <button class="ghost" onclick={refresh}>{$t('models.refresh')}</button>
+      <button class="ghost" onclick={refreshAll}>{$t('models.refresh')}</button>
       {#if status.models.length > 0}
         <button class="ghost" onclick={unloadAll} disabled={busy !== ''}>{$t('models.unload')}</button>
       {/if}
     </div>
   </header>
 
-  <!-- 1. 模型位置 -->
+  <!-- 推理服务：模型跑在它上面，先有服务才有下面的一切 -->
   <section class="card">
-    <h3>1 · {$t('models.dir')}</h3>
+    <h3>{$t('settings.daemon')}</h3>
+    <div class="daemon-status">
+      <span class="daemon-dot" class:on={daemonInfo.running}></span>
+      <div class="daemon-status-text">
+        <strong class:on={daemonInfo.running}
+          >{daemonInfo.running ? $t('settings.running') : $t('settings.stopped')}</strong
+        >
+        <span>{daemonInfo.running
+            ? $t('settings.daemonRunningHint')
+            : $t('settings.daemonStoppedHint')}</span>
+      </div>
+      <div class="daemon-actions">
+        <button onclick={startDaemon} disabled={daemonBusy || !hasTauri || daemonInfo.running}>
+          {$t('settings.start')}
+        </button>
+        <button class="ghost" onclick={stopDaemon} disabled={daemonBusy || !hasTauri || !daemonInfo.running}>
+          {$t('settings.stop')}
+        </button>
+        <button
+          class="ghost"
+          onclick={restartDaemon}
+          disabled={daemonBusy || !hasTauri || !daemonInfo.running}
+          title={$t('settings.restartHint')}
+        >
+          {$t('settings.restart')}
+        </button>
+      </div>
+    </div>
+    <dl class="daemon-facts">
+      <div>
+        <dt>{$t('settings.backend')}</dt>
+        <dd>{daemonInfo.backend}</dd>
+      </div>
+      <div>
+        <dt>{$t('settings.port')}</dt>
+        <dd>{daemonInfo.port}</dd>
+      </div>
+    </dl>
+    {#if !hasTauri}<p class="muted">{$t('settings.tDesktop')}</p>{/if}
+  </section>
+
+  <!-- 模型位置 -->
+  <section class="card">
+    <h3>{$t('models.dir')}</h3>
     <p class="muted"><code>{modelsDir || '—'}</code></p>
     <div class="row">
       <button onclick={selectFolder} disabled={!hasTauri}>{$t('settings.selectFolder')}</button>
@@ -302,9 +432,9 @@ onMount(() => {
     </div>
   </section>
 
-  <!-- 2. 搜索并下载 -->
+  <!-- 搜索并下载 -->
   <section class="card">
-    <h3>2 · {$t('models.download')}</h3>
+    <h3>{$t('models.download')}</h3>
     <div class="searchbar">
       <input
         bind:value={query}
@@ -357,9 +487,9 @@ onMount(() => {
     {/if}
   </section>
 
-  <!-- 3. 本地模型库 -->
+  <!-- 本地模型库 -->
   <section class="card">
-    <h3>3 · {$t('models.library')}</h3>
+    <h3>{$t('models.library')}</h3>
     <p class="muted">{$t('models.libraryHint')}</p>
     {#if !hasTauri}
       <p class="muted">{$t('models.tDesktop')}</p>
@@ -373,6 +503,7 @@ onMount(() => {
               {b.name}
               {#if b.kind === 'vision'}<span class="badge">vision</span>{/if}
               {#if b.kind === 'speculative'}<span class="badge">spec</span>{/if}
+              {#if b.mtp}<span class="badge">MTP</span>{/if}
               {#if b.class === 'embedding' || b.class === 'rerank'}
                 <span class="badge api">API · {b.class}</span>
               {/if}
@@ -387,43 +518,6 @@ onMount(() => {
         {/each}
       </ul>
     {/if}
-  </section>
-
-  <!-- 4. 已加载（运行中） -->
-  <section class="card">
-    <h3>4 · {$t('models.loaded')} ({status.models.length})</h3>
-    {#if status.models.length === 0}
-      <p class="muted">{$t('models.none')}</p>
-    {:else}
-      <ul class="file-list">
-        {#each status.models as m}
-          <li>
-            <span class="file-name">
-              {m.id}
-              {#if m.info?.vision}<span class="badge">vision</span>{/if}
-              {#if m.info?.model_class === 'embedding' || m.info?.model_class === 'rerank'}
-                <span class="badge api">API · {m.info.model_class}</span>
-              {/if}
-              {#if m.id === status.default_model}<span class="badge">{$t('models.default')}</span>{/if}
-            </span>
-            <span class="file-size">ctx {m.n_ctx} · GPU {m.n_gpu_layers} · {$t('models.idle')} {m.idle_secs}s</span>
-            <button class="ghost" onclick={() => unload(m.id)} disabled={busy !== ''}>{$t('models.unload')}</button>
-          </li>
-        {/each}
-      </ul>
-    {/if}
-  </section>
-
-  <!-- 5. 从磁盘加载（高级） -->
-  <section class="card">
-    <h3>5 · {$t('models.loadDisk')}</h3>
-    <label class="field">
-      <span>{$t('models.path')}</span>
-      <input bind:value={modelPath} placeholder="D:\\models\\qwen2.5-0.5b-instruct-q4_k_m.gguf" />
-    </label>
-    <button onclick={() => load()} disabled={busy !== ''}>
-      {busy === 'load' ? $t('models.loading') : $t('models.loadModel')}
-    </button>
 
     <details class="advanced">
       <summary>{$t('models.advanced')}</summary>
@@ -495,6 +589,32 @@ onMount(() => {
         </label>
       </div>
     </details>
+  </section>
+
+  <!-- 已加载（运行中） -->
+  <section class="card">
+    <h3>{$t('models.loaded')} ({status.models.length})</h3>
+    {#if status.models.length === 0}
+      <p class="muted">{$t('models.none')}</p>
+    {:else}
+      <ul class="file-list">
+        {#each status.models as m}
+          <li>
+            <span class="file-name">
+              {m.id}
+              {#if m.info?.vision}<span class="badge">vision</span>{/if}
+              {#if m.info?.mtp}<span class="badge">MTP {m.load_mtp ? 'on' : 'off'}</span>{/if}
+              {#if m.info?.model_class === 'embedding' || m.info?.model_class === 'rerank'}
+                <span class="badge api">API · {m.info.model_class}</span>
+              {/if}
+              {#if m.id === status.default_model}<span class="badge">{$t('models.default')}</span>{/if}
+            </span>
+            <span class="file-size">ctx {m.n_ctx} · GPU {m.n_gpu_layers} · {$t('models.idle')} {m.idle_secs}s</span>
+            <button class="ghost" onclick={() => unload(m.id)} disabled={busy !== ''}>{$t('models.unload')}</button>
+          </li>
+        {/each}
+      </ul>
+    {/if}
   </section>
 
   {#if notice}<div class="notice">{notice}</div>{/if}

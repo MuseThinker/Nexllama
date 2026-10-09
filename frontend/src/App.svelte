@@ -1,11 +1,11 @@
 <script>
 import { onDestroy } from 'svelte';
 import { daemon } from './lib/api.js';
-import { t, locale } from './lib/i18n.js';
-import { theme } from './lib/theme.js';
+import { t } from './lib/i18n.js';
 import Chat from './routes/Chat.svelte';
 import Models from './routes/Models.svelte';
 import Settings from './routes/Settings.svelte';
+import wordmark from './assets/logo-wordmark.png';
 
 const tabs = [
   { id: 'chat', key: 'nav.chat' },
@@ -52,30 +52,9 @@ onDestroy(() => clearInterval(poll));
   }
 </style>
 
-<div class="corner">
-  <div class="corner-trigger">⚙ {$t('nav.settings')}</div>
-  <div class="corner-menu">
-    <div class="menu-group">
-      <span class="menu-title">{$t('ui.theme')}</span>
-      <div class="menu-row">
-        <button class:active={$theme === 'light'} onclick={() => theme.set('light')}>{$t('ui.themeLight')}</button>
-        <button class:active={$theme === 'dark'} onclick={() => theme.set('dark')}>{$t('ui.themeDark')}</button>
-        <button class:active={$theme === 'auto'} onclick={() => theme.set('auto')}>{$t('ui.themeAuto')}</button>
-      </div>
-    </div>
-    <div class="menu-group">
-      <span class="menu-title">{$t('ui.language')}</span>
-      <div class="menu-row">
-        <button class:active={$locale === 'zh'} onclick={() => locale.set('zh')}>中文</button>
-        <button class:active={$locale === 'en'} onclick={() => locale.set('en')}>English</button>
-      </div>
-    </div>
-  </div>
-</div>
-
 <div class="app">
   <aside>
-    <h1>Nexllama</h1>
+    <img class="brand" src={wordmark} alt="Nexllama" />
     <nav>
       {#each tabs as item}
         <button class:active={tab === item.id} onclick={() => (tab = item.id)}

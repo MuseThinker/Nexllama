@@ -302,3 +302,69 @@ fn missing_files_name_the_problem() {
     let result = probe("certainly/not/here.gguf");
     assert!(result.is_err());
 }
+#[test]
+fn mtp_is_recognised_from_the_nextn_layer_count() {
+    // `<arch>.nextn_predict_layers` is what llama.cpp reads into n_layer_nextn.
+    assert_eq!(
+        class_of(vec![
+            (
+                "general.architecture",
+                STRING_TAG,
+                KvValue::String("qwen35moe")
+            ),
+            ("qwen35moe.nextn_predict_layers", 4, KvValue::U32(1)),
+        ]),
+        ModelClass::Llm
+    );
+    let p = read(gguf(vec![
+        (
+            "general.architecture",
+            STRING_TAG,
+            KvValue::String("qwen35moe"),
+        ),
+        ("qwen35moe.nextn_predict_layers", 4, KvValue::U32(1)),
+    ]))
+    .unwrap();
+    assert!(p.has_mtp(), "a positive nextn layer count means MTP");
+    assert_eq!(p.nextn_layers, Some(1));
+}
+
+#[test]
+fn mtp_is_recognised_from_tensor_names_when_the_key_is_absent() {
+    let p = read(gguf_with_tensors(
+        vec![(
+            "general.architecture",
+            STRING_TAG,
+            KvValue::String("qwen35moe"),
+        )],
+        &[
+            "token_embd.weight",
+            "blk.48.nextn.eh_proj.weight",
+            "blk.48.nextn.hnorm.weight",
+        ],
+    ))
+    .unwrap();
+    assert!(p.has_mtp(), "nextn tensors are the fallback signal");
+    assert_eq!(p.nextn_layers, None);
+    assert!(p.nextn_tensors);
+}
+
+#[test]
+fn zero_nextn_layers_without_tensors_is_not_mtp() {
+    let p = read(gguf(vec![
+        ("general.architecture", STRING_TAG, KvValue::String("qwen2")),
+        ("qwen2.nextn_predict_layers", 4, KvValue::U32(0)),
+    ]))
+    .unwrap();
+    assert!(!p.has_mtp());
+}
+
+#[test]
+fn an_ordinary_model_has_no_mtp() {
+    let p = read(gguf_with_tensors(
+        vec![("general.architecture", STRING_TAG, KvValue::String("qwen2"))],
+        &["token_embd.weight", "blk.0.attn_q.weight"],
+    ))
+    .unwrap();
+    assert!(!p.has_mtp());
+}

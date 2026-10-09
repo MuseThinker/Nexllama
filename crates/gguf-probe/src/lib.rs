@@ -132,9 +132,23 @@ pub struct Probe {
     /// share an architecture, a name and a KV section, and differ only by the
     /// head, which shows up as `cls.weight` / `cls.output.*` tensors.
     pub cls_head: bool,
+    /// `<arch>.nextn_predict_layers`, llama.cpp's `n_layer_nextn`.
+    ///
+    /// A positive count is how a model with a built-in MTP (NextN) head says so.
+    pub nextn_layers: Option<u64>,
+    /// Whether any tensor is named `…nextn…`, the fallback signal for a GGUF that
+    /// carries the head without the key.
+    pub nextn_tensors: bool,
 }
 
 impl Probe {
+    /// Whether this model ships a multi-token-prediction head.
+    ///
+    /// llama.cpp loads it only when asked (`--load-mtp` / `--spec-type draft-mtp`),
+    /// so without this the head sits in the file unused.
+    pub fn has_mtp(&self) -> bool {
+        self.nextn_layers.unwrap_or(0) > 0 || self.nextn_tensors
+    }
     /// Pick the family, with the rules written down:
     ///
     /// * a ranking head, rank pooling, or a `cls` tensor makes it a reranker
@@ -249,6 +263,8 @@ fn read_header<R: BufRead + Seek>(mut reader: R) -> Result<Probe, ProbeError> {
         rerank_heads: None,
         pooling_type: None,
         cls_head: false,
+        nextn_layers: None,
+        nextn_tensors: false,
     };
 
     for _ in 0..kv_count {
@@ -274,11 +290,20 @@ fn read_header<R: BufRead + Seek>(mut reader: R) -> Result<Probe, ProbeError> {
             ("pooling_type", GgufType::U64) => {
                 found.pooling_type = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));
             }
+            // The key is prefixed with the architecture, so match on the suffix.
+            (key, GgufType::U32) if key.ends_with(".nextn_predict_layers") => {
+                found.nextn_layers = Some(u64::from(read_u32(&mut reader)?));
+            }
+            (key, GgufType::U64) if key.ends_with(".nextn_predict_layers") => {
+                found.nextn_layers = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));
+            }
             (_, value_type) => skip_value(&mut reader, value_type)?,
         }
     }
 
-    found.cls_head = has_cls_head(&mut reader, tensor_count)?;
+    let (cls_head, nextn) = scan_tensors(&mut reader, tensor_count)?;
+    found.cls_head = cls_head;
+    found.nextn_tensors = nextn;
     Ok(found)
 }
 
@@ -287,12 +312,20 @@ fn read_header<R: BufRead + Seek>(mut reader: R) -> Result<Probe, ProbeError> {
 /// The head is what separates a BERT reranker from the embedding model it shares
 /// everything else with, and it is not in the KV section, so this is the only
 /// place the distinction exists.
-fn has_cls_head<R: BufRead + Seek>(reader: &mut R, tensor_count: u64) -> Result<bool, ProbeError> {
-    let mut found = false;
+fn scan_tensors<R: BufRead + Seek>(
+    reader: &mut R,
+    tensor_count: u64,
+) -> Result<(bool, bool), ProbeError> {
+    let mut cls = false;
+    let mut nextn = false;
     for _ in 0..tensor_count {
         let name = read_string(reader)?;
         if name == "cls" || name.starts_with("cls.") {
-            found = true;
+            cls = true;
+        }
+        // llama.cpp names the MTP head `nextn`; a few converters write `mtp`.
+        if name.contains("nextn") || name.contains("mtp") {
+            nextn = true;
         }
         let n_dims = read_u32(reader)?;
         for _ in 0..n_dims {
@@ -301,7 +334,7 @@ fn has_cls_head<R: BufRead + Seek>(reader: &mut R, tensor_count: u64) -> Result<
         read_u32(reader)?; // ggml type
         read_u8x8(reader)?; // offset
     }
-    Ok(found)
+    Ok((cls, nextn))
 }
 
 fn read_u32<R: BufRead>(reader: &mut R) -> Result<u32, ProbeError> {
