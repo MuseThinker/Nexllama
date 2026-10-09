@@ -300,65 +300,62 @@ fn gpu_names() -> Vec<String> {
 
 /// Ask this platform what graphics hardware it has.
 ///
-/// Every platform answers a different question in a different shape, and the
-/// whole point of asking is to pick a backend without making the user choose,
-/// so each one gets its own incantation rather than a lowest common denominator.
-#[cfg(windows)]
+/// The branch is decided at run time rather than with `#[cfg(target_os)]` on
+/// purpose: a `cfg` branch is not compiled on the platforms it does not match,
+/// so the macOS and Linux arms would only ever be checked by whoever happened
+/// to build there. This way every arm is type-checked on every build, and a
+/// platform is only ever *executed* where it applies.
 fn platform_gpu_text() -> String {
-    // CIM over PowerShell: no extra dependency, and present on every supported
-    // Windows.
-    let out = hidden_command("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(Get-CimInstance Win32_VideoController).Name",
-        ])
-        .output();
-    out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
-}
-
-#[cfg(target_os = "macos")]
-fn platform_gpu_text() -> String {
-    // `system_profiler` reports each display controller, with the interesting
-    // lines shaped like "Chipset Model: Apple M2 Pro".
-    let out = hidden_command("system_profiler")
-        .args(["SPDisplaysDataType"])
-        .output();
-    let raw = out
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    raw.lines()
-        .filter_map(|line| line.split_once(':'))
-        .map(|(key, value)| (key.trim(), value.trim()))
-        .filter(|(key, _)| *key == "Chipset Model" || *key == "Vendor")
-        .map(|(_, value)| value.to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-#[cfg(target_os = "linux")]
-fn platform_gpu_text() -> String {
-    // `lspci` is the closest thing Linux has to a standard answer. The lines
-    // worth reading name a VGA, 3D or display controller.
-    let out = hidden_command("lspci").args(["-nn"]).output();
-    let raw = out
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    raw.lines()
-        .filter(|line| {
-            let l = line.to_ascii_lowercase();
-            l.contains("vga") || l.contains("3d controller") || l.contains("display controller")
-        })
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn platform_gpu_text() -> String {
-    String::new()
+    let out = match std::env::consts::OS {
+        // `system_profiler` reports each display controller, with the
+        // interesting lines shaped like "Chipset Model: Apple M2 Pro".
+        "macos" => hidden_command("system_profiler")
+            .args(["SPDisplaysDataType"])
+            .output()
+            .map(|o| {
+                let raw = String::from_utf8_lossy(&o.stdout);
+                raw.lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(key, value)| (key.trim(), value.trim()))
+                    .filter(|(key, _)| *key == "Chipset Model" || *key == "Vendor")
+                    .map(|(_, value)| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default(),
+        // `lspci` is the closest thing Linux has to a standard answer. The
+        // lines worth reading name a VGA, 3D or display controller.
+        "linux" => hidden_command("lspci")
+            .args(["-nn"])
+            .output()
+            .map(|o| {
+                let raw = String::from_utf8_lossy(&o.stdout);
+                raw.lines()
+                    .filter(|line| {
+                        let l = line.to_ascii_lowercase();
+                        l.contains("vga")
+                            || l.contains("3d controller")
+                            || l.contains("display controller")
+                    })
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default(),
+        // Windows: CIM through PowerShell, which needs no extra dependency and
+        // is present on every supported version.
+        _ => hidden_command("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance Win32_VideoController).Name",
+            ])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default(),
+    };
+    out
 }
 
 fn has_nvidia() -> bool {
@@ -1015,13 +1012,16 @@ fn open_models_dir(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 /// Open a folder in whatever this desktop uses to show folders.
+///
+/// Run-time for the same reason as [`platform_gpu_text`]: every arm gets
+/// compiled everywhere, so a typo in the Linux one is not a surprise saved for
+/// whoever first builds there.
 fn reveal_in_file_manager(dir: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    let opener = "explorer";
-    #[cfg(target_os = "macos")]
-    let opener = "open";
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let opener = "xdg-open";
+    let opener = match std::env::consts::OS {
+        "macos" => "open",
+        "linux" => "xdg-open",
+        _ => "explorer",
+    };
     Command::new(opener).arg(dir).spawn().map(|_| ())
 }
 
