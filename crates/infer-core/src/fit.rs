@@ -87,6 +87,34 @@ const MIN_CTX: u32 = 2048;
 ///
 /// Fails when the hardware cannot be probed or llama.cpp cannot read the file.
 /// A model that simply does not fit is a successful call with `fits: false`.
+/// A report for a size with no local file yet.
+///
+/// Weights dominate what a checkpoint needs, and they are the only thing known
+/// about a file before it has been fetched, so this compares against the
+/// largest thing the machine can hold instead of projecting a full allocation.
+/// It answers "is this worth starting", not "will this load".
+pub fn from_size(bytes: u64, hardware: HardwareProfile) -> FitReport {
+    let (fits, needed_mb, available_mb) = fits_size(bytes, &hardware);
+    let reason = if fits {
+        format!("fits: about {needed_mb} MiB of weights, and {available_mb} MiB is free")
+    } else {
+        format!(
+            "does not fit: about {needed_mb} MiB of weights but only {available_mb} MiB is free; \
+             a smaller quantisation would"
+        )
+    };
+    FitReport {
+        fits,
+        needed_mb,
+        available_mb,
+        suggested_gpu_layers: None,
+        suggested_ctx: None,
+        suggested_quant: None,
+        reason,
+        hardware,
+    }
+}
+
 pub fn fit(path: &Path, n_ctx: u32) -> Result<FitReport> {
     let hardware = probe()?;
     let n_ctx = if n_ctx == 0 { DEFAULT_CTX } else { n_ctx };

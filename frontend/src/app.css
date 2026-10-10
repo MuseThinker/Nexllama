@@ -868,10 +868,34 @@ strong.on {
   gap: 12px;
   padding: 8px 2px;
   border-bottom: 1px solid var(--border);
+  /* Wrap, so a fit report can take a line of its own underneath the row. */
+  flex-wrap: wrap;
 }
 
 .file-list li:last-child {
   border-bottom: none;
+}
+
+/* One line under the row it belongs to: a report squeezed in beside the buttons
+   would leave no room for the reason, which is the whole point of showing it. */
+.fit-report {
+  flex: 1 0 100%;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.fit-report.warn {
+  border-color: #d98a2b;
+  color: var(--text);
 }
 
 /* Flex, not inline: a name that wraps used to flow through the badges that

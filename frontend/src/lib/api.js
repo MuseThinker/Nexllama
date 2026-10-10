@@ -77,6 +77,11 @@ export const daemon = {
   load: (body) =>
     req('/admin/load', { method: 'POST', body: JSON.stringify(body) }, 0),
 
+  // No timeout either: measuring a checkpoint means reading its metadata, and
+  // on a multi-gigabyte file that is real I/O, not a quick lookup.
+  fit: (body) =>
+    req('/admin/fit', { method: 'POST', body: JSON.stringify(body) }, 0),
+
   unload: (model) =>
     req('/admin/unload', {
       method: 'POST',

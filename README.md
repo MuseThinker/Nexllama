@@ -252,6 +252,64 @@ per-model **Advanced** panel on the Models page. Loading accepts:
 The daemon exposes the same options as CLI flags (`--load-mode`, `--flash-attn`,
 `--n-batch`, `--no-offload-kqv`, ...) for headless/Docker use.
 
+## Smart Fit
+
+Nexllama measures the machine and the checkpoint rather than asking you to guess
+at parameters. Every number comes from llama.cpp's own fitting helpers — the same
+ones `llama-cli` uses — not from an estimate about layer sizes, because a
+confident wrong estimate ends in an out-of-memory kill part-way through a load.
+
+**`POST /admin/fit`** measures one checkpoint. Give either:
+
+- `model`: a path to a GGUF already on disk, plus optional `n_ctx`; or
+- `size_bytes`: the size of a file that has not been downloaded yet.
+
+It answers with `fits`, how much is needed against how much is free, the
+`n_gpu_layers` and `n_ctx` llama.cpp would pick, a smaller quantisation when the
+weights themselves are the problem, and a `reason` in plain words.
+
+In the app, the Models page has a **Check fit** button beside each model in the
+library, and **Adopt** applies the suggested layer count and context to the form.
+Downloads are checked against free memory before the transfer starts.
+
+All of it is advice. `/admin/load` accepts `strict_fit: true` if you want a load
+refused outright, but nothing is blocked by default: being wrong about memory
+costs a kill, while a wrong warning costs nothing.
+
+### Prefix cache
+
+A conversation grows a turn at a time, so every prompt after the first contains
+the one before it as a prefix — and re-encoding that prefix is most of the wait
+before the first token. With `prefix_cache` on, the KV state is reused and only
+the new suffix is encoded.
+
+It is off by default. This one is stateful, and being wrong would not raise an
+error: it would quietly produce the wrong reply. Verify before enabling it on a
+model you care about:
+
+```bash
+cargo run -p infer-core --example prefix_check -- models/your-model.gguf 0
+```
+
+That runs the same conversation twice, once with the cache on and once off, and
+compares the replies. On a 0.5B model the second turn took 95% less time to
+encode, with identical output. It switches itself off whenever a draft model or
+MTP head is loaded, because those track position separately from the target.
+
+### Adaptive speculative decoding
+
+Drafting only pays while the model confirms what is proposed; a rejected proposal
+is a forward pass that produced nothing. With `adaptive_draft` (on by default,
+floor `accept_floor` = 0.3) drafting is switched off once measurement says it is
+not paying for itself, and allowed back if the rate recovers. It only ever turns
+drafting *off*, so leaving it enabled is the safe direction.
+
+### Runtime figures
+
+`/admin/status` reports per-model `perf`: requests, tokens, and smoothed
+`tokens_per_second`, `first_token_ms` and `draft_acceptance` — so each of the
+above can be checked rather than taken on faith.
+
 ## Models folder
 
 Models live in a folder scanned recursively for `*.gguf`. The path defaults to

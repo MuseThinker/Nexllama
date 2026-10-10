@@ -381,10 +381,18 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
 #[derive(Deserialize)]
 struct FitRequest {
     /// Path to a GGUF already on disk.
-    model: String,
+    #[serde(default)]
+    model: Option<String>,
     /// Context to measure against; defaults to a conventional 4096.
     #[serde(default)]
     n_ctx: Option<u32>,
+    /// Size in bytes of a file that is *not* on disk yet.
+    ///
+    /// Given instead of `model` when there is nothing to open — a download that
+    /// has not started. Checking that is the only way to warn before several
+    /// gigabytes have already been transferred.
+    #[serde(default)]
+    size_bytes: Option<u64>,
 }
 
 /// `POST /admin/fit` — measure one checkpoint against this machine.
@@ -395,7 +403,22 @@ struct FitRequest {
 /// which is a worse outcome than loading something that turns out slow. So this
 /// reports, and the caller decides.
 async fn fit_check(Json(req): Json<FitRequest>) -> Result<Json<FitReport>, ApiError> {
-    let path = std::path::PathBuf::from(&req.model);
+    // A size needs no file, which is the point: it can be checked before the
+    // download that would have brought the file.
+    if let Some(bytes) = req.size_bytes {
+        let hardware = tokio::task::spawn_blocking(infer_core::hwprofile::probe)
+            .await
+            .map_err(|e| ApiError::Model(format!("hardware probe failed: {e}")))?
+            .map_err(|e| ApiError::Model(e.to_string()))?;
+        return Ok(Json(infer_core::fit::from_size(bytes, hardware)));
+    }
+
+    let Some(model) = req.model else {
+        return Err(ApiError::BadRequest(
+            "fit needs either `model` (a path) or `size_bytes` (a size)".into(),
+        ));
+    };
+    let path = std::path::PathBuf::from(model);
     let n_ctx = req.n_ctx.unwrap_or(0);
     // Measuring reads the checkpoint's metadata, which is real file input on a
     // multi-gigabyte file; it must not run on the async runtime.

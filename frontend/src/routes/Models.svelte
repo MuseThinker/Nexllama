@@ -264,6 +264,38 @@ function loadBody(path) {
   };
 }
 
+// Smart Fit. The daemon measures the checkpoint against what llama.cpp reports
+// about this machine — the same helper llama-cli uses — so these are not guesses
+// about layer sizes. Nothing is applied to the form unless the user asks.
+let fitReport = $state(null);
+let fitBusy = $state('');
+
+async function checkFit(b) {
+  if (!b?.main || busy || fitBusy) return;
+  fitBusy = b.main;
+  error = '';
+  try {
+    await ensureDaemon();
+    const r = await daemon.fit({ model: b.main, n_ctx: Number(adv.nCtx) });
+    fitReport = { path: b.main, ...r };
+  } catch (e) {
+    error = describeError(e);
+  } finally {
+    fitBusy = '';
+  }
+}
+
+function adoptFit() {
+  if (!fitReport) return;
+  if (fitReport.suggested_gpu_layers != null) {
+    adv.nGpuLayers = String(fitReport.suggested_gpu_layers);
+  }
+  if (fitReport.suggested_ctx != null) {
+    adv.nCtx = String(fitReport.suggested_ctx);
+  }
+  notice = $t('models.fitAdopted');
+}
+
 async function loadBundle(b) {
   if (!b?.main || busy) return;
   busy = 'load';
@@ -362,7 +394,20 @@ async function download(file) {
   downloading = file.filename;
   progress = { downloaded: 0, total: file.size };
   error = '';
+  notice = '';
   try {
+    // Checked *before* the transfer, not after: warning once several gigabytes
+    // have already landed is not a warning, it is a receipt.
+    if (file.size > 0) {
+      try {
+        await ensureDaemon();
+        const r = await daemon.fit({ size_bytes: Number(file.size) });
+        if (!r.fits) notice = r.reason;
+      } catch {
+        // A failed check must never block the download. It is advice, and
+        // whoever is clicking may know this machine better than the probe does.
+      }
+    }
     const path = await invoke('hub_download', { repo: activeRepo, filename: file.filename });
     lastDownloaded = path;
     await loadLocal();
@@ -581,9 +626,23 @@ onMount(() => {
                 <span>MTP</span>
               </label>
             {/if}
+            <button class="ghost" onclick={() => checkFit(b)} disabled={busy !== '' || fitBusy !== ''}>
+              {fitBusy === b.main ? $t('models.fitting') : $t('models.fit')}
+            </button>
             <button onclick={() => loadBundle(b)} disabled={busy !== ''}>
               {loadingPath === b.main ? $t('models.loading') : $t('models.load')}
             </button>
+            {#if fitReport?.path === b.main}
+              <div class="fit-report" class:warn={!fitReport.fits}>
+                <span>{fitReport.reason}</span>
+                {#if fitReport.needed_mb > 0}
+                  <span class="file-size">{fitReport.needed_mb} / {fitReport.available_mb} MiB</span>
+                {/if}
+                {#if fitReport.suggested_gpu_layers != null || fitReport.suggested_ctx != null}
+                  <button class="ghost" onclick={adoptFit}>{$t('models.fitAdopt')}</button>
+                {/if}
+              </div>
+            {/if}
           </li>
         {/each}
       </ul>
