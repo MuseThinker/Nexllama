@@ -1,5 +1,8 @@
 pub mod engine;
 pub mod error;
+pub mod fit;
+pub mod hwprofile;
+pub mod promptcache;
 pub mod sampler;
 pub mod types;
 
@@ -8,6 +11,8 @@ pub use engine::{
     LoraAdapter, RerankResult,
 };
 pub use error::{InferError, Result};
+pub use fit::FitReport;
+pub use hwprofile::{GpuInfo, HardwareProfile};
 pub use sampler::{SamplerParams, MAX_DRAFT, MAX_NGRAM, MAX_TOKENS};
 pub use types::{ChatMsg, GenStats};
 

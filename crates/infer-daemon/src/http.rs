@@ -17,10 +17,11 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use infer_core::{
-    ChatMsg, Engine, EngineHandle, FlashAttn, InferError, LoadMode, LoraAdapter, SamplerParams,
+    ChatMsg, Engine, EngineHandle, FitReport, FlashAttn, InferError, LoadConfig, LoadMode,
+    LoraAdapter, SamplerParams,
 };
 
-use crate::state::{AppState, DaemonState, InFlight, Loaded};
+use crate::state::{record_stats, AppState, DaemonState, InFlight, Loaded, RuntimeStats};
 
 /// Shared secret required on every request when set.
 pub type ApiKey = Option<Arc<String>>;
@@ -74,6 +75,7 @@ pub fn router(state: AppState, api_key: ApiKey, cors_origins: Vec<String>) -> Ro
         .route("/admin/status", get(status))
         .route("/admin/load", post(load))
         .route("/admin/unload", post(unload))
+        .route("/admin/fit", post(fit_check))
         .route_layer(middleware::from_fn_with_state(api_key, require_key));
 
     Router::new()
@@ -167,7 +169,7 @@ async fn root(State(state): State<AppState>) -> Json<serde_json::Value> {
             "chat": ["POST /v1/chat/completions", "POST /api/chat", "POST /api/generate"],
             "embeddings": ["POST /v1/embeddings", "POST /api/embed", "POST /api/embeddings"],
             "rerank": ["POST /v1/rerank", "POST /rerank"],
-            "admin": ["GET /health", "GET /admin/status", "POST /admin/load", "POST /admin/unload"]
+            "admin": ["GET /health", "GET /admin/status", "POST /admin/load", "POST /admin/unload", "POST /admin/fit"]
         }
     }))
 }
@@ -341,6 +343,18 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
         .models
         .values()
         .map(|l| {
+            // Read under its own lock and tolerate poisoning: a model that has
+            // already answered should not be able to take /admin/status down
+            // with it over a statistic.
+            let perf = l.stats.lock().ok().map(|s| {
+                json!({
+                    "requests": s.requests,
+                    "tokens": s.tokens,
+                    "tokens_per_second": round2(s.tokens_per_second),
+                    "first_token_ms": round2(s.first_token_ms),
+                    "draft_acceptance": s.draft_acceptance.map(round2),
+                })
+            });
             json!({
                 "id": l.id,
                 "path": l.path,
@@ -353,6 +367,7 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
                 "loras": l.loras,
                 "loaded_secs_ago": l.loaded_at.elapsed().as_secs(),
                 "idle_secs": l.last_used.elapsed().as_secs(),
+                "perf": perf,
             })
         })
         .collect();
@@ -361,6 +376,34 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
         "default_model": guard.default_model,
         "keep_alive_secs": guard.keep_alive.as_secs(),
     }))
+}
+
+#[derive(Deserialize)]
+struct FitRequest {
+    /// Path to a GGUF already on disk.
+    model: String,
+    /// Context to measure against; defaults to a conventional 4096.
+    #[serde(default)]
+    n_ctx: Option<u32>,
+}
+
+/// `POST /admin/fit` — measure one checkpoint against this machine.
+///
+/// Advisory in every field, and it never refuses a model on its own. The whole
+/// point of measuring is that guessing has already been tried: an auto-tuner
+/// that offloads too much gets the process killed part-way through a load,
+/// which is a worse outcome than loading something that turns out slow. So this
+/// reports, and the caller decides.
+async fn fit_check(Json(req): Json<FitRequest>) -> Result<Json<FitReport>, ApiError> {
+    let path = std::path::PathBuf::from(&req.model);
+    let n_ctx = req.n_ctx.unwrap_or(0);
+    // Measuring reads the checkpoint's metadata, which is real file input on a
+    // multi-gigabyte file; it must not run on the async runtime.
+    let report = tokio::task::spawn_blocking(move || infer_core::fit::fit(&path, n_ctx))
+        .await
+        .map_err(|e| ApiError::Model(format!("fit task failed: {e}")))?
+        .map_err(|e| ApiError::Model(e.to_string()))?;
+    Ok(Json(report))
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -385,6 +428,13 @@ struct LoadRequest {
     model: String,
     #[serde(default)]
     name: Option<String>,
+    /// Refuse the load when the checkpoint measures as not fitting.
+    ///
+    /// Off by default. The measurement is advisory because being wrong about
+    /// memory costs an out-of-memory kill mid-load, while a wrong warning costs
+    /// nothing — so this only refuses when the caller explicitly asks it to.
+    #[serde(default)]
+    strict_fit: Option<bool>,
     #[serde(default)]
     n_gpu_layers: Option<u32>,
     #[serde(default)]
@@ -416,6 +466,8 @@ struct LoadRequest {
     #[serde(default)]
     load_mtp: Option<bool>,
     #[serde(default)]
+    mtp_n_max: Option<u32>,
+    #[serde(default)]
     mmproj: Option<String>,
     #[serde(default)]
     draft_model: Option<String>,
@@ -438,6 +490,22 @@ fn model_id(req: &LoadRequest) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("model")
         .to_string()
+}
+
+/// Drop the MTP flags a request only inherited.
+///
+/// `cfg` is cloned from the daemon's startup config, which carries
+/// `load_mtp`/`mtp_n_max` for the model the daemon came up on. A request that
+/// supplies its own draft model is choosing the other way to draft, so those
+/// inherited flags must not ride along — the engine refuses MTP and a separate
+/// drafter together, and the error would name a conflict this request never
+/// asked for. When the request *did* ask for MTP itself, both flags stay and
+/// the engine reports the genuine conflict.
+fn drop_inherited_mtp(cfg: &mut LoadConfig, asked_mtp: bool) {
+    if cfg.draft_model.is_some() && !asked_mtp {
+        cfg.load_mtp = false;
+        cfg.mtp_n_max = 0;
+    }
 }
 
 async fn load(
@@ -547,8 +615,20 @@ async fn load(
     if let Some(v) = req.rope_freq_scale {
         cfg.rope_freq_scale = v;
     }
+    // Whether *this* request asked for MTP, as opposed to inheriting the flag
+    // from the daemon's startup config. Read off the request before `cfg` is
+    // touched.
+    let asked_mtp = req.load_mtp.unwrap_or(false) || req.mtp_n_max.unwrap_or(0) > 0;
     if let Some(v) = req.load_mtp {
         cfg.load_mtp = v;
+    }
+    if let Some(v) = req.mtp_n_max {
+        cfg.mtp_n_max = v;
+        // Asking for a budget is asking for drafting, whatever the flag next
+        // to it said; leaving `load_mtp` false would load nothing to draft with.
+        if v > 0 {
+            cfg.load_mtp = true;
+        }
     }
     if let Some(v) = req.lora.as_ref() {
         cfg.lora = v
@@ -576,6 +656,7 @@ async fn load(
         if let Some(n) = req.draft_n_max {
             cfg.draft_n_max = n;
         }
+        drop_inherited_mtp(&mut cfg, asked_mtp);
     }
     let n_gpu_layers = cfg.n_gpu_layers;
     let n_ctx = cfg.n_ctx;
@@ -588,6 +669,41 @@ async fn load(
              draft"
                 .into(),
         );
+    }
+    if load_mtp {
+        notes.push(
+            "the model's bundled MTP head is loaded; turn on speculative decoding per \
+             request to draft with it"
+                .into(),
+        );
+    }
+
+    // Measured before anything is displaced: refusing a load must not cost the
+    // caller the model that is already serving.
+    let fit = tokio::task::spawn_blocking({
+        let path = cfg.model_path.clone();
+        let n_ctx = cfg.n_ctx;
+        move || infer_core::fit::fit(&path, n_ctx)
+    })
+    .await
+    .map_err(|e| ApiError::Model(format!("fit task failed: {e}")))?
+    .map_err(|e| ApiError::Model(e.to_string()))?;
+
+    if !fit.fits {
+        let hint = match (fit.suggested_gpu_layers, fit.suggested_ctx) {
+            (Some(layers), Some(ctx)) => {
+                format!(" (llama.cpp suggests {layers} layers, ctx {ctx})")
+            }
+            (Some(layers), None) => format!(" (llama.cpp suggests {layers} layers)"),
+            _ => String::new(),
+        };
+        if req.strict_fit.unwrap_or(false) {
+            return Err(ApiError::BadRequest(format!(
+                "{}{hint}; not loaded because strict_fit was requested",
+                fit.reason
+            )));
+        }
+        notes.push(format!("warning: {}{hint}", fit.reason));
     }
 
     // Drop any existing model with the same id before loading the new one.
@@ -630,6 +746,7 @@ async fn load(
             draft_model: req.draft_model.clone(),
             loras: req.lora.clone().unwrap_or_default(),
             in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            stats: std::sync::Arc::new(std::sync::Mutex::new(RuntimeStats::default())),
         },
     );
     if guard.default_model.is_none() || req.set_default.unwrap_or(false) {
@@ -641,7 +758,7 @@ async fn load(
     }
 
     Ok(Json(
-        json!({ "status": "ok", "id": id, "info": info, "notes": notes }),
+        json!({ "status": "ok", "id": id, "info": info, "notes": notes, "fit": fit }),
     ))
 }
 
@@ -969,6 +1086,14 @@ fn ndjson(value: serde_json::Value) -> Result<axum::body::Bytes, Infallible> {
     Ok(axum::body::Bytes::from(line))
 }
 
+/// Two decimal places.
+///
+/// These are smoothed figures shown to a person, not measurements to act on:
+/// the third decimal is noise, and printing it invites reading meaning into it.
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
 /// Map Ollama's `options` onto the sampler knobs we have.
 fn sampler_from_options(
     base: &SamplerParams,
@@ -1058,7 +1183,12 @@ async fn ollama_chat(
         .map(|m| ChatMsg::new(m.role.clone(), m.content.clone()))
         .collect();
     let params = sampler_from_options(&SamplerParams::default(), req.options.as_ref());
-    Ok(ollama_stream(handle, model_id, active, msgs, params, req.stream, true).await)
+    // Taken before `model_id` is handed to the stream, which owns it from there.
+    let perf = state.runtime_stats(&model_id).await;
+    Ok(ollama_stream(
+        handle, model_id, active, msgs, params, req.stream, true, perf,
+    )
+    .await)
 }
 
 /// `POST /api/generate` — Ollama's single-prompt route.
@@ -1076,7 +1206,11 @@ async fn ollama_generate(
     }
     msgs.push(ChatMsg::new("user", req.prompt.clone()));
     let params = sampler_from_options(&SamplerParams::default(), req.options.as_ref());
-    Ok(ollama_stream(handle, model_id, active, msgs, params, req.stream, false).await)
+    let perf = state.runtime_stats(&model_id).await;
+    Ok(ollama_stream(
+        handle, model_id, active, msgs, params, req.stream, false, perf,
+    )
+    .await)
 }
 
 /// Build one Ollama reply object. A present `stats` marks the final line.
@@ -1117,6 +1251,7 @@ async fn ollama_stream(
     params: SamplerParams,
     stream: bool,
     chat: bool,
+    perf: Option<Arc<std::sync::Mutex<RuntimeStats>>>,
 ) -> Response {
     if !stream {
         let generated = tokio::task::spawn_blocking(move || {
@@ -1134,6 +1269,7 @@ async fn ollama_stream(
 
         return match generated {
             Ok(Ok((content, stats))) => {
+                record_stats(perf.as_ref(), &stats);
                 Json(ollama_reply(&model_id, chat, &content, Some(&stats))).into_response()
             }
             Ok(Err(e)) => api_error(&e),
@@ -1161,7 +1297,10 @@ async fn ollama_stream(
             return;
         }
         let final_line = match result {
-            Ok(stats) => ndjson(ollama_reply(&model_id, chat, "", Some(&stats))),
+            Ok(stats) => {
+                record_stats(perf.as_ref(), &stats);
+                ndjson(ollama_reply(&model_id, chat, "", Some(&stats)))
+            }
             Err(e) => ndjson(json!({ "error": e.to_string(), "done": true })),
         };
         let _ = tx.blocking_send(final_line);
@@ -1440,6 +1579,9 @@ async fn chat(
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
     let (handle, model_id, active) = chat_engine(&state, req.model.as_deref()).await?;
+    // Taken while `model_id` is still ours; the streaming branch moves it into
+    // the blocking task that finishes the reply.
+    let perf = state.runtime_stats(&model_id).await;
 
     let params = req.sampler();
     let msgs = req.chat_msgs()?;
@@ -1455,6 +1597,8 @@ async fn chat(
             Ok::<_, InferError>((out, stats))
         })
         .await??;
+
+        record_stats(perf.as_ref(), &stats);
 
         return Ok(Json(json!({
             "object": "chat.completion",
@@ -1521,6 +1665,7 @@ async fn chat(
         }
         let final_ev = match result {
             Ok(stats) => {
+                record_stats(perf.as_ref(), &stats);
                 // See the non-streaming path: a truncated reply reports itself.
                 let finish_reason = if stats.hit_token_cap {
                     "length"
@@ -1564,7 +1709,6 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use http_body_util::BodyExt;
-    use infer_core::LoadConfig;
     use std::time::Duration;
     use tower::ServiceExt;
 
@@ -1930,6 +2074,34 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "a negative thread count must be refused"
         );
+    }
+
+    /// The daemon comes up with `--load-mtp` for its startup model, so every
+    /// later load inherits that flag through `base_cfg`. A load that brings its
+    /// own drafter is choosing the other way to draft, and must not then be
+    /// told it asked for both.
+    #[test]
+    fn a_draft_model_drops_an_inherited_mtp_head() {
+        let mut cfg = LoadConfig::new("m.gguf");
+        cfg.load_mtp = true;
+        cfg.mtp_n_max = 4;
+        cfg.draft_model = Some("d.gguf".into());
+        drop_inherited_mtp(&mut cfg, false);
+        assert!(!cfg.load_mtp, "the inherited head must be dropped");
+        assert_eq!(cfg.mtp_n_max, 0);
+
+        // Asked for both: keep them, so the engine reports the real conflict.
+        let mut cfg = LoadConfig::new("m.gguf");
+        cfg.load_mtp = true;
+        cfg.draft_model = Some("d.gguf".into());
+        drop_inherited_mtp(&mut cfg, true);
+        assert!(cfg.load_mtp);
+
+        // No drafter: nothing to conflict with, so the default survives.
+        let mut cfg = LoadConfig::new("m.gguf");
+        cfg.load_mtp = true;
+        drop_inherited_mtp(&mut cfg, false);
+        assert!(cfg.load_mtp);
     }
 
     /// A browser page from another site must not be able to drive this server,

@@ -35,6 +35,11 @@ let error = $state('');
 let notice = $state('');
 let busy = $state('');
 let loadingPath = $state('');
+// Which drafter to load is a property of the file, not of the app, so it is
+// kept per bundle and defaults to the bundled MTP head whenever the model has
+// one — a head needs no second file and drafts faster than a side-mounted one.
+let mtpOn = $state({});
+const wantMtp = (b) => !!b.mtp && mtpOn[b.name] !== false;
 
 let query = $state('');
 // Restricting a search to one author is the difference between hundreds of
@@ -145,12 +150,20 @@ async function selectFolder() {
   }
 }
 
+// A daemon that is not listening fails every call the same way, and the raw
+// browser text for it says nothing about what to do. Everything else is worth
+// showing verbatim, because the daemon writes real sentences into it.
+function describeError(e) {
+  if (e instanceof TypeError && String(e).includes('fetch')) return $t('models.daemonDown');
+  return String(e);
+}
+
 async function refresh() {
   try {
     status = await daemon.status();
     error = '';
   } catch (e) {
-    error = String(e);
+    error = describeError(e);
   }
 }
 
@@ -161,6 +174,17 @@ async function refreshDaemon() {
   } catch (e) {
     error = String(e);
   }
+}
+
+// Loading a model is a call to the daemon, so the service has to be up first.
+// Starting it here is what makes Load work from a cold app; a start the app
+// refuses — an exposed bind address with no access token — comes back as its
+// own sentence rather than as a port nobody answers on.
+async function ensureDaemon() {
+  if (!hasTauri) return;
+  await refreshDaemon();
+  if (!daemonInfo.running) await daemonStart();
+  await refreshDaemon();
 }
 
 // The header's Refresh covers the whole page: the loaded models and the service
@@ -247,15 +271,21 @@ async function loadBundle(b) {
   error = '';
   notice = '';
   try {
+    await ensureDaemon();
     const body = loadBody(b.main);
     if (b.projector) body.mmproj = b.projector;
-    if (b.draft) body.draft_model = b.draft;
+    if (wantMtp(b)) {
+      body.load_mtp = true;
+    } else {
+      body.load_mtp = false;
+      if (b.draft) body.draft_model = b.draft;
+    }
     if (b.loras?.length) body.lora = b.loras;
     const res = await daemon.load(body);
     if (res?.notes?.length) notice = res.notes.join('; ');
     await refresh();
   } catch (e) {
-    error = String(e);
+    error = describeError(e);
   } finally {
     busy = '';
     loadingPath = '';
@@ -424,6 +454,9 @@ onMount(() => {
         </button>
       </div>
     </div>
+    {#if !daemonInfo.running && daemonInfo.last_error}
+      <div class="error">{daemonInfo.last_error}</div>
+    {/if}
     <dl class="daemon-facts">
       <div>
         <dt>{$t('settings.backend')}</dt>
@@ -529,7 +562,7 @@ onMount(() => {
             <span class="file-name">
               {b.name}
               {#if b.kind === 'vision'}<span class="badge">vision</span>{/if}
-              {#if b.kind === 'speculative'}<span class="badge">spec</span>{/if}
+              {#if b.kind === 'speculative'}<span class="badge" title={b.draft}>spec</span>{/if}
               {#if b.mtp}<span class="badge">MTP</span>{/if}
               {#if b.class === 'embedding' || b.class === 'rerank'}
                 <span class="badge api">API · {b.class}</span>
@@ -538,6 +571,16 @@ onMount(() => {
             <span class="file-size">
               {fmt(b.size)}{#if b.files.length > 1} · {b.files.length} {$t('models.files')}{/if}
             </span>
+            {#if b.mtp}
+              <label class="checkline" title={$t('models.mtpHint')}>
+                <input
+                  type="checkbox"
+                  checked={wantMtp(b)}
+                  onchange={(e) => (mtpOn[b.name] = e.target.checked)}
+                />
+                <span>MTP</span>
+              </label>
+            {/if}
             <button onclick={() => loadBundle(b)} disabled={busy !== ''}>
               {loadingPath === b.main ? $t('models.loading') : $t('models.load')}
             </button>
@@ -631,6 +674,8 @@ onMount(() => {
               {m.id}
               {#if m.info?.vision}<span class="badge">vision</span>{/if}
               {#if m.info?.mtp}<span class="badge">MTP {m.load_mtp ? 'on' : 'off'}</span>{/if}
+              {#if m.draft_model}<span class="badge" title={m.draft_model}>draft</span>{/if}
+              {#if m.mmproj}<span class="badge" title={m.mmproj}>mmproj</span>{/if}
               {#if m.info?.model_class === 'embedding' || m.info?.model_class === 'rerank'}
                 <span class="badge api">API · {m.info.model_class}</span>
               {/if}

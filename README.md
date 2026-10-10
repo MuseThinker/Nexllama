@@ -260,6 +260,11 @@ native folder picker (**Select folder** / **Open folder**). The library lists ev
 it finds; click **Load** to bring one up, or tick one or more under **Auto-load at start**
 to keep them resident from launch. Downloads land in the same folder.
 
+Point the app at a folder that *is* one model's folder — weights with a projector and
+a draft beside them — and the library shows that as a single row whose **Load** takes
+all the files. A folder holding several models stays listed file by file, since there
+is no way to tell whose projector is whose.
+
 ### Multi-file models
 
 A model that ships several files lives in its own subfolder:
@@ -272,10 +277,20 @@ models/Qwen2.5-VL-7B/
 ```
 
 Roles are recognized from the filename (`mmproj`/`projector`, `draft`/`eagle`/`mtp`/`dflash`,
-`lora`/`adapter`) and the bundle is loaded together. Wired today: **LoRA adapters** and the
-**MTP flag** (`load_mtp`, same-file NextN head). Vision projectors and draft-model speculative
-decoding are accepted but not yet used for generation — the load response returns a `notes`
-field saying so rather than silently ignoring them.
+`lora`/`adapter`) and the bundle is loaded together. Wired today: **LoRA adapters**,
+**vision projectors**, and the **draft file** — the `draft` role becomes `draft_model`,
+which is what drives DFlash / EAGLE-3 / side-mounted MTP drafting once *Speculative*
+is on. The same-file MTP head is a per-model load option (`load_mtp`) rather than a
+bundle role. The load response returns a `notes` field naming what is in play instead
+of silently ignoring anything.
+
+**Auto-load at start takes the same files.** The daemon accepts `--mmproj` and
+`--draft-model` alongside `--model` (one value for every model, or one per model),
+and the app resolves the bundle before spawning, so a model that is resident from
+launch is not missing its projector or its drafter. When the model carries its own
+MTP head, that head is passed instead of the draft file: it needs no second set of
+weights and drafts faster, and the library has an **MTP** checkbox per bundle for
+turning it off.
 
 ### Model classes
 
@@ -291,7 +306,8 @@ guessing, no extension heuristics:
 The split is the point: a chat model is something you test and tune by talking to
 it, and an encoder is something you point a program at. Neither appears where the
 other belongs, and the composer says so when the only models loaded are API ones.
-| vision | a projector file in the bundle | chat, and it can accept images |
+A bundle carrying a projector is still class `llm` — it is the bundle's `kind` that
+becomes `vision`, and once loaded it accepts images.
 
 The class travels in `/admin/status` (`info.model_class`) and is enforced in the
 daemon too, so an API client pointing at an embedding model gets
@@ -479,31 +495,51 @@ exact optimisation — not an approximation. Two practical notes:
 
 Every reply reports the hit rate, e.g. `draft 6/32 (19%)`.
 
-### MTP (built-in NextN head)
+### MTP (NextN head)
 
-Some models ship a multi-token-prediction head inside the same GGUF — Qwen3.6's
-`qwen35moe.nextn_predict_layers`, for instance. llama.cpp will only load that head
-when asked, and it is what the reference command uses to go fast:
+Some models ship a multi-token-prediction head inside the same GGUF —
+`qwen35.nextn_predict_layers`, for instance, which is what Qwen3.8-27B's own file
+carries. llama.cpp will only read that head when asked, and it is what the
+reference command uses to go fast:
 
 ```bash
 llama-server -m model.gguf -ngl 99 --spec-type draft-mtp --spec-draft-n-max 3
 ```
 
 The app detects the head from the GGUF (`nextn_predict_layers`, or `nextn` tensor
-names) and reports it as `info.mtp` in `/admin/status`, with a badge in the
-library. **Loading it is a separate step**, and `load_mtp` says whether it
-happened — the honest state today is usually `mtp=true, load_mtp=false`.
+names) and reports it as `info.mtp` in `/admin/status`, with a badge and an **MTP**
+checkbox in the library. The checkbox is on whenever the file has a head, so
+loading one of these models drafts out of the box; `load_mtp` in the reply says
+whether the head was actually read. `load_mtp` is a request to *draft*, not to keep
+weights resident: with no budget given it falls back to `draft_n_max` (default 2)
+rather than loading a head that never gets used.
 
-That is deliberate for now. `--load-mtp` only loads the head; the speedup comes
-from *drafting* with it and verifying against the model, and that loop is not
-implemented yet. Enabling the flag without the loop would spend the head's memory
-for no gain, so the app neither auto-enables it nor hides the fact that the model
-has it. `mtp=true` is the signal that the draft loop would pay off.
+Two routes reach the same draft loop:
 
-Note also that the n-gram drafter above is refused on models whose KV cache cannot
-drop rejected draft tokens (Qwen3.6's hybrid cache is one), so speculative
-decoding is off there until the MTP path exists — the daemon says so instead of
-returning wrong tokens.
+- **Bundled head** — the default when the model has one: `load_mtp` builds a
+  second context of type `mtp` over the same weights, and the reply goes through
+  the MTP draft loop instead of the ordinary one. `--mtp-n-max N` on the daemon,
+  or `mtp_n_max` on `/admin/load`, sets the budget explicitly; `--load-mtp` on its
+  own takes the default.
+- **Side-mounted head**: the same NextN tensors published as their own GGUF
+  (`mtp-<model>-<quant>.gguf`: `blk.<last>`, `blk.<last>.nextn.*`, embeddings,
+  output, nothing else). Point `draft_model` at that file. The arch and the
+  `nextn` tensors are what identify it as an MTP head rather than a truncated
+  model, and it is loaded with `load_mtp` because llama.cpp otherwise skips
+  every tensor in it. Dropping it into the model's folder is enough — the
+  bundle picks it up as the draft. Only used when the head is turned off, since
+  the engine takes one drafter per load.
+
+Both routes need recurrent-state snapshots sized to the draft length so a
+rejected draft can be rolled back; the engine raises `n_rs_seq` on its own once
+a drafter is configured, which is what lets a hybrid cache like Qwen3.8's take
+part at all.
+
+Note also that the n-gram drafter above is refused on models whose KV cache
+cannot drop rejected draft tokens (a hybrid cache with `n_rs_seq` at 0 is the
+case): the first rejected draft latches drafting off for that engine, rebuilds
+the cache from what was actually committed and finishes the reply one token at a
+time. The daemon reports that instead of returning wrong tokens.
 
 An abandoned stream is abandoned properly: when the reader goes away the engine
 stops at its next emitted token instead of finishing `max_tokens` into a socket
@@ -511,8 +547,7 @@ nobody is reading. Cancelling a 600-token reply used to block the next request
 for the remainder of the generation; now the following request starts within a
 second.
 
-This is self-speculation, so it needs no draft model. A bundled MTP head is
-loaded via `load_mtp`.
+Both routes are measured against the alternatives at the end of this section.
 
 ### Draft models: DFlash and EAGLE-3
 
@@ -523,29 +558,101 @@ from this conversation.
 
 ```bash
 curl http://127.0.0.1:15656/admin/load -H "Content-Type: application/json" -d '{
-  "model": "/models/Qwen3.8-27B-Q4_K_M.gguf",
-  "draft_model": "/models/Qwen3.8-27B-DFlash2.gguf",
-  "draft_n_max": 8
+  "model": "/models/Qwen3.8-27B-UD-IQ4_XS.gguf",
+  "draft_model": "/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+  "draft_n_max": 3
 }'
 ```
 
 Then ask for it per request with `"speculative": true` (or tick *Speculative* in
 Chat → Params). The two routes are complementary rather than competing:
 
-| | MTP (`load_mtp`) | DFlash / EAGLE-3 (`draft_model`) |
+`draft_n_max` defaults to **2** when it is left out — measured, not cautious: each
+extra proposed token costs another drafter round and widens the verification pass
+while acceptance falls, and 2 was the peak for DFlash and for MTP on Qwen3.8-27B
+(the numbers are below). A model loaded at start-up takes the same pair as daemon
+flags: `--draft-model <path>` and `--draft-n-max <n>`.
+
+| | MTP head | DFlash / EAGLE-3 |
 |---|---|---|
-| Where the weights come from | heads bundled in the target | a separate checkpoint |
+| Where the weights come from | bundled in the target, or a side-mounted `mtp-*.gguf` | a separate checkpoint |
+| Set with | `load_mtp` / `mtp_n_max`, or `draft_model` | `draft_model` + `draft_n_max` |
 | Which models can use it | only ones that shipped MTP heads | any dense model with a matching drafter |
 | Typical source | Unsloth releases | **z-lab** for DFlash |
 
-Qwen3.8-27B has no MTP head to load, which is exactly the case DFlash exists
-for — `z-lab/Qwen3.8-27B-DFlash2-GGUF` is the drafter for it. DFlash2
-checkpoints are detected from their own GGUF metadata, so nothing extra has to
-be declared beyond pointing at the file.
+Qwen3.8-27B ships both. `z-lab/Qwen3.8-27B-DFlash2-GGUF` is the DFlash drafter for
+it, and its NextN head is available twice over: the four `blk.64.nextn.*` tensors
+sit inside the target file already (that is what `info.mtp` sees), and an MTP-only
+GGUF of the same head — `mtp-Qwen3.8-27B-Q4_0.gguf`, last block plus NextN plus the
+embeddings and output rows — can be pointed at with `draft_model`. Both drafters are
+detected from their own GGUF metadata, so nothing extra has to be declared beyond
+pointing at the file.
 
 Both drafters work from the target's hidden states, so neither is used for image
 prompts; a request with images falls back to ordinary decoding rather than
 drafting from a history that does not match what is in the cache.
+
+### Measured: five ways to draft, one model
+
+Qwen3.8-27B-UD-IQ4_XS (13.3 GB) on a 24 GB Quadro RTX 6000, `n_ctx=4096`,
+`n_gpu_layers=999`, `max_tokens=256`, temperature 1.0 / top_p 0.95 / top_k 20,
+seed 42, one fixed prompt. Rows 1–4 and 6 are three separate sessions of a warm-up
+reply followed by **7 timed replies**; row 5 is one session of 5. `decode` is all
+generated tokens over all generation time, so it does not scale with how many
+replies were timed.
+
+| # | drafter | `draft_n_max` | decode tok/s | speed-up | TTFT | prefill tok/s | accept | accepted/round |
+|---|---|---|---|---|---|---|---|---|
+| 1 | none (baseline) | – | **24.3** (24.0–24.7) | — | 126–128 ms | 414–433 | – | – |
+| 2 | DFlash `Q4_0`, `draft_model` | 2 | 27.9 (25.9–30.9) | +15 % | 178–206 ms | 197–223 | 62.7 % | 1.25 |
+| 3 | DFlash2 `Q4_K_M`, `draft_model` | 3 | 27.6 (26.2–30.1) | +14 % | 204–242 ms | 174–199 | 56.5 % | 1.69 |
+| 4 | MTP side file `Q4_0`, `draft_model` | 2 | 32.6 (32.1–33.7) | +34 % | 178–215 ms | 187–224 | 64.7 % | 1.29 |
+| 5 | MTP bundled head, `--mtp-n-max` | 2 | **33.9** | **+38 %** | 172 ms | 231 | 64.9 % | 1.30 |
+| 6 | control: DFlash2 loaded, `speculative: false` | – | 24.1 (24.0–24.1) | 0 % | 131–134 ms | 398–403 | – | – |
+
+Row 5 is measured against its own session's baseline, which was 24.6 tok/s.
+
+What the rows say:
+
+- **Row 6 is the sanity check.** Having a 1 GB drafter resident costs nothing
+  when it is not used: same decode, same prefill as row 1. The TTFT and prefill
+  loss in rows 2–5 is not the file sitting in VRAM, it is drafting being on —
+  the prompt has to be prefilled through the drafter too, which is why prefill
+  roughly halves. On a long prompt that is the part of the bill that matters;
+  on this 30-token prompt it is 45–115 ms of a ~130 ms TTFT.
+- **MTP wins on this model, and it wins consistently.** Both MTP rows sit at
+  32–34 tok/s in every session while the two DFlash rows wander between 26 and
+  31. MTP drafts from the target's own hidden state through a head that lives
+  next to the last block, so its proposals track the target more closely
+  (64.9 % accepted), and the forward pass that buys them is over one block plus
+  the head — shared with the target, or a 1.6 GB side file — rather than over a
+  whole second model.
+- **The bundled head is the better of the two MTP routes** (33.9 vs 32.6): it
+  shares the target's own `blk.64` and embeddings instead of re-reading a
+  separately quantised copy of them, and it costs no extra VRAM beyond the KV
+  cache. It is also the one the desktop build reaches: the library's **MTP**
+  checkbox is on whenever the file has a head, and unticking it falls back to
+  the side-mounted file (row 4) when the folder has one.
+- **Acceptance is reproducible; the speed-up is not, quite.** Given the same
+  seed, all three sessions produced byte-identical draft counters (rows 2–4 are
+  exact), but decode wanders by ~15 % between sessions. Drafting adds a second
+  model's kernel launches plus CPU-side sampling between every round, and that
+  is the part that competes with everything else on the machine.
+- **Longer drafts are not free.** Each drafter has its own optimum and it is
+  small: DFlash `Q4_0` is fastest at 2, DFlash2 at 3, MTP at 2. Pushing
+  DFlash2 to 4 takes acceptance from 56.5 % to 45.6 % and lands back at the
+  speed of `n_max=2`; pushing it to 7 is barely better than drafting nothing.
+  The model block size caps DFlash at 8, and the daemon clamps anything above
+  it rather than erroring.
+
+Reproduce rows 1–4 and 6 with `POST /admin/load` (`draft_model`, `draft_n_max`)
+and row 5 with the same call (`"load_mtp": true`, or `"mtp_n_max": 2` for an
+explicit budget) or by starting the daemon with `--mtp-n-max 2`; then one warm-up
+reply followed by `max_tokens: 256` replies with `speculative: true` while watching
+`stats.draft_tokens`, `stats.accepted_draft_tokens` and `stats.draft_rounds`;
+`decode = generated_tokens * 1000 / gen_ms` summed over the timed replies rather
+than averaged per reply — averaged per reply and then divided into the total
+token count inflates the result by the number of replies.
 
 ## Where models come from
 

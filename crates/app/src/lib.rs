@@ -225,6 +225,13 @@ enum Phase {
 struct DaemonProc {
     phase: Mutex<Phase>,
     child: Mutex<Option<Child>>,
+    /// Why the last start attempt failed.
+    ///
+    /// The first thing a launch does is start the daemon, and it does so with
+    /// no window yet to report to: without this, a refused start — the bind
+    /// address is exposed and no access token is set, say — reached a log line
+    /// nobody sees, and every later call failed as an unreachable port.
+    last_error: Mutex<Option<String>>,
 }
 
 /// Lock helper that reports poisoning instead of panicking.
@@ -235,6 +242,13 @@ struct DaemonProc {
 fn lock<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, String> {
     m.lock()
         .map_err(|_| "the daemon state lock is poisoned; restart the app".to_string())
+}
+
+/// Remember why a start failed, or clear it now that one worked.
+fn note_start(state: &DaemonProc, result: &Result<u16, String>) {
+    if let Ok(mut slot) = lock(&state.last_error) {
+        *slot = result.as_ref().err().cloned();
+    }
 }
 
 fn backends_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -614,8 +628,45 @@ fn spawn_daemon(
             models.push(m);
         }
     }
-    for m in models {
+    // A bundle is several files: the projector is what lets the model read
+    // images, the draft checkpoint is what speculative decoding drafts with,
+    // and a bundled MTP head needs neither. Startup loading used to take the
+    // main file alone, so an auto-loaded bundle came up half a model — nothing
+    // to draft with — until someone pressed Load in the library and sent the
+    // same files over HTTP instead.
+    let root = models_dir(app).ok();
+    let root = root.as_deref();
+    let files: Vec<StartupFiles> = models.iter().map(|m| startup_files(m, root)).collect();
+    // The daemon pairs these by position, so they are only passed when every
+    // startup model has the file: one --draft-model against two --model values
+    // would otherwise give the first model's drafter to the second.
+    let paired = |get: fn(&StartupFiles) -> Option<String>| -> Option<Vec<String>> {
+        if !files.iter().all(|f| get(f).is_some()) {
+            return None;
+        }
+        Some(files.iter().filter_map(get).collect())
+    };
+    // The head is a daemon-wide flag, so it is only used when it can only mean
+    // one model.
+    let mtp_head = models.len() == 1 && files.first().is_some_and(|f| f.mtp);
+
+    for m in &models {
         cmd.arg("--model").arg(m);
+    }
+    if let Some(list) = paired(|f| f.projector.clone()) {
+        for p in list {
+            cmd.arg("--mmproj").arg(p);
+        }
+    }
+    // Bundled head and a side-mounted checkpoint draft the same way, and the
+    // engine only ever takes one: the head is both faster and free of a second
+    // set of weights, so it wins whenever the file has one.
+    if mtp_head {
+        cmd.arg("--load-mtp");
+    } else if let Some(list) = paired(|f| f.draft.clone()) {
+        for d in list {
+            cmd.arg("--draft-model").arg(d);
+        }
     }
 
     let num = |key: &str| settings.get(key).and_then(|v| v.as_i64());
@@ -836,6 +887,7 @@ fn daemon_start(
     }
 
     let result = spawn_daemon(&app, model, keep_alive_secs, n_gpu_layers, n_ctx);
+    note_start(&state, &result);
     if let Ok(mut phase) = lock(&state.phase) {
         *phase = if result.is_ok() {
             Phase::Running
@@ -885,6 +937,9 @@ fn daemon_status(app: tauri::AppHandle, state: tauri::State<DaemonProc>) -> serd
         "backend": backend,
         "host": bind_host(&load_settings(&app)),
         "binary": daemon_binary(&app, &backend).ok().map(|p| p.to_string_lossy().to_string()),
+        // A start refused at launch has nowhere else to surface itself, so the
+        // status carries it and the library card can say what to fix.
+        "last_error": lock(&state.last_error).ok().and_then(|slot| slot.clone()),
     })
 }
 
@@ -1025,6 +1080,81 @@ fn reveal_in_file_manager(dir: &Path) -> std::io::Result<()> {
     Command::new(opener).arg(dir).spawn().map(|_| ())
 }
 
+/// What comes with an auto-loaded model.
+struct StartupFiles {
+    projector: Option<String>,
+    draft: Option<String>,
+    mtp: bool,
+}
+
+/// Reads a model's own files the way the library does, so that starting the
+/// app on a model and clicking Load on it in the library cannot disagree about
+/// what belongs together.
+fn startup_files(model: &str, root: Option<&Path>) -> StartupFiles {
+    let mut out = StartupFiles {
+        projector: None,
+        draft: None,
+        mtp: false,
+    };
+    out.mtp = gguf_probe::probe(model)
+        .map(|p| p.has_mtp() && p.classify() == gguf_probe::ModelClass::Llm)
+        .unwrap_or(false);
+    let path = Path::new(model);
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => return out,
+    };
+    // The library gives a file in the models root a bundle of its own when the
+    // root holds several models: scanning it for a projector would hand this
+    // model somebody else's. One model in a folder of its own — weights with
+    // their projector and draft beside them — is the other half of that rule,
+    // and is exactly the case where there is nothing to get wrong.
+    let at_root = root.is_some_and(|r| same_dir(dir, r));
+    let mut files = Vec::new();
+    collect_gguf_files(dir, dir, &mut files);
+    if at_root {
+        // The root also contains whole subfolders of other models, and those
+        // are none of this file's business.
+        files.retain(|f| {
+            f["path"]
+                .as_str()
+                .is_some_and(|p| Path::new(p).parent() == Some(dir))
+        });
+        if files.iter().filter(|f| f["role"] == "main").count() != 1 {
+            return out;
+        }
+    }
+    // `read_dir` order is a property of the filesystem, not of the model: the
+    // same folder has to keep yielding the same drafter.
+    sort_files(&mut files);
+    let pick = |role: &str| {
+        files
+            .iter()
+            .filter(|f| f["path"].as_str() != Some(model))
+            .find(|f| f["role"] == role)
+            .and_then(|f| f["path"].as_str().map(str::to_string))
+    };
+    out.projector = pick("projector");
+    out.draft = pick("draft");
+    out
+}
+
+/// Windows paths are case-insensitive and the models folder is set by hand, so
+/// equality here cannot be byte equality.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+fn sort_files(files: &mut [serde_json::Value]) {
+    files.sort_by(|a, b| {
+        a["filename"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["filename"].as_str().unwrap_or(""))
+    });
+}
+
 fn role_of(filename: &str) -> &'static str {
     let n = filename.to_ascii_lowercase();
     if n.contains("mmproj") || n.contains("projector") {
@@ -1124,12 +1254,14 @@ fn bundle(name: &str, dir: &str, files: Vec<serde_json::Value>) -> serde_json::V
 fn list_local_models(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, String> {
     let dir = models_dir(&app)?;
     let mut bundles = Vec::new();
+    let mut loose: Vec<serde_json::Value> = Vec::new();
     for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         if path.is_dir() {
             let mut files = Vec::new();
             collect_gguf_files(&path, &path, &mut files);
+            sort_files(&mut files);
             if !files.is_empty() {
                 let name = path
                     .file_name()
@@ -1149,21 +1281,21 @@ fn list_local_models(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, St
                 .and_then(|n| n.to_str())
                 .unwrap_or("model")
                 .to_string();
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("model")
-                .to_string();
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            let files = vec![serde_json::json!({
+            loose.push(serde_json::json!({
                 "filename": filename,
                 "role": role_of(&filename),
                 "size": size,
                 "path": path.to_string_lossy(),
-            })];
-            bundles.push(bundle(&stem, "", files));
+            }));
         }
     }
+    // The folder the user pointed the app at is often a single model's own
+    // folder — projector, draft checkpoint and bundled head beside the weights.
+    // Listing those as five separate models asked which one to load, and every
+    // answer except the weights was wrong.
+    sort_files(&mut loose);
+    bundles.extend(root_bundles(loose));
     bundles.sort_by(|a, b| {
         a["name"]
             .as_str()
@@ -1171,6 +1303,37 @@ fn list_local_models(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, St
             .cmp(b["name"].as_str().unwrap_or(""))
     });
     Ok(bundles)
+}
+
+/// Turns the loose `.gguf` files sitting in the models folder itself into rows.
+///
+/// Exactly one of them being the main file means the rest are that model's own
+/// files, so they belong in one row. Two or more main files means a folder of
+/// unrelated models with no way to tell whose projector is whose, so each file
+/// keeps a row of its own.
+fn root_bundles(files: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut mains = files.iter().filter(|f| f["role"] == "main");
+    let (Some(main), None) = (mains.next(), mains.next()) else {
+        return files
+            .into_iter()
+            .map(|f| {
+                let name = stem_of(f["filename"].as_str());
+                bundle(&name, "", vec![f])
+            })
+            .collect();
+    };
+    let name = stem_of(main["filename"].as_str());
+    vec![bundle(&name, "", files)]
+}
+
+/// The row's name is what a file is called without its extension.
+fn stem_of(filename: Option<&str>) -> String {
+    let filename = filename.unwrap_or("model");
+    Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename)
+        .to_string()
 }
 
 #[tauri::command]
@@ -1645,9 +1808,13 @@ pub fn run() {
                     .get("nCtx")
                     .and_then(|v| v.as_u64())
                     .map(|v| v as u32);
-                if let Err(e) = spawn_daemon(&handle, model, keep, ngl, nctx) {
+                let result = spawn_daemon(&handle, model, keep, ngl, nctx);
+                if let Err(e) = &result {
                     eprintln!("[nexllama] daemon autostart skipped: {e}");
                 }
+                // The window is not up yet, so this is the only chance to keep
+                // the reason: the library card reads it back from the status.
+                note_start(&handle.state::<DaemonProc>(), &result);
             }
             Ok(())
         })
@@ -1702,6 +1869,101 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// The models folder is often one model's own folder: weights with a
+    /// projector and a draft beside them and nothing else, in which case a
+    /// start has to take all three. A folder holding two models has no way to
+    /// say whose projector is whose, so there a file brings nothing along —
+    /// and a model in its own subfolder under the root keeps working as ever.
+    #[test]
+    fn startup_files_follow_the_bundles_the_library_would_build() {
+        let here = std::env::temp_dir().join(format!("nexllama-here-{}", std::process::id()));
+        let there = std::env::temp_dir().join(format!("nexllama-there-{}", std::process::id()));
+        let sub = here.join("qwen");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&there).unwrap();
+        let weights = here.join("flat.gguf");
+        let projector = here.join("mmproj-x.gguf");
+        let draft = here.join("dflash-x.gguf");
+        let main = sub.join("main.gguf");
+        let sub_proj = sub.join("mmproj-y.gguf");
+        let sub_draft = sub.join("dflash-y.gguf");
+        let first = there.join("a.gguf");
+        let second = there.join("b.gguf");
+        let shared_proj = there.join("mmproj-x.gguf");
+        let files = [
+            &weights,
+            &projector,
+            &draft,
+            &main,
+            &sub_proj,
+            &sub_draft,
+            &first,
+            &second,
+            &shared_proj,
+        ];
+        for p in files {
+            std::fs::write(p, b"not a gguf").unwrap();
+        }
+        let here = here.to_string_lossy().to_string();
+        let here = Path::new(&here);
+        let there = there.to_string_lossy().to_string();
+        let there = Path::new(&there);
+
+        let flat = startup_files(&weights.to_string_lossy(), Some(here));
+        assert_eq!(
+            (flat.projector.as_deref(), flat.draft.as_deref()),
+            (projector.to_str(), draft.to_str())
+        );
+
+        let bundled = startup_files(&main.to_string_lossy(), Some(here));
+        assert_eq!(
+            (bundled.projector.as_deref(), bundled.draft.as_deref()),
+            (sub_proj.to_str(), sub_draft.to_str())
+        );
+
+        for model in [&first, &second] {
+            let alone = startup_files(&model.to_string_lossy(), Some(there));
+            assert_eq!((alone.projector, alone.draft), (None, None));
+        }
+        std::fs::remove_dir_all(here).ok();
+        std::fs::remove_dir_all(there).ok();
+    }
+
+    /// One model plus its own files is one row in the library; a folder of
+    /// unrelated models keeps one row each.
+    #[test]
+    fn loose_files_in_the_models_folder_form_one_row() {
+        let entry = |filename: &str| {
+            serde_json::json!({
+                "filename": filename,
+                "role": role_of(filename),
+                "size": 1u64,
+                "path": format!("C:/models/{filename}"),
+            })
+        };
+        let bundle = |files: Vec<serde_json::Value>| root_bundles(files);
+
+        let one = bundle(vec![
+            entry("mmproj-x.gguf"),
+            entry("base-model.gguf"),
+            entry("dflash-x.gguf"),
+        ]);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0]["name"], "base-model");
+        assert_eq!(
+            one[0]["main"].as_str().and_then(|p| p.rsplit('/').next()),
+            Some("base-model.gguf")
+        );
+        assert!(one[0]["projector"].is_string());
+        assert!(one[0]["draft"].is_string());
+        assert_eq!(one[0]["files"].as_array().map(Vec::len), Some(3));
+
+        let many = bundle(vec![entry("a-model.gguf"), entry("b-model.gguf")]);
+        assert_eq!(many.len(), 2);
+        assert_eq!(many[0]["name"], "a-model");
+        assert_eq!(many[1]["name"], "b-model");
     }
 
     #[test]

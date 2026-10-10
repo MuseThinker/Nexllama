@@ -874,8 +874,16 @@ strong.on {
   border-bottom: none;
 }
 
+/* Flex, not inline: a name that wraps used to flow through the badges that
+   followed it, so a long model name and three badges could end up printed on
+   top of each other. As items they size and wrap on their own. */
 .file-name {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 4px;
   word-break: break-all;
 }
 
@@ -886,9 +894,16 @@ strong.on {
   font-variant-numeric: tabular-nums;
 }
 
+/* Inside a row the toggle lines up with the name rather than dropping below it. */
+.file-list li .checkline {
+  margin-top: 0;
+  flex: none;
+}
+
 .badge {
   display: inline-block;
-  margin-left: 8px;
+  white-space: nowrap;
+  margin-left: 4px;
   padding: 1px 6px;
   border-radius: 5px;
   background: var(--panel-2);

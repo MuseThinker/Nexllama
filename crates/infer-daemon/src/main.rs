@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use infer_core::{Engine, FlashAttn, LoadConfig, LoadMode};
 
-use crate::state::{AppState, Loaded};
+use crate::state::{AppState, Loaded, RuntimeStats};
 
 #[derive(Parser, Debug)]
 #[command(name = "infer-daemon", about = "Local llama.cpp inference daemon")]
@@ -101,14 +101,31 @@ struct Args {
     n_rs_seq: u32,
 
     /// MTP speculative decoding: draft tokens per round (upstream
-    /// --spec-draft-n-max). 0 disables it. Implies --load-mtp and
+    /// --spec-draft-n-max). 0 takes the budget from --load-mtp, so it only
+    /// disables MTP when --load-mtp is not set. Implies --load-mtp and
     /// --n-rs-seq.
     #[arg(long, default_value_t = 0)]
     mtp_n_max: u32,
 
     /// Multimodal projector that lets the model read images.
+    ///
+    /// Pass it once to serve every startup model, or once per --model to pair
+    /// them by position. It is a startup option only: a model loaded later from
+    /// the library brings its own.
     #[arg(long)]
-    mmproj: Option<PathBuf>,
+    mmproj: Vec<PathBuf>,
+
+    /// A separate draft checkpoint (DFlash / EAGLE-3) that proposes tokens for
+    /// the model it sits next to.
+    ///
+    /// Pairing works the same way as --mmproj. This is not the bundled MTP
+    /// head, which needs no file: see --load-mtp and --mtp-n-max.
+    #[arg(long)]
+    draft_model: Vec<PathBuf>,
+
+    /// Draft tokens per round for --draft-model (0 = the engine's default).
+    #[arg(long, default_value_t = 0)]
+    draft_n_max: u32,
 
     /// RoPE base frequency (0 = model default).
     #[arg(long, default_value_t = 0.0)]
@@ -196,15 +213,46 @@ async fn main() -> anyhow::Result<()> {
     base.rope_freq_base = args.rope_freq_base;
     base.rope_freq_scale = args.rope_freq_scale;
     base.ngram_cache = args.ngram_cache.clone();
-    base.mmproj = args.mmproj.clone();
+
+    // Checked before anything is loaded: a mispaired list would otherwise only
+    // surface after the first model was already resident in VRAM.
+    for (flag, n) in [
+        ("--mmproj", args.mmproj.len()),
+        ("--draft-model", args.draft_model.len()),
+    ] {
+        if n > 1 && n != args.model.len() {
+            anyhow::bail!(
+                "{flag} was given {n} times but there are {} startup models",
+                args.model.len()
+            );
+        }
+    }
 
     let state = AppState::new(Duration::from_secs(args.keep_alive_secs), base.clone());
 
     let mut first = true;
-    for model in &args.model {
+    for (i, model) in args.model.iter().enumerate() {
+        // Projector and draft file describe *this* model, so they are resolved
+        // per model and never left in `base`: `base` is also where a later load
+        // from the library starts from, and it has its own files to bring.
+        let one = |values: &[PathBuf]| {
+            if values.len() == 1 {
+                values.first().cloned()
+            } else {
+                values.get(i).cloned()
+            }
+        };
         let mut cfg = base.clone();
         cfg.model_path = model.clone().into();
+        cfg.mmproj = one(&args.mmproj);
+        cfg.draft_model = one(&args.draft_model);
+        cfg.draft_n_max = args.draft_n_max;
         let path = cfg.model_path.clone();
+        let draft_model = cfg
+            .draft_model
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
+        let mmproj = cfg.mmproj.as_ref().map(|p| p.to_string_lossy().to_string());
         let id = Path::new(model)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -217,11 +265,32 @@ async fn main() -> anyhow::Result<()> {
         // The file name reaches the log; the full path does not. A log that
         // lives on disk indefinitely does not need a record of where the user
         // keeps their models.
-        tracing::info!(%id, "loading startup model");
-        let engine = tokio::task::spawn_blocking(move || {
+        let draft = draft_model
+            .as_deref()
+            .map(Path::new)
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+            .unwrap_or("none");
+        tracing::info!(%id, %draft, "loading startup model");
+        // A startup model is a convenience, not a requirement: the file may have
+        // been moved since it was configured, and a daemon that exits on that
+        // leaves the UI unable to load anything else. Log it and keep serving —
+        // the library can still load whatever is actually on disk.
+        let engine = match tokio::task::spawn_blocking(move || {
             Engine::load(cfg, |ev| tracing::info!(?ev, "load"))
         })
-        .await??;
+        .await
+        {
+            Ok(Ok(engine)) => engine,
+            Ok(Err(e)) => {
+                tracing::error!(%id, error = %e, "startup model failed to load; serving without it");
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(%id, error = %e, "startup model load task failed; serving without it");
+                continue;
+            }
+        };
 
         let info = engine.info().clone();
         let mut guard = state.inner.lock().await;
@@ -238,10 +307,11 @@ async fn main() -> anyhow::Result<()> {
                 n_gpu_layers,
                 n_ctx,
                 load_mtp,
-                mmproj: None,
-                draft_model: None,
+                mmproj,
+                draft_model,
                 loras: Vec::new(),
                 in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                stats: std::sync::Arc::new(std::sync::Mutex::new(RuntimeStats::default())),
             },
         );
         if first {

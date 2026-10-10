@@ -22,6 +22,14 @@ let ngramM = $state(8);
 let models = $state([]);
 let apiOnly = $state(0);
 let selected = $state('');
+// The drafter belongs to the model that was loaded with one: a bundled MTP
+// head or a side-mounted checkpoint drafts for it, and the n-gram drafter is
+// the only thing the two numbers below still describe.
+const active = $derived(models.find((m) => m.id === selected) ?? null);
+const modelDrafts = $derived(!!(active?.draft_model || active?.load_mtp));
+const drafter = $derived(
+  active?.draft_model ? String(active.draft_model).split(/[\\/]/).pop() : active?.load_mtp ? 'MTP' : ''
+);
 let images = $state([]);
 let fileInput;
 // Set while a reply is streaming so it can be stopped. Aborting the request is
@@ -134,6 +142,17 @@ function rememberModel(id) {
   }
 }
 
+// The daemon reports a failure either as a sentence or as a JSON error object.
+// Interpolating the object straight into the template printed `[object Object]`
+// — the one message that says nothing about what went wrong.
+function errorText(ev) {
+  const e = ev?.error;
+  if (typeof e === 'string' && e.trim()) return e;
+  if (e && typeof e === 'object') return String(e.message ?? JSON.stringify(e));
+  if (typeof ev?.message === 'string' && ev.message.trim()) return ev.message;
+  return 'generation failed';
+}
+
 async function send() {
   const text = input.trim();
   if ((!text && images.length === 0) || busy) return;
@@ -181,7 +200,7 @@ async function send() {
       ...(seedMode === 'fixed' ? { seed: Number(seed) } : {}),
     })) {
       if (ev.event === 'error' || ev.error) {
-        error = ev.error ?? 'generation failed';
+        error = errorText(ev);
         break;
       }
       if (ev.stats) {
@@ -374,7 +393,9 @@ onMount(() => {
           <option value="">{$t('models.none')}</option>
         {/if}
         {#each models as m}
-          <option value={m.id}>{m.id}{m.info?.vision ? ' · vision' : ''}</option>
+          <option value={m.id}
+            >{m.id}{m.info?.vision ? ' · vision' : ''}{m.load_mtp ? ' · MTP' : m.draft_model ? ' · draft' : ''}</option
+          >
         {/each}
       </select>
 
@@ -392,11 +413,11 @@ onMount(() => {
             >{$t('chat.repeatLastN')} <input type="number" step="1" min="0" bind:value={repeatLastN} /></label
           >
           <label>{$t('chat.maxtok')} <input type="number" step="1" min="0" bind:value={maxTokens} /></label>
-          <label class="check">
+          <label class="check" title={modelDrafts ? drafter : ''}>
             <input type="checkbox" bind:checked={speculative} />
-            <span>{$t('chat.speculative')}</span>
+            <span>{$t(modelDrafts ? 'chat.speculativeModel' : 'chat.speculative')}</span>
           </label>
-          {#if speculative}
+          {#if speculative && !modelDrafts}
             <label>{$t('chat.ngramN')} <input type="number" step="1" min="1" max="16" bind:value={ngramN} /></label>
             <label>{$t('chat.ngramM')} <input type="number" step="1" min="1" max="32" bind:value={ngramM} /></label>
           {/if}

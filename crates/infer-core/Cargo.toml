@@ -27,3 +27,7 @@ anyhow.workspace = true
 [[example]]
 name = "bench"
 path = "examples/bench.rs"
+
+[[example]]
+name = "prefix_check"
+path = "examples/prefix_check.rs"
