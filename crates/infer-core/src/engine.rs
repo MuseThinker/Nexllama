@@ -3165,4 +3165,3 @@ fn emit_tail(pending: &mut Vec<u8>, reply: &Sender<GenEvent>) -> Result<()> {
     }
     Ok(())
 }
-        
