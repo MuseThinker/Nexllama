@@ -37,6 +37,32 @@ let fileInput;
 // socket that is no longer being read.
 let controller = null;
 
+// The transcript follows the reply while it streams — but only while the
+// reader is already near the bottom. Someone scrolled up to reread a turn must
+// not be dragged down on every token; that is worse than not following at all.
+// "Near" rather than "exactly", because sub-pixel rounding can leave the
+// scroll position a fraction off the true end and kill the pin forever.
+let transcript;
+let pinned = $state(true);
+
+function onTranscriptScroll() {
+  const el = transcript;
+  if (!el) return;
+  pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+}
+
+// Runs whenever the tail of the conversation changes — a new message, or the
+// growing text of the reply now streaming. Reading the two values is what
+// subscribes the effect to them.
+$effect(() => {
+  void messages.length;
+  void messages[messages.length - 1]?.content;
+  if (!pinned || !transcript) return;
+  // Instant, not smooth: this fires per token, and easing between them reads
+  // as the transcript lagging behind the text.
+  transcript.scrollTo({ top: transcript.scrollHeight });
+});
+
 // The sampling panel. A native <details> only closes on its own summary, so
 // once it was open it stayed open through every click elsewhere on the page.
 let paramsOpen = $state(false);
@@ -285,7 +311,7 @@ onMount(() => {
     <h2>{$t('chat.title')}</h2>
   </header>
 
-  <div class="transcript">
+  <div class="transcript" bind:this={transcript} onscroll={onTranscriptScroll}>
     {#if messages.length === 0}
       <p class="muted">{$t('chat.empty')}</p>
     {/if}
