@@ -1279,9 +1279,7 @@ fn bundle(name: &str, dir: &str, files: Vec<serde_json::Value>) -> serde_json::V
         "loras": loras,
         "class": class,
         "mtp": mtp,
-        "draft_kind": pick("draft")
-            .and_then(|d| d.as_str())
-            .map(draft_kind_label),
+        "draft_kind": pick("draft").and_then(|d| d.as_str().map(draft_kind_label)),
         "kind": if pick("projector").is_some() {
             "vision"
         } else if pick("draft").is_some() {
