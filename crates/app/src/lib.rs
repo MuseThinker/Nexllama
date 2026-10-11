@@ -1232,7 +1232,7 @@ fn bundle(name: &str, dir: &str, files: Vec<serde_json::Value>) -> serde_json::V
                     .map(|p| gguf_probe::probe(p).is_ok())
                     .unwrap_or(false)
             })
-            .and_then(|f| f["path"].clone())
+            .map(|f| f["path"].clone())
     };
     let loras: Vec<serde_json::Value> = files
         .iter()
