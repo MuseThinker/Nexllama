@@ -201,10 +201,40 @@ impl HubClient {
         validate_filename(filename)?;
         std::fs::create_dir_all(dest_dir.as_ref())?;
         let dest = dest_dir.as_ref().join(filename);
-        let url = format!("{}/{}/resolve/main/{}", self.endpoint, repo, filename);
+        // The file may sit in a subfolder of the destination, which does not
+        // exist yet — `create_dir_all` above only made the destination itself.
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // A `#` or `?` in a name would otherwise be read as a fragment or query,
+        // and the download would come back truncated — or 404, with no hint why.
+        // Encoded one segment at a time so the separators stay separators.
+        let encode_path = |s: &str| {
+            s.split('/').map(url_encode).collect::<Vec<_>>().join("/")
+        };
+        let url = format!(
+            "{}/{}/resolve/main/{}",
+            self.endpoint,
+            encode_path(repo),
+            encode_path(filename)
+        );
         download_file(&self.http, &self.token, &url, &dest, on_progress).await?;
         Ok(dest)
     }
+}
+
+/// Percent-encode everything that is not an unreserved URL character.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 impl Default for HubClient {
@@ -231,14 +261,55 @@ struct ApiTreeEntry {
     entry_type: Option<String>,
 }
 
+/// A repo-relative path may carry directories, because repos do: the tree
+/// listing is recursive and plenty of GGUF lives in a subfolder. What must
+/// never get through is anything that could escape the destination — absolute
+/// paths, drive letters, and `..` at any depth — so every segment is held to
+/// the same rule a bare filename always was.
 pub(crate) fn validate_filename(filename: &str) -> Result<()> {
-    if filename.is_empty()
-        || filename.contains('/')
-        || filename.contains('\\')
-        || filename.contains("..")
-        || filename.starts_with('.')
-    {
+    if filename.is_empty() || filename.starts_with('/') || filename.contains('\\') {
+        return Err(HubError::InvalidFilename(filename.to_string()));
+    }
+    let safe = filename.split('/').all(|seg| {
+        !seg.is_empty()
+            && seg != "."
+            && seg != ".."
+            && !seg.contains("..")
+            && !seg.starts_with('.')
+            && !seg.contains(':')
+    });
+    if !safe {
         return Err(HubError::InvalidFilename(filename.to_string()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod filename_tests {
+    use super::*;
+
+    #[test]
+    fn subfolders_are_allowed_because_repos_have_them() {
+        assert!(validate_filename("subdir/model-q4.gguf").is_ok());
+        assert!(validate_filename("a/b/c/model.gguf").is_ok());
+    }
+
+    #[test]
+    fn nothing_may_climb_out_of_the_destination() {
+        assert!(validate_filename("../model.gguf").is_err());
+        assert!(validate_filename("sub/../../model.gguf").is_err());
+        assert!(validate_filename("sub/..model.gguf").is_err());
+        // Absolute and drive-letter forms, including the Windows spellings.
+        assert!(validate_filename("/model.gguf").is_err());
+        assert!(validate_filename("C:/model.gguf").is_err());
+        assert!(validate_filename("sub\\model.gguf").is_err());
+    }
+
+    #[test]
+    fn the_old_bare_filename_rules_still_hold() {
+        assert!(validate_filename("model.gguf").is_ok());
+        assert!(validate_filename("").is_err());
+        assert!(validate_filename(".hidden.gguf").is_err());
+        assert!(validate_filename("sub/.hidden.gguf").is_err());
+    }
 }

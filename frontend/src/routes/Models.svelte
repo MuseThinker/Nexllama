@@ -26,6 +26,7 @@ const advDefaults = {
   offloadKqv: true,
   ropeFreqBase: 0,
   ropeFreqScale: 0,
+  prefixCache: false,
 };
 const LOAD_KEY = 'nexllama.load';
 
@@ -240,8 +241,10 @@ async function loadLocal() {
   if (!hasTauri) return;
   try {
     localModels = await invoke('list_local_models');
-  } catch {
-    /* ignore */
+  } catch (e) {
+    // An empty library and a read failure look identical from the outside.
+    // Saying nothing turns "no models yet" into "where did everything go".
+    error = String(e);
   }
 }
 
@@ -261,6 +264,7 @@ function loadBody(path) {
     offload_kqv: adv.offloadKqv,
     rope_freq_base: Number(adv.ropeFreqBase),
     rope_freq_scale: Number(adv.ropeFreqScale),
+    prefix_cache: adv.prefixCache === true,
   };
 }
 
@@ -373,16 +377,24 @@ async function search() {
 }
 
 async function pickRepo(id) {
+  // One listing at a time: two racing listings would pair one repo's files
+  // with the other repo's name, and a download built from that pair asks for
+  // a file that does not exist.
+  if (loadingFiles) return;
   activeRepo = id;
   files = [];
   loadingFiles = true;
   error = '';
   try {
-    files = await invoke('hub_list_gguf', { repo: id });
+    const got = await invoke('hub_list_gguf', { repo: id });
+    // Another repo may have been picked while this one was in flight; a late
+    // answer belongs to a request nobody is waiting for any more.
+    if (activeRepo !== id) return;
+    files = got;
   } catch (e) {
-    error = String(e);
+    if (activeRepo === id) error = String(e);
   } finally {
-    loadingFiles = false;
+    if (activeRepo === id) loadingFiles = false;
   }
 }
 
@@ -433,6 +445,9 @@ onMount(() => {
   let un1;
   let un2;
   listen('download://progress', (e) => {
+    // Progress events carry the file they belong to; adopting whichever event
+    // arrived last would show one download's numbers on another's bar.
+    if (e.payload.filename !== downloading) return;
     progress = { downloaded: e.payload.downloaded, total: e.payload.total ?? progress.total };
   }).then((f) => (un1 = f));
   listen('download://done', (e) => {
@@ -715,6 +730,10 @@ onMount(() => {
         <label class="checkline">
           <input type="checkbox" bind:checked={adv.offloadKqv} />
           <span>{$t('settings.offloadKqv')}</span>
+        </label>
+        <label class="checkline" title={$t('settings.prefixCacheHint')}>
+          <input type="checkbox" bind:checked={adv.prefixCache} />
+          <span>{$t('settings.prefixCache')}</span>
         </label>
       </div>
     </details>

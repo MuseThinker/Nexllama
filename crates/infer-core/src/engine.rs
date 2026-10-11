@@ -156,10 +156,13 @@ pub struct LoadConfig {
     /// How many prompts to remember.
     #[serde(default)]
     pub prefix_cache_entries: u32,
-    /// Ceiling on the total tokens remembered, which is what bounds the memory
-    /// this holds.
-    #[serde(default)]
-    pub prefix_cache_max_tokens: u32,
+    /// Ceiling on the state held, in MiB.
+    ///
+    /// Bytes, not tokens: a remembered prompt costs its serialised KV cache,
+    /// which for a large model is hundreds of kilobytes per token, so a budget
+    /// counted in tokens would look small while quietly holding gigabytes.
+    #[serde(default = "default_cache_mb")]
+    pub prefix_cache_max_mb: u32,
 
     /// Stop drafting when measurement says it is not paying for itself.
     ///
@@ -179,6 +182,10 @@ fn default_true() -> bool {
 
 fn default_accept_floor() -> f32 {
     0.3
+}
+
+fn default_cache_mb() -> u32 {
+    512
 }
 
 impl LoadConfig {
@@ -209,7 +216,7 @@ impl LoadConfig {
             // Opt-in: see the note on `prefix_cache`.
             prefix_cache: false,
             prefix_cache_entries: 4,
-            prefix_cache_max_tokens: 8192,
+            prefix_cache_max_mb: 512,
             adaptive_draft: true,
             accept_floor: 0.3,
         }
@@ -1135,7 +1142,14 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
             // An MTP checkpoint ships its head as ordinary tensors that llama.cpp
             // skips unless asked for them, so asking is the difference between a
             // draft head and a file full of weights nothing points at.
-            let mut params = LlamaModelParams::default().with_n_gpu_layers(cfg.n_gpu_layers);
+            // Same placement and read-strategy questions as the main model: a
+            // draft on the wrong GPU is worse than no draft, and mmap/mlock/dio
+            // mean just as much for a second multi-gigabyte file.
+            let mut params = LlamaModelParams::default()
+                .with_n_gpu_layers(cfg.n_gpu_layers)
+                .with_main_gpu(cfg.main_gpu)
+                .with_load_mode(cfg.load_mode.into())
+                .with_use_mlock(cfg.use_mlock);
             if draft_kind == Some(DraftKind::Mtp) {
                 params = params.with_load_mtp(true);
             }
@@ -1230,7 +1244,7 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
     let mut prefix = if cfg.prefix_cache && mtp_n_max == 0 && cfg.draft_model.is_none() {
         PromptCache::new(
             cfg.prefix_cache_entries.max(1) as usize,
-            cfg.prefix_cache_max_tokens.max(1024) as usize,
+            cfg.prefix_cache_max_mb as usize * 1024 * 1024,
         )
     } else {
         PromptCache::disabled()
@@ -1597,7 +1611,7 @@ fn run_generate<'m, 'd>(
     // A separate draft model outranks the n-gram drafter as well: it proposes
     // from learned weights rather than from repeats in this conversation, so
     // when one is loaded it is the better guess.
-    if params.speculative && images == 0 {
+    if speculate && images == 0 {
         if let (Some(kind), Some(draft)) = (draft_kind, draft_ctx.as_mut()) {
             // An MTP head drafted from a side-mounted checkpoint is still an MTP
             // head — same loop, same session, only the weights it reads are a
@@ -1611,6 +1625,9 @@ fn run_generate<'m, 'd>(
                 // and never assumes the two share weights. The draft model
                 // loaded here outlives the session this borrow feeds, so the
                 // only thing being widened is the binding's own type.
+                //
+                // SAFETY: the draft context's data outlives this borrow, so the
+                // lifetime extension is sound; no other use of `draft` follows.
                 let side: &mut LlamaContext<'m> = unsafe {
                     std::mem::transmute::<&mut LlamaContext<'d>, &mut LlamaContext<'m>>(draft)
                 };
@@ -2428,9 +2445,15 @@ fn draft_kind(path: &Path) -> DraftKind {
         }
     }
     let name = path.to_string_lossy().to_lowercase();
+    // Order matters: publishers name checkpoints after the family they serve as
+    // often as after the head they are, so "eagle" is checked before "mtp" — a
+    // file mentioning both is much more likely to be the EAGLE checkpoint. The
+    // NextN spelling is what several MTP-head releases actually use.
     if name.contains("dflash") {
         DraftKind::DFlash
-    } else if name.contains("mtp") {
+    } else if name.contains("eagle") {
+        DraftKind::Eagle3
+    } else if name.contains("mtp") || name.contains("nextn") {
         DraftKind::Mtp
     } else {
         DraftKind::Eagle3
@@ -3142,3 +3165,4 @@ fn emit_tail(pending: &mut Vec<u8>, reply: &Sender<GenEvent>) -> Result<()> {
     }
     Ok(())
 }
+        

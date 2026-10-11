@@ -33,17 +33,22 @@ pub struct Cached {
 pub struct PromptCache {
     /// Most entries to hold. Zero disables the cache outright.
     max_entries: usize,
-    /// Ceiling on the total tokens held, which is what bounds the memory.
-    max_tokens: usize,
+    /// Ceiling on the total state bytes held, which is what bounds the memory.
+    ///
+    /// Bytes, not tokens, and deliberately so: a remembered prompt costs its
+    /// serialised KV cache, which for a large model is hundreds of kilobytes
+    /// per token. A budget counted in tokens would look small while holding
+    /// gigabytes.
+    max_bytes: usize,
     /// Least-recently-used first.
     entries: Vec<Cached>,
 }
 
 impl PromptCache {
-    pub fn new(max_entries: usize, max_tokens: usize) -> Self {
+    pub fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             max_entries,
-            max_tokens,
+            max_bytes,
             entries: Vec::new(),
         }
     }
@@ -76,7 +81,7 @@ impl PromptCache {
             if tokens[..e.tokens.len()] != e.tokens[..] {
                 continue;
             }
-            if best.map_or(true, |(len, _)| e.tokens.len() > len) {
+            if best.is_none_or(|(len, _)| e.tokens.len() > len) {
                 best = Some((e.tokens.len(), i));
             }
         }
@@ -116,7 +121,7 @@ impl PromptCache {
         // bigger than the whole budget is better served by caching it slowly
         // than by never caching it at all.
         while self.entries.len() > 1
-            && self.entries.iter().map(|e| e.tokens.len()).sum::<usize>() > self.max_tokens
+            && self.entries.iter().map(|e| e.state.len()).sum::<usize>() > self.max_bytes
         {
             self.entries.remove(0);
         }
@@ -232,6 +237,16 @@ mod tests {
         let mut tight = PromptCache::new(8, MIN_TOKENS / 2);
         tight.insert(vec![1; MIN_TOKENS], vec![1; MIN_TOKENS]);
         assert_eq!(tight.len(), 1);
+    }
+
+    #[test]
+    fn the_budget_is_bytes_of_state_not_tokens() {
+        let mut c = PromptCache::new(8, 100);
+        c.insert(vec![1; MIN_TOKENS], vec![0u8; 60]);
+        c.insert(vec![2; MIN_TOKENS], vec![0u8; 60]);
+        // Two entries hold 120 bytes of state against a 100-byte budget: the
+        // oldest goes, whatever its token count.
+        assert_eq!(c.len(), 1);
     }
 
     #[test]

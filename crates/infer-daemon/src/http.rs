@@ -458,6 +458,15 @@ struct LoadRequest {
     /// nothing — so this only refuses when the caller explicitly asks it to.
     #[serde(default)]
     strict_fit: Option<bool>,
+    /// Reuse the KV state of an already-encoded prefix for this model.
+    #[serde(default)]
+    prefix_cache: Option<bool>,
+    /// How many prompts to remember.
+    #[serde(default)]
+    prefix_cache_entries: Option<u32>,
+    /// Ceiling on remembered state, in MiB.
+    #[serde(default)]
+    prefix_cache_max_mb: Option<u32>,
     #[serde(default)]
     n_gpu_layers: Option<u32>,
     #[serde(default)]
@@ -701,32 +710,59 @@ async fn load(
         );
     }
 
+    // Prefix reuse is opt-in per load, and off unless asked for. The budget is
+    // in MiB because what a remembered prompt costs is its serialised KV state,
+    // not its token count.
+    if let Some(on) = req.prefix_cache {
+        cfg.prefix_cache = on;
+    }
+    if let Some(n) = req.prefix_cache_entries {
+        cfg.prefix_cache_entries = n;
+    }
+    if let Some(mb) = req.prefix_cache_max_mb {
+        cfg.prefix_cache_max_mb = mb;
+    }
+
     // Measured before anything is displaced: refusing a load must not cost the
-    // caller the model that is already serving.
-    let fit = tokio::task::spawn_blocking({
+    // caller the model that is already serving. A measurement that fails is
+    // advisory too — `fit.rs` documents "never refuses a model on its own" and
+    // an `Err` here would contradict that. We log and continue without a
+    // report, so a transient backend/probe failure cannot brick loading.
+    let fit: Option<FitReport> = match tokio::task::spawn_blocking({
         let path = cfg.model_path.clone();
         let n_ctx = cfg.n_ctx;
         move || infer_core::fit::fit(&path, n_ctx)
     })
     .await
-    .map_err(|e| ApiError::Model(format!("fit task failed: {e}")))?
-    .map_err(|e| ApiError::Model(e.to_string()))?;
-
-    if !fit.fits {
-        let hint = match (fit.suggested_gpu_layers, fit.suggested_ctx) {
-            (Some(layers), Some(ctx)) => {
-                format!(" (llama.cpp suggests {layers} layers, ctx {ctx})")
-            }
-            (Some(layers), None) => format!(" (llama.cpp suggests {layers} layers)"),
-            _ => String::new(),
-        };
-        if req.strict_fit.unwrap_or(false) {
-            return Err(ApiError::BadRequest(format!(
-                "{}{hint}; not loaded because strict_fit was requested",
-                fit.reason
-            )));
+    {
+        Ok(Ok(r)) => Some(r),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "fit: could not measure; loading without fit advice");
+            None
         }
-        notes.push(format!("warning: {}{hint}", fit.reason));
+        Err(e) => {
+            tracing::warn!(error = %e, "fit task failed; loading without fit advice");
+            None
+        }
+    };
+
+    if let Some(fit) = fit.as_ref() {
+        if !fit.fits {
+            let hint = match (fit.suggested_gpu_layers, fit.suggested_ctx) {
+                (Some(layers), Some(ctx)) => {
+                    format!(" (llama.cpp suggests {layers} layers, ctx {ctx})")
+                }
+                (Some(layers), None) => format!(" (llama.cpp suggests {layers} layers)"),
+                _ => String::new(),
+            };
+            if req.strict_fit.unwrap_or(false) {
+                return Err(ApiError::BadRequest(format!(
+                    "{}{hint}; not loaded because strict_fit was requested",
+                    fit.reason
+                )));
+            }
+            notes.push(format!("warning: {}{hint}", fit.reason));
+        }
     }
 
     // Drop any existing model with the same id before loading the new one.
@@ -1266,6 +1302,7 @@ fn ollama_reply(
 /// `chat` picks the message-shaped reply; otherwise the reply carries `response`,
 /// which is what `/api/generate` clients read. Streaming here is newline-delimited
 /// JSON rather than SSE — the one place Ollama and OpenAI genuinely differ.
+#[allow(clippy::too_many_arguments)]
 async fn ollama_stream(
     handle: EngineHandle,
     model_id: String,

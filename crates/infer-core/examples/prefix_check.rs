@@ -51,12 +51,16 @@ fn conversation() -> Vec<Vec<ChatMsg>> {
 
 /// One pass over the conversation. Returns the replies and how long each took
 /// to encode, which is where the cache should show up.
-fn run(path: &str, n_gpu_layers: u32, prefix_cache: bool) -> anyhow::Result<(Vec<String>, Vec<f64>)> {
+fn run(
+    path: &str,
+    n_gpu_layers: u32,
+    prefix_cache: bool,
+) -> anyhow::Result<(Vec<String>, Vec<f64>)> {
     let mut cfg = LoadConfig::new(path);
     cfg.n_gpu_layers = n_gpu_layers;
     cfg.prefix_cache = prefix_cache;
     cfg.prefix_cache_entries = 4;
-    cfg.prefix_cache_max_tokens = 8192;
+    cfg.prefix_cache_max_mb = 512;
     // Drafting is off: it changes what gets sampled, and this is checking
     // whether the *cache* changes what gets sampled.
     cfg.adaptive_draft = false;
@@ -90,7 +94,11 @@ fn main() -> anyhow::Result<()> {
 
     println!("encode time per turn (ms), off vs on");
     for (i, (off, on)) in off_prompt.iter().zip(on_prompt.iter()).enumerate() {
-        let change = if *off > 0.0 { (*on - *off) / *off * 100.0 } else { 0.0 };
+        let change = if *off > 0.0 {
+            (*on - *off) / *off * 100.0
+        } else {
+            0.0
+        };
         println!("  turn {i}: {off:8.1} -> {on:8.1}  ({change:+.0}%)");
     }
 

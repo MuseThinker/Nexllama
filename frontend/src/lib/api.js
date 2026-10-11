@@ -77,10 +77,12 @@ export const daemon = {
   load: (body) =>
     req('/admin/load', { method: 'POST', body: JSON.stringify(body) }, 0),
 
-  // No timeout either: measuring a checkpoint means reading its metadata, and
-  // on a multi-gigabyte file that is real I/O, not a quick lookup.
+  // Default timeout on purpose. Measuring reads real metadata, but it is a
+  // header read, not a load — and the download precheck runs *before* the
+  // transfer, so a hung daemon here would hold the download forever with
+  // nothing on screen to say why. Timing out falls back to "start anyway".
   fit: (body) =>
-    req('/admin/fit', { method: 'POST', body: JSON.stringify(body) }, 0),
+    req('/admin/fit', { method: 'POST', body: JSON.stringify(body) }),
 
   unload: (model) =>
     req('/admin/unload', {

@@ -1211,7 +1211,29 @@ fn bundle(name: &str, dir: &str, files: Vec<serde_json::Value>) -> serde_json::V
             .find(|f| f["role"] == role)
             .map(|f| f["path"].clone())
     };
-    let main = pick("main").or_else(|| files.first().map(|f| f["path"].clone()));
+    // The name is a hint; the header is the verdict. Main weights get named
+    // after the family they serve — "…-MTP", "…-EAGLE" — exactly the way draft
+    // heads are, so a folder can hold two files whose names both say "draft"
+    // while only one is a full model. Among the candidates, the largest one
+    // whose header can actually be read is the main file: a stripped head is
+    // never the biggest GGUF in its own folder, and loading the second-biggest
+    // file as the model is the one outcome worse than offering nothing.
+    let main = {
+        let mut candidates: Vec<&serde_json::Value> = files
+            .iter()
+            .filter(|f| matches!(f["role"].as_str(), Some("main") | Some("draft")))
+            .collect();
+        candidates.sort_by_key(|f| std::cmp::Reverse(f["size"].as_u64().unwrap_or(0)));
+        candidates
+            .iter()
+            .find(|f| {
+                f["path"]
+                    .as_str()
+                    .map(|p| gguf_probe::probe(p).is_ok())
+                    .unwrap_or(false)
+            })
+            .and_then(|f| f["path"].clone())
+    };
     let loras: Vec<serde_json::Value> = files
         .iter()
         .filter(|f| f["role"] == "lora")
