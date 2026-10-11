@@ -1155,6 +1155,24 @@ fn sort_files(files: &mut [serde_json::Value]) {
     });
 }
 
+/// A short label for the drafter a side-mounted file implements, from its name.
+///
+/// The engine makes the same call from the checkpoint header when it loads;
+/// this is the list's guess from the filename, so the choice is readable
+/// before anything has been loaded.
+fn draft_kind_label(filename: &str) -> &'static str {
+    let n = filename.to_ascii_lowercase();
+    if n.contains("dflash") {
+        "DFlash"
+    } else if n.contains("eagle") {
+        "EAGLE-3"
+    } else if n.contains("mtp") || n.contains("nextn") {
+        "MTP"
+    } else {
+        "draft"
+    }
+}
+
 fn role_of(filename: &str) -> &'static str {
     let n = filename.to_ascii_lowercase();
     if n.contains("mmproj") || n.contains("projector") {
@@ -1261,6 +1279,9 @@ fn bundle(name: &str, dir: &str, files: Vec<serde_json::Value>) -> serde_json::V
         "loras": loras,
         "class": class,
         "mtp": mtp,
+        "draft_kind": pick("draft")
+            .and_then(|d| d.as_str())
+            .map(draft_kind_label),
         "kind": if pick("projector").is_some() {
             "vision"
         } else if pick("draft").is_some() {

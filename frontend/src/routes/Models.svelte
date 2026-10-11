@@ -36,11 +36,20 @@ let error = $state('');
 let notice = $state('');
 let busy = $state('');
 let loadingPath = $state('');
-// Which drafter to load is a property of the file, not of the app, so it is
-// kept per bundle and defaults to the bundled MTP head whenever the model has
-// one — a head needs no second file and drafts faster than a side-mounted one.
-let mtpOn = $state({});
-const wantMtp = (b) => !!b.mtp && mtpOn[b.name] !== false;
+// Which drafter to load is a choice, because the engine takes exactly one: the
+// bundled MTP head or a side-mounted draft file, never both. "auto" prefers the
+// side-mounted file — a published DFlash/EAGLE checkpoint is the drafter
+// someone made for this exact model — and falls back to the head.
+let drafter = $state({});
+
+function wantMtp(b) {
+  const choice = drafter[b.name] ?? 'auto';
+  if (choice === 'mtp') return b.mtp === true;
+  if (choice === 'draft') return b.draft != null;
+  return !b.draft && b.mtp === true;
+}
+
+const draftLabel = (b) => b.draft_kind ?? 'draft';
 
 let query = $state('');
 // Restricting a search to one author is the difference between hundreds of
@@ -631,14 +640,16 @@ onMount(() => {
             <span class="file-size">
               {fmt(b.size)}{#if b.files.length > 1} · {b.files.length} {$t('models.files')}{/if}
             </span>
-            {#if b.mtp}
-              <label class="checkline" title={$t('models.mtpHint')}>
-                <input
-                  type="checkbox"
-                  checked={wantMtp(b)}
-                  onchange={(e) => (mtpOn[b.name] = e.target.checked)}
-                />
-                <span>MTP</span>
+            {#if b.mtp || b.draft}
+              <label class="checkline" title={$t('models.drafterHint')}>
+                <select
+                  value={drafter[b.name] ?? 'auto'}
+                  onchange={(e) => (drafter[b.name] = e.target.value)}
+                >
+                  <option value="auto">{$t('models.drafterAuto')}</option>
+                  {#if b.mtp}<option value="mtp">MTP</option>{/if}
+                  {#if b.draft}<option value="draft">{draftLabel(b)}</option>{/if}
+                </select>
               </label>
             {/if}
             <button class="ghost" onclick={() => checkFit(b)} disabled={busy !== '' || fitBusy !== ''}>

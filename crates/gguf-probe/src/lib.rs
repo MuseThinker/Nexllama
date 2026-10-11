@@ -324,7 +324,13 @@ fn scan_tensors<R: BufRead + Seek>(
             cls = true;
         }
         // llama.cpp names the MTP head `nextn`; a few converters write `mtp`.
-        if name.contains("nextn") || name.contains("mtp") {
+        // Anchored, not a bare substring: "mtp" inside an unrelated tensor name
+        // must not read as a built-in head.
+        let mtp_head = name.starts_with("mtp.")
+            || name.contains(".mtp.")
+            || name.ends_with(".mtp")
+            || name.contains("nextn");
+        if mtp_head {
             nextn = true;
         }
         let n_dims = read_u32(reader)?;

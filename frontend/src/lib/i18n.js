@@ -55,7 +55,9 @@ const dict = {
     'models.libraryHint': 'LLM（含视觉）用于对话框测试与调参；标记 API 的 embedding / rerank 模型通过 HTTP 接口提供服务。',
     'models.libraryEmpty': '还没有模型。可在下方下载，或把 GGUF 放进 models 目录。',
     'models.load': '加载',
-    'models.mtpHint': '用模型自带的 MTP 头做草稿：不需要第二个文件，比外挂草稿更快，多占少量显存。',
+    'models.drafterAuto': '自动',
+    'models.drafterHint':
+      '起草方式。自动：优先外挂草稿文件（如 DFlash2），没有才用内置 MTP 头——引擎只认其中一个。',
     'models.advanced': '高级参数',
     'models.gpuLayers': 'GPU 层数',
     'models.fit': '适配检查',
@@ -208,8 +210,9 @@ const dict = {
       'LLMs (including vision) are for the chat panel; models marked API (embedding / rerank) serve HTTP endpoints.',
     'models.libraryEmpty': 'No models yet. Download one below, or drop a GGUF into the models folder.',
     'models.load': 'Load',
-    'models.mtpHint':
-      "Draft with the model's bundled MTP head: no second file, faster than a side-mounted draft, a little more VRAM.",
+    'models.drafterAuto': 'auto',
+    'models.drafterHint':
+      'Which drafter to load. Auto prefers a side-mounted draft file (e.g. DFlash2) over the bundled MTP head — the engine takes one or the other, never both.',
     'models.advanced': 'Advanced',
     'models.gpuLayers': 'GPU layers',
     'models.fit': 'Check fit',
