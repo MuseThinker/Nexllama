@@ -34,7 +34,13 @@ pub struct FitReport {
     pub fits: bool,
     /// Bytes the checkpoint's weights and buffers are projected to need.
     pub needed_mb: u64,
-    /// Bytes free on the device that would hold the most.
+    /// Bytes free on the device that constrains the load.
+    ///
+    /// For the measured path this is the tightest device (the minimum free
+    /// across the devices the checkpoint would land on) — the actual ceiling
+    /// when "fits" requires every piece to fit. For the size path it is the
+    /// largest single device, because that path asks "is it worth starting"
+    /// rather than "will this load".
     pub available_mb: u64,
     /// How many layers llama.cpp would offload, if it were left to decide.
     pub suggested_gpu_layers: Option<u32>,
@@ -81,12 +87,6 @@ const DEFAULT_CTX: u32 = 4096;
 /// for anything but the shortest exchange.
 const MIN_CTX: u32 = 2048;
 
-/// Measure a checkpoint against this machine.
-///
-/// # Errors
-///
-/// Fails when the hardware cannot be probed or llama.cpp cannot read the file.
-/// A model that simply does not fit is a successful call with `fits: false`.
 /// A report for a size with no local file yet.
 ///
 /// Weights dominate what a checkpoint needs, and they are the only thing known
@@ -115,6 +115,12 @@ pub fn from_size(bytes: u64, hardware: HardwareProfile) -> FitReport {
     }
 }
 
+/// Measure a checkpoint against this machine.
+///
+/// # Errors
+///
+/// Fails when the hardware cannot be probed or llama.cpp cannot read the file.
+/// A model that simply does not fit is a successful call with `fits: false`.
 pub fn fit(path: &Path, n_ctx: u32) -> Result<FitReport> {
     let hardware = probe()?;
     let n_ctx = if n_ctx == 0 { DEFAULT_CTX } else { n_ctx };
@@ -141,8 +147,9 @@ pub fn fit(path: &Path, n_ctx: u32) -> Result<FitReport> {
         }
     };
 
-    // The device that has to absorb the most is the one that decides: a model
-    // split across two cards still fails if either piece does not fit.
+    // A model split across two cards fails if either piece does not fit, so the
+    // need is the biggest piece and the supply is the tightest device — the
+    // honest "X of Y free" comparison is against the minimum, not the largest.
     let needed_mb = measured
         .entries
         .iter()
@@ -153,7 +160,7 @@ pub fn fit(path: &Path, n_ctx: u32) -> Result<FitReport> {
         .entries
         .iter()
         .map(|e| mb(e.free.max(0) as usize))
-        .max()
+        .min()
         .unwrap_or(hardware.largest_free_mb());
 
     let fits = measured.entries.iter().all(|e| {
@@ -217,6 +224,11 @@ pub fn fit(path: &Path, n_ctx: u32) -> Result<FitReport> {
 /// is a comparison against the largest thing the machine can hold rather than a
 /// projection. It answers "is this worth starting", not "will this load".
 pub fn fits_size(bytes: u64, hardware: &HardwareProfile) -> (bool, u64, u64) {
+    // 32-bit `usize` would silently truncate a file larger than 4 GiB. This
+    // crate only ships for 64-bit Windows and macOS today, so the assert is the
+    // honest guarantee; a 32-bit port would have to switch to a checked
+    // conversion here and in `mb`.
+    debug_assert!(bytes <= usize::MAX as u64);
     let available = hardware.largest_free_mb();
     (
         mb(bytes as usize) <= available,

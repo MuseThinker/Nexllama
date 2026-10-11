@@ -336,6 +336,8 @@
           "rope_freq_base": { "type": "number" },
           "rope_freq_scale": { "type": "number" },
           "load_mtp": { "type": "boolean" },
+          "mtp_n_max": { "type": "integer", "description": "Tokens the MTP head may propose per round; 0 means use the engine default. Forces load_mtp." },
+          "strict_fit": { "type": "boolean", "description": "Refuse the load when Smart Fit says the model does not fit, rather than only warning." },
           "mmproj": { "type": "string", "description": "Multimodal projector, for image input." },
           "draft_model": { "type": "string", "description": "A separate draft checkpoint — DFlash or EAGLE-3 — that proposes continuations for the target to verify. The other half of speculative decoding from `load_mtp`, which uses heads bundled in the target." },
           "draft_n_max": { "type": "integer", "description": "Tokens the draft model may propose per round. 0 uses a default; the real bound is n_batch, since the proposal is verified in one pass." },
@@ -344,6 +346,59 @@
           "set_default": { "type": "boolean" }
         },
         "required": ["model"]
+      },
+      "FitRequest": {
+        "type": "object",
+        "description": "Either `model` (a path on disk) or `size_bytes` (a not-yet-downloaded file).",
+        "properties": {
+          "model": { "type": "string", "description": "Path to a GGUF on disk." },
+          "n_ctx": { "type": "integer", "description": "Context to measure against; defaults to 4096." },
+          "size_bytes": { "type": "integer", "description": "Size of a file that is not on disk yet, for pre-download checks." }
+        }
+      },
+      "FitReport": {
+        "type": "object",
+        "description": "Smart Fit's read on one checkpoint against this machine. Advisory in every field: nothing here refuses a load on its own.",
+        "properties": {
+          "fits": { "type": "boolean" },
+          "needed_mb": { "type": "integer" },
+          "available_mb": { "type": "integer" },
+          "suggested_gpu_layers": { "type": ["integer", "null"] },
+          "suggested_ctx": { "type": ["integer", "null"] },
+          "suggested_quant": { "type": ["string", "null"] },
+          "reason": { "type": "string" },
+          "hardware": { "$ref": "#/components/schemas/HardwareProfile" }
+        }
+      },
+      "GpuInfo": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "backend": { "type": "string" },
+          "vram_total_mb": { "type": "integer" },
+          "vram_free_mb": { "type": "integer" }
+        }
+      },
+      "HardwareProfile": {
+        "type": "object",
+        "description": "What the machine offers a model, taken from llama.cpp's own device registry.",
+        "properties": {
+          "ram_total_mb": { "type": "integer" },
+          "ram_free_mb": { "type": "integer" },
+          "cpu_cores": { "type": "integer" },
+          "gpus": { "type": "array", "items": { "$ref": "#/components/schemas/GpuInfo" } }
+        }
+      },
+      "RuntimeStats": {
+        "type": "object",
+        "description": "Smoothed performance figures for one loaded model, surfaced under /admin/status → models[].perf.",
+        "properties": {
+          "requests": { "type": "integer" },
+          "tokens": { "type": "integer" },
+          "tokens_per_second": { "type": "number" },
+          "first_token_ms": { "type": "number" },
+          "draft_acceptance": { "type": ["number", "null"], "description": "Smoothed share of drafted tokens the model confirmed. `null` until a reply has actually drafted." }
+        }
       },
       "UnloadRequest": {
         "type": "object",
@@ -466,6 +521,19 @@
         "security": [{ "bearerAuth": [] }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UnloadRequest" }, "example": { "model": "qwen2.5" } } } },
         "responses": { "200": { "description": "unloaded", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/admin/fit": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Smart Fit: measure one checkpoint against this machine",
+        "description": "Advisory in every field. Used by the library card and by the download check; the load endpoint runs the same measurement but only fails when the caller asked for `strict_fit`.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FitRequest" }, "example": { "model": "D:\\models\\qwen2.5-0.5b-instruct-q4_k_m.gguf", "n_ctx": 4096 } } } },
+        "responses": {
+          "200": { "description": "report", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FitReport" } } } },
+          "400": { "description": "bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/chat/completions": {
