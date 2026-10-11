@@ -56,6 +56,9 @@ const dict = {
     'models.libraryEmpty': '还没有模型。可在下方下载，或把 GGUF 放进 models 目录。',
     'models.load': '加载',
     'models.drafterAuto': '自动',
+    'models.results': '{n} 个结果',
+    'models.collapse': '收起',
+    'models.expand': '展开',
     'models.drafterHint':
       '起草方式。自动：优先外挂草稿文件（如 DFlash2），没有才用内置 MTP 头——引擎只认其中一个。',
     'models.advanced': '高级参数',
@@ -211,6 +214,9 @@ const dict = {
     'models.libraryEmpty': 'No models yet. Download one below, or drop a GGUF into the models folder.',
     'models.load': 'Load',
     'models.drafterAuto': 'auto',
+    'models.results': '{n} results',
+    'models.collapse': 'Collapse',
+    'models.expand': 'Expand',
     'models.drafterHint':
       'Which drafter to load. Auto prefers a side-mounted draft file (e.g. DFlash2) over the bundled MTP head — the engine takes one or the other, never both.',
     'models.advanced': 'Advanced',

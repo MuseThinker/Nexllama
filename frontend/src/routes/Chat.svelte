@@ -30,6 +30,33 @@ const modelDrafts = $derived(!!(active?.draft_model || active?.load_mtp));
 const drafter = $derived(
   active?.draft_model ? String(active.draft_model).split(/[\\/]/).pop() : active?.load_mtp ? 'MTP' : ''
 );
+// What to call the drafter a loaded model actually uses, from the draft file's
+// name. `info.mtp` is a property of the GGUF — "ships a head" — and says
+// nothing about which drafter a reply came from.
+const kindOf = (p) => {
+  const n = String(p).toLowerCase();
+  return n.includes('dflash')
+    ? 'DFlash'
+    : n.includes('eagle')
+      ? 'EAGLE-3'
+      : n.includes('mtp') || n.includes('nextn')
+        ? 'MTP'
+        : 'draft';
+};
+
+// A model loaded with a drafter should draft by default: the drafter was chosen
+// at load time, and a second switch hidden in the parameters panel reads as
+// "the drafter does nothing". Auto-enabled once; switching it off afterwards
+// stays off.
+let specAutoSet = false;
+$effect(() => {
+  if (modelDrafts && !specAutoSet) {
+    speculative = true;
+    specAutoSet = true;
+  } else if (!modelDrafts) {
+    specAutoSet = false;
+  }
+});
 let images = $state([]);
 let fileInput;
 // Set while a reply is streaming so it can be stopped. Aborting the request is
@@ -420,7 +447,7 @@ onMount(() => {
         {/if}
         {#each models as m}
           <option value={m.id}
-            >{m.id}{m.info?.vision ? ' · vision' : ''}{m.load_mtp ? ' · MTP' : m.draft_model ? ' · draft' : ''}</option
+            >{m.id}{m.info?.vision ? ' · vision' : ''}{m.draft_model ? ` · ${kindOf(m.draft_model)}` : m.load_mtp ? ' · MTP' : ''}</option
           >
         {/each}
       </select>

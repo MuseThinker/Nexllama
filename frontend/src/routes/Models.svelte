@@ -51,6 +51,20 @@ function wantMtp(b) {
 
 const draftLabel = (b) => b.draft_kind ?? 'draft';
 
+// What to call the drafter a loaded model actually uses, from the draft file's
+// name. `info.mtp` is a property of the GGUF — "ships a head" — and says
+// nothing about which drafter a reply came from.
+const kindOf = (p) => {
+  const n = String(p).toLowerCase();
+  return n.includes('dflash')
+    ? 'DFlash'
+    : n.includes('eagle')
+      ? 'EAGLE-3'
+      : n.includes('mtp') || n.includes('nextn')
+        ? 'MTP'
+        : 'draft';
+};
+
 let query = $state('');
 // Restricting a search to one author is the difference between hundreds of
 // repos of uneven quality and a list worth reading. Empty means "anywhere".
@@ -58,6 +72,9 @@ let author = $state('');
 let authors = $state([]);
 let searching = $state(false);
 let results = $state([]);
+// A long search once lived on screen until the next search replaced it; being
+// able to fold it away is how the rest of the page gets its room back.
+let resultsOpen = $state(true);
 let activeRepo = $state('');
 let files = $state([]);
 let loadingFiles = $state(false);
@@ -580,6 +597,14 @@ onMount(() => {
     {/if}
 
     {#if results.length > 0}
+      <div class="results-head">
+        <span class="muted">{$t('models.results', { n: results.length })}</span>
+        <button class="ghost" onclick={() => (resultsOpen = !resultsOpen)}>
+          {$t(resultsOpen ? 'models.collapse' : 'models.expand')}
+        </button>
+      </div>
+    {/if}
+    {#if results.length > 0 && resultsOpen}
       <ul class="repo-list">
         {#each results as r}
           <li>
@@ -762,8 +787,11 @@ onMount(() => {
             <span class="file-name">
               {m.id}
               {#if m.info?.vision}<span class="badge">vision</span>{/if}
-              {#if m.info?.mtp}<span class="badge">MTP {m.load_mtp ? 'on' : 'off'}</span>{/if}
-              {#if m.draft_model}<span class="badge" title={m.draft_model}>draft</span>{/if}
+              {#if m.draft_model}
+                <span class="badge" title={m.draft_model}>{kindOf(m.draft_model)}</span>
+              {:else if m.load_mtp && m.info?.mtp}
+                <span class="badge">MTP</span>
+              {/if}
               {#if m.mmproj}<span class="badge" title={m.mmproj}>mmproj</span>{/if}
               {#if m.info?.model_class === 'embedding' || m.info?.model_class === 'rerank'}
                 <span class="badge api">API · {m.info.model_class}</span>
