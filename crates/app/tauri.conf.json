@@ -20,8 +20,8 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' asset: http://asset.localhost; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: http://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost http://127.0.0.1:15656",
-      "devCsp": "default-src 'self' asset: http://asset.localhost http://127.0.0.1:5173; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: http://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost http://127.0.0.1:15656 http://127.0.0.1:5173 ws://127.0.0.1:5173"
+      "csp": "default-src 'self' asset: http://asset.localhost; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: http://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost http://127.0.0.1:*",
+      "devCsp": "default-src 'self' asset: http://asset.localhost http://127.0.0.1:5173; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: http://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost http://127.0.0.1:* http://127.0.0.1:5173 ws://127.0.0.1:5173"
     }
   },
   "bundle": {
@@ -30,9 +30,10 @@
     "icon": ["icons/icon.ico", "icons/icon.png"],
     "resources": ["backends/**/*"],
     "windows": {
-      "nsis": {
-        "installerIcon": "icons/icon.ico",
-        "uninstallerIcon": "icons/icon.ico"
+"nsis":  {
+        "installerIcon":  "icons/icon.ico",
+        "uninstallerIcon":  "icons/icon.ico",
+        "template":  "installer.nsi"
       }
     }
   }

@@ -11,14 +11,52 @@ pub use engine::{
     LoraAdapter, RerankResult,
 };
 pub use error::{InferError, Result};
-pub use fit::FitReport;
+pub use fit::{FitReport, ModelFootprint};
 pub use hwprofile::{GpuInfo, HardwareProfile};
 pub use sampler::{SamplerParams, MAX_DRAFT, MAX_NGRAM, MAX_TOKENS};
 pub use types::{ChatMsg, GenStats};
 
+/// What kind of model a checkpoint is, as the string the API reports.
+///
+/// Read from the GGUF header, so it costs a metadata pass rather than a load —
+/// which is what makes it usable *before* a model is loaded, to decide how it
+/// should be treated. A file that cannot be read classifies as a generation
+/// model: that is the class a chat route wants, so a wrong guess here costs a
+/// routing decision rather than data.
+pub fn model_class_of(path: &std::path::Path) -> &'static str {
+    gguf_probe::probe(path)
+        .map(|probed| probed.classify().as_str())
+        .unwrap_or("llm")
+}
+
+/// The micro-batch an encoder context is built with.
+///
+/// An encoder decodes a whole sequence in one batch, so the micro-batch has to
+/// be able to hold it: llama.cpp asserts rather than splitting, and a failing
+/// assertion takes the process with it. `n_ubatch` therefore never sits below
+/// `n_ctx` here, and is never raised above a value the caller already chose.
+pub fn encoder_ubatch(n_ubatch: u32, n_ctx: u32) -> u32 {
+    n_ubatch.max(n_ctx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An encoder is fed whole sequences, and llama.cpp asserts
+    /// `n_ubatch >= n_tokens` instead of splitting one. The generation default
+    /// of 512 is smaller than a 512-token context, so an encoder loaded with
+    /// those defaults died on the first embed with a ggml assertion — the
+    /// process went with it, and the caller saw the service vanish.
+    #[test]
+    fn an_encoder_micro_batch_never_undercuts_its_context() {
+        assert_eq!(encoder_ubatch(512, 512), 512);
+        assert_eq!(encoder_ubatch(512, 2048), 2048);
+        // A micro-batch already larger than the context is left alone: raising
+        // anything would cost memory for no gain.
+        assert_eq!(encoder_ubatch(1024, 512), 1024);
+        assert_eq!(encoder_ubatch(0, 0), 0);
+    }
 
     #[test]
     fn draft_is_clamped_by_context_and_batch() {

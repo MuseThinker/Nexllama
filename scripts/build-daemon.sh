@@ -88,10 +88,21 @@ esac
 
 for name in "${LIBS[@]}"; do
     lib="$OUT/${LIB_PREFIX}${name}${LIB_SUFFIX}"
-    if [ -f "$lib" ]; then
-        cp "$lib" "$DST/"
-    else
+    if [ ! -f "$lib" ]; then
         echo "warning: missing runtime library: $(basename "$lib")" >&2
+        continue
+    fi
+    if [ "$OS" = Linux ]; then
+        # The build tree holds the same file under three names - `libllama.so`,
+        # `libllama.so.0`, `libllama.so.0.4.0` - and the loader asks for the
+        # *SONAME*, which is the middle one. Copying only the linker name (what
+        # this script used to do) leaves `libllama.so.0 => not found` on any
+        # machine without llama.cpp installed. Ship the name that is requested.
+        soname="$(readelf -d "$lib" 2>/dev/null | sed -n 's/.*(SONAME).*\[\(.*\)\].*/\1/p')"
+        [ -n "$soname" ] || soname="$(basename "$lib")"
+        cp -f "$lib" "$DST/$soname"
+    else
+        cp -f "$lib" "$DST/"
     fi
 done
 
@@ -104,6 +115,35 @@ if [ "$OS" = Darwin ]; then
     # Without this the loader searches the paths the libraries were built with,
     # which exist only on the machine that built them.
     install_name_tool -add_rpath @loader_path "$DST/infer-daemon" 2>/dev/null || true
+fi
+
+if [ "$OS" = Linux ]; then
+    # The same problem, in ELF form. The daemon and every llama.cpp library were
+    # linked against absolute paths into the build directory, and the libraries
+    # also refer to *each other*, so patching only the binary would leave
+    # `libllama.so` unable to find `libggml.so`. `$ORIGIN` closes the chain:
+    # every object resolves its neighbours in the same directory.
+    if ! command -v patchelf >/dev/null 2>&1; then
+        echo "build-daemon.sh: patchelf is required on Linux (apt install patchelf)" >&2
+        exit 1
+    fi
+    for f in "$DST/infer-daemon" "$DST"/lib*.so*; do
+        [ -f "$f" ] || continue
+        patchelf --set-rpath '$ORIGIN' "$f"
+    done
+    chmod +x "$DST/infer-daemon"
+
+    # Every staged library has to resolve to a file beside the binary. `not
+    # found` means a name or the RPATH is wrong; a path outside $DST means the
+    # build machine's own copy is standing in - an ABI this build never linked
+    # against, which is where the crashes on other machines come from.
+    bad="$(ldd "$DST/infer-daemon" 2>/dev/null \
+        | grep -E 'lib(llama|ggml|mtmd)' | grep -vF "$DST/" || true)"
+    if [ -n "$bad" ]; then
+        echo "build-daemon.sh: staged libraries do not resolve to $DST:" >&2
+        printf '%s\n' "$bad" >&2
+        exit 1
+    fi
 fi
 
 echo "backend ready: $DST"

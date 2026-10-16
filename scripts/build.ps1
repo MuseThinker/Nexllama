@@ -33,8 +33,9 @@ foreach ($d in @($llvm, $cmake, $ninja, $cargoBin)) {
     }
 }
 $env:LIBCLANG_PATH = $llvm
-$env:CFLAGS = "/utf-8"
-$env:CXXFLAGS = "/utf-8"
+$env:CFLAGS = "/utf-8 /O2"
+$env:CXXFLAGS = "/utf-8 /O2"
+$env:CL = "/utf-8 /O2"
 $env:VSLANG = "1033"
 
 if (-not $CargoArgs -or $CargoArgs.Count -eq 0) { $CargoArgs = @("build") }

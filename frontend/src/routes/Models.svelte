@@ -2,7 +2,8 @@
 import { onMount } from 'svelte';
 import { daemon } from '../lib/api.js';
 import { t } from '../lib/i18n.js';
-import { invoke, listen, hasTauri, pickFolder } from '../lib/tauri.js';
+import { invoke, listen, hasTauri, pickFolder, openExternal } from '../lib/tauri.js';
+import { CLOUD_CATALOG, catalogById } from '../lib/cloudCatalog.js';
 import {
   startDaemon as daemonStart,
   stopDaemon as daemonStop,
@@ -14,7 +15,10 @@ import {
 // the daemon picks them up from when it is spawned.
 const advDefaults = {
   nGpuLayers: 999,
-  nCtx: 4096,
+  // 0 = auto: the daemon sizes the context to the machine (llama.cpp's own fit)
+  // and caps it at the model's training length, so it is not too small to hold a
+  // prompt nor large enough to exhaust VRAM.
+  nCtx: 0,
   nBatch: 2048,
   nUbatch: 512,
   mainGpu: 0,
@@ -26,7 +30,17 @@ const advDefaults = {
   offloadKqv: true,
   ropeFreqBase: 0,
   ropeFreqScale: 0,
-  prefixCache: false,
+  // Reuse the KV of a shared prefix across turns. On by default (verified by
+  // prefix_check); ignored while a drafter is loaded.
+  prefixCache: true,
+  // Let a reasoning model think before answering. On by default; off makes the
+  // reply start on the answer. A per-model setting, applied to every chat with
+  // this model unless a request names its own.
+  thinking: true,
+  // MTP draft tokens per round (llama.cpp's --spec-draft-n-max). 0 leaves the
+  // engine default (2). Higher drafts further ahead at a lower acceptance rate;
+  // worth raising for models where the head is accurate.
+  draftNMax: 0,
 };
 const LOAD_KEY = 'nexllama.load';
 
@@ -42,11 +56,19 @@ let loadingPath = $state('');
 // someone made for this exact model — and falls back to the head.
 let drafter = $state({});
 
+// Whether to load the bundled MTP head. The engine takes exactly one drafter,
+// so choosing the side-mounted file means *not* loading the head — returning
+// `true` here for the "draft" choice is what made a DFlash selection load MTP.
 function wantMtp(b) {
   const choice = drafter[b.name] ?? 'auto';
   if (choice === 'mtp') return b.mtp === true;
-  if (choice === 'draft') return b.draft != null;
-  return !b.draft && b.mtp === true;
+  if (choice === 'draft') return false;
+  if (choice === 'none') return false;
+  // Auto: prefer the bundled head when the side file is another MTP head — the
+  // bundled one shares the target's own weights instead of re-reading a copy.
+  // A side DFlash/EAGLE checkpoint is the better drafter, so it wins there.
+  if (b.mtp && (b.draft == null || b.draft_kind === 'MTP')) return true;
+  return false;
 }
 
 const draftLabel = (b) => b.draft_kind ?? 'draft';
@@ -92,6 +114,12 @@ let daemonBusy = $state(false);
 // clearly not for talking to.
 const classRank = (b) => ({ vision: 1, llm: 2, speculative: 3, embedding: 4, rerank: 5 }[b.kind] ?? 3);
 const orderedModels = $derived([...localModels].sort((a, b) => classRank(a) - classRank(b)));
+
+// Everything the service knows about, resident or not. A model that was
+// released to make room for another of its kind is still listed here: it is one
+// step away from running again, and hiding it would make the list claim fewer
+// models than the user loaded.
+const loadedModels = $derived((status.models ?? []).filter((m) => !m.cloud));
 let modelsDir = $state('');
 
 let hydrated = false;
@@ -181,6 +209,9 @@ async function selectFolder() {
 // browser text for it says nothing about what to do. Everything else is worth
 // showing verbatim, because the daemon writes real sentences into it.
 function describeError(e) {
+  // Our own timeout, from `api.js`: whichever call it was, the sentence says how
+  // long it waited and that the wait is what failed.
+  if (e?.timedOut) return $t('models.requestTimeout', { secs: e.timeoutSecs });
   if (e instanceof TypeError && String(e).includes('fetch')) return $t('models.daemonDown');
   return String(e);
 }
@@ -190,7 +221,11 @@ async function refresh() {
     status = await daemon.status();
     error = '';
   } catch (e) {
-    error = describeError(e);
+    // A poll that fails while a model is loading is a poll that timed out, not
+    // a service that is down: the load itself has the port, and the panel would
+    // otherwise report "not connected" over the top of a load that is about to
+    // succeed. Only a quiet poll is worth telling the user about.
+    if (!busy) error = describeError(e);
   }
 }
 
@@ -264,7 +299,22 @@ async function restartDaemon() {
 }
 
 async function loadLocal() {
-  if (!hasTauri) return;
+  // In a browser there is no folder picker and no local disk to read: the
+  // library is whatever the daemon was pointed at with `--models-dir`, read with
+  // the same `model-index` rules the app's own command uses. One code path for
+  // "what is installed" is the point — two would drift.
+  if (!hasTauri) {
+    try {
+      const listing = await daemon.localModels();
+      localModels = listing?.models ?? [];
+      modelsDir = listing?.dir ?? null;
+      error = '';
+    } catch (e) {
+      localModels = [];
+      error = describeError(e);
+    }
+    return;
+  }
   try {
     localModels = await invoke('list_local_models');
   } catch (e) {
@@ -291,6 +341,7 @@ function loadBody(path) {
     rope_freq_base: Number(adv.ropeFreqBase),
     rope_freq_scale: Number(adv.ropeFreqScale),
     prefix_cache: adv.prefixCache === true,
+    thinking: adv.thinking !== false,
   };
 }
 
@@ -336,16 +387,28 @@ async function loadBundle(b) {
     await ensureDaemon();
     const body = loadBody(b.main);
     if (b.projector) body.mmproj = b.projector;
-    if (wantMtp(b)) {
+    if ((drafter[b.name] ?? 'auto') === 'none') {
+      // Load the model alone: no head, no side file.
+      body.load_mtp = false;
+    } else if (wantMtp(b)) {
       body.load_mtp = true;
     } else {
       body.load_mtp = false;
       if (b.draft) body.draft_model = b.draft;
     }
+    // Draft length, on whichever drafter this load uses: the bundled head reads
+    // `mtp_n_max`, a side checkpoint reads `draft_n_max`. Sending `mtp_n_max` for
+    // a side checkpoint would turn the bundled head on as well.
+    const draftN = Number(adv.draftNMax);
+    if (draftN > 0) {
+      if (body.load_mtp) body.mtp_n_max = draftN;
+      else if (body.draft_model) body.draft_n_max = draftN;
+    }
     if (b.loras?.length) body.lora = b.loras;
     const res = await daemon.load(body);
     if (res?.notes?.length) notice = res.notes.join('; ');
     await refresh();
+    await persistAutoLoad();
   } catch (e) {
     error = describeError(e);
   } finally {
@@ -354,13 +417,34 @@ async function loadBundle(b) {
   }
 }
 
+/// Remember the local models that are loaded, so a restart (or an update) brings
+/// the same ones back up. Clearing the last one clears the list.
+async function persistAutoLoad() {
+  if (!hasTauri) return;
+  try {
+    const s = await invoke('get_settings');
+    const loaded = (status.models ?? [])
+      .filter((m) => !m.cloud && m.loaded !== false && m.path)
+      .map((m) => m.path);
+    // Never erase the list because nothing happens to be resident: a poll taken
+    // during a restart, or a model that has been released to make room, would
+    // otherwise leave the next launch with nothing to load.
+    if (loaded.length === 0) return;
+    s.autoLoad = loaded;
+    await invoke('set_settings', { settings: s });
+  } catch {
+    /* remembering is best-effort; a failure must not disturb the load */
+  }
+}
+
 async function unload(id) {
   busy = id;
   try {
     await daemon.unload(id);
     await refresh();
+    await persistAutoLoad();
   } catch (e) {
-    error = String(e);
+    error = describeError(e);
   } finally {
     busy = '';
   }
@@ -371,8 +455,9 @@ async function unloadAll() {
   try {
     await daemon.unload();
     await refresh();
+    await persistAutoLoad();
   } catch (e) {
-    error = String(e);
+    error = describeError(e);
   } finally {
     busy = '';
   }
@@ -389,6 +474,7 @@ async function search() {
   results = [];
   files = [];
   activeRepo = '';
+  resultsOpen = true;
   try {
     results = await invoke('hub_search', {
       query: query.trim(),
@@ -483,6 +569,7 @@ onMount(() => {
   refresh();
   loadLocal();
   loadAdv();
+  loadCloud();
   refreshModelsDir();
   refreshDaemon();
   // The list of authors lives next to the search that uses it, so adding one
@@ -497,6 +584,185 @@ onMount(() => {
     un2?.();
   };
 });
+
+// ── 云端模型 ─────────────────────────────────────────────────────────────
+// Providers are non-secret config (id/name/baseUrl/models) kept in settings; the
+// key/token for each lives in the OS credential store via the app, never here.
+let view = $state('local');
+let autoEnabled = $state(false);
+let autoPrefer = $state('local');
+let cloud = $state([]);
+let cloudKeys = $state([]);
+let cloudPicks = $state('');
+let cloudBusy = $state('');
+let cloudNotice = $state('');
+let cloudError = $state('');
+
+async function loadCloud() {
+  if (!hasTauri) return;
+  try {
+    const s = await invoke('get_settings');
+    autoEnabled = s?.synergyEnabled === true;
+    autoPrefer = s?.synergyPrefer === 'cloud' ? 'cloud' : 'local';
+    cloud = (Array.isArray(s?.cloudProviders) ? s.cloudProviders : []).map((p) => ({
+      ...p,
+      _key: '',
+      _available: [],
+      _pick: (p.models ?? [])[0] ?? '',
+      _saved: false,
+    }));
+    const ids = cloud.map((p) => p.id);
+    cloudKeys = ids.length ? await invoke('cloud_key_present', { ids }) : [];
+  } catch (e) {
+    cloudError = String(e);
+  }
+}
+
+function addProvider() {
+  const c = catalogById(cloudPicks);
+  if (!c || cloud.some((p) => p.id === c.id)) return;
+  cloud = [
+    ...cloud,
+    {
+      id: c.id,
+      name: c.name,
+      baseUrl: c.baseUrl,
+      console: c.console,
+      auth: c.auth,
+      models: [],
+      enabled: true,
+      _key: '',
+      _available: [],
+      _pick: '',
+      _saved: false,
+    },
+  ];
+  cloudPicks = '';
+}
+
+function removeProvider(id) {
+  if (cloudKeys.includes(id)) invoke('cloud_key_clear', { id }).catch(() => {});
+  cloudKeys = cloudKeys.filter((x) => x !== id);
+  cloud = cloud.filter((p) => p.id !== id);
+  saveCloud(true);
+}
+
+const hasKey = (id) => cloudKeys.includes(id);
+
+/// Turn `auto` routing on/off.
+async function setAutoEnabled(on) {
+  autoEnabled = !!on;
+  cloudError = '';
+  try {
+    await invoke('set_routing', { enabled: autoEnabled });
+  } catch (e) {
+    cloudError = String(e);
+  }
+}
+
+/// Persist and push the `auto` alias policy (local-first or cloud-first).
+async function setAutoPrefer(next) {
+  autoPrefer = next === 'cloud' ? 'cloud' : 'local';
+  cloudError = '';
+  try {
+    await invoke('set_routing', { prefer: autoPrefer });
+  } catch (e) {
+    cloudError = String(e);
+  }
+}
+
+/// Candidate models for the picker: what the provider listed plus whatever is
+/// already enabled, so a saved choice still shows after a reload.
+function candidates(p) {
+  return [...new Set([...(p._available ?? []), ...(p.models ?? [])])];
+}
+
+/// Store a provider's key the moment the field is left, so it persists even if
+/// the user never presses save. Only ids cross back, never the value.
+async function persistKey(p) {
+  if (!p._key) return;
+  try {
+    await invoke('cloud_key_set', { id: p.id, key: p._key });
+    if (!cloudKeys.includes(p.id)) cloudKeys = [...cloudKeys, p.id];
+  } catch (e) {
+    cloudError = String(e);
+  }
+}
+
+async function fetchModels(p) {
+  cloudBusy = p.id;
+  cloudError = '';
+  cloudNotice = '';
+  try {
+    const r = await invoke('cloud_fetch_models', {
+      probe: { baseUrl: p.baseUrl, key: p._key || '' },
+    });
+    const list = Array.isArray(r?.models) ? r.models : [];
+    p._available = list;
+    if (!p._pick || !list.includes(p._pick)) p._pick = list[0] ?? p._pick;
+    cloudNotice = $t('cloud.fetched', { n: list.length });
+  } catch (e) {
+    cloudError = String(e);
+  } finally {
+    cloudBusy = '';
+  }
+}
+
+/// Confirm this provider: use the chosen model, then save and push. The key
+/// travels with the push, so it is stored and forwarded in one step.
+async function confirmProvider(p) {
+  cloudBusy = p.id;
+  cloudError = '';
+  cloudNotice = '';
+  try {
+    if (p._pick) p.models = [p._pick];
+    p._saved = true;
+    await saveCloud(true);
+    if (!cloudError) cloudNotice = $t('cloud.confirmed', { name: p.name });
+  } catch (e) {
+    p._saved = false;
+    cloudError = String(e);
+  } finally {
+    cloudBusy = '';
+  }
+}
+
+async function saveCloud(silent) {
+  if (!hasTauri) {
+    if (!silent) cloudNotice = $t('cloud.saved');
+    return;
+  }
+  try {
+    const s = await invoke('get_settings');
+    // Drop the transient input fields; only real config is persisted.
+    const clean = cloud.map(({ _key, _available, _pick, ...p }) => p);
+    s.cloudProviders = clean;
+    await invoke('set_settings', { settings: s });
+    // The keys ride along here: the app stores them and forwards them to the
+    // daemon, so a key only just typed is in effect immediately.
+    const pushed = await invoke('cloud_push_providers', {
+      providers: cloud.map((p) => ({
+        id: p.id,
+        name: p.name,
+        baseUrl: p.baseUrl,
+        models: p.models ?? [],
+        key: p._key || '',
+      })),
+    });
+    const keyed = cloud.filter((p) => p._key).map((p) => p.id);
+    if (keyed.length) cloudKeys = [...new Set([...cloudKeys, ...keyed])];
+    cloud = clean.map((p) => ({ ...p, _key: '', _available: [], _pick: (p.models ?? [])[0] ?? '' }));
+    if (!silent) cloudNotice = $t('cloud.saved');
+    // Saved, but nothing reached the daemon with a key: name it and drop the
+    // "saved" tick so the button does not claim success that did not happen.
+    if ((pushed?.count ?? 0) > 0 && (pushed?.withKey ?? 0) === 0) {
+      cloudError = $t('cloud.noKey');
+      cloud = cloud.map((p) => ({ ...p, _saved: false }));
+    }
+  } catch (e) {
+    cloudError = String(e);
+  }
+}
 </script>
 
 <div class="page models">
@@ -504,7 +770,7 @@ onMount(() => {
     <h2>{$t('models.title')}</h2>
     <div class="row">
       <button class="ghost" onclick={refreshAll}>{$t('models.refresh')}</button>
-      {#if status.models.length > 0}
+      {#if loadedModels.length > 0}
         <button class="ghost" onclick={unloadAll} disabled={busy !== ''}>{$t('models.unload')}</button>
       {/if}
     </div>
@@ -553,9 +819,62 @@ onMount(() => {
         <dd>{daemonInfo.port}</dd>
       </div>
     </dl>
+    {#if daemonInfo.gpu_backend && daemonInfo.backend !== daemonInfo.gpu_backend}
+      <p class="muted">{$t('models.gpuNotUsed', { gpu: daemonInfo.gpu_backend })}</p>
+    {/if}
+    <h4 class="section-sub">{$t('models.available')}</h4>
+    {#if (status.models ?? []).length === 0}
+      <p class="muted">{$t('models.none')}</p>
+    {:else}
+      <ul class="model-list">
+        {#each status.models as m (m.id)}
+          <li>
+            <span class="tag" class:cloud={m.cloud}>
+              {m.cloud ? $t('models.badgeCloud') : $t('models.badgeLocal')}
+            </span>
+            <span class="file-name">{m.id}</span>
+            {#if m.cloud}<span class="muted">{m.provider}</span>{/if}
+            {#if !m.cloud && m.loaded === false}<span class="muted">· {$t('models.released')}</span>{/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+    <div class="synergy">
+      <div class="synergy-head">
+        <span class="synergy-title">
+          {$t('models.synergy')}
+          <span class="info" title={$t('models.autoHint')}>ⓘ</span>
+        </span>
+        <label class="toggle routing" title={$t('models.synergy')}>
+          <input type="checkbox" checked={autoEnabled} onchange={(e) => setAutoEnabled(e.target.checked)} />
+          <span class="track"></span>
+        </label>
+      </div>
+      {#if autoEnabled}
+        <label class="field synergy-policy">
+          <span>
+            {$t('models.autoPolicy')}
+            <span
+              class="info"
+              title={autoPrefer === 'cloud' ? $t('models.autoCloudHint') : $t('models.autoLocalHint')}>ⓘ</span
+            >
+          </span>
+          <select value={autoPrefer} onchange={(e) => setAutoPrefer(e.target.value)}>
+            <option value="local">{$t('models.autoLocalFirst')}</option>
+            <option value="cloud">{$t('models.autoCloudFirst')}</option>
+          </select>
+        </label>
+      {/if}
+    </div>
     {#if !hasTauri}<p class="muted">{$t('settings.tDesktop')}</p>{/if}
   </section>
 
+  <div class="seg">
+    <button class:active={view === 'local'} onclick={() => (view = 'local')}>{$t('models.localTab')}</button>
+    <button class:active={view === 'cloud'} onclick={() => (view = 'cloud')}>{$t('models.cloudTab')}</button>
+  </div>
+
+  {#if view === 'local'}
   <!-- 模型位置 -->
   <section class="card">
     <h3>{$t('models.dir')}</h3>
@@ -596,15 +915,13 @@ onMount(() => {
       <p class="muted">{$t('models.tDesktop')}</p>
     {/if}
 
-    {#if results.length > 0}
+    {#if results.length > 0 && resultsOpen}
       <div class="results-head">
         <span class="muted">{$t('models.results', { n: results.length })}</span>
-        <button class="ghost" onclick={() => (resultsOpen = !resultsOpen)}>
-          {$t(resultsOpen ? 'models.collapse' : 'models.expand')}
+        <button class="ghost" onclick={() => (resultsOpen = false)}>
+          {$t('models.collapse')}
         </button>
       </div>
-    {/if}
-    {#if results.length > 0 && resultsOpen}
       <ul class="repo-list">
         {#each results as r}
           <li>
@@ -615,20 +932,19 @@ onMount(() => {
           </li>
         {/each}
       </ul>
-    {/if}
-
-    {#if files.length > 0}
-      <ul class="file-list">
-        {#each files as f}
-          <li>
-            <span class="file-name">{f.filename}</span>
-            <span class="file-size">{fmt(f.size)}</span>
-            <button onclick={() => download(f)} disabled={downloading !== ''}>
-              {downloading === f.filename ? $t('models.downloading') : $t('models.downloadBtn')}
-            </button>
-          </li>
-        {/each}
-      </ul>
+      {#if files.length > 0}
+        <ul class="file-list">
+          {#each files as f}
+            <li>
+              <span class="file-name">{f.filename}</span>
+              <span class="file-size">{fmt(f.size)}</span>
+              <button onclick={() => download(f)} disabled={downloading !== ''}>
+                {downloading === f.filename ? $t('models.downloading') : $t('models.downloadBtn')}
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
     {/if}
 
     {#if downloading}
@@ -672,8 +988,13 @@ onMount(() => {
                   onchange={(e) => (drafter[b.name] = e.target.value)}
                 >
                   <option value="auto">{$t('models.drafterAuto')}</option>
-                  {#if b.mtp}<option value="mtp">MTP</option>{/if}
-                  {#if b.draft}<option value="draft">{draftLabel(b)}</option>{/if}
+                  <option value="none">{$t('models.drafterNone')}</option>
+                  {#if b.mtp}<option value="mtp">{$t('models.drafterMtpHead')}</option>{/if}
+                  {#if b.draft}
+                    <option value="draft">
+                      {draftLabel(b)}{#if b.mtp} · {$t('models.drafterFile')}{/if}
+                    </option>
+                  {/if}
                 </select>
               </label>
             {/if}
@@ -757,6 +1078,17 @@ onMount(() => {
           <span>{$t('settings.ropeFreqScale')}</span>
           <input type="number" min="0" step="0.1" bind:value={adv.ropeFreqScale} />
         </label>
+        <label class="field">
+          <span>{$t('models.thinking')}</span>
+          <select bind:value={adv.thinking}>
+            <option value={true}>{$t('models.thinkingOn')}</option>
+            <option value={false}>{$t('models.thinkingOff')}</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>{$t('models.draftNMax')}</span>
+          <input type="number" min="0" max="16" bind:value={adv.draftNMax} />
+        </label>
       </div>
       <div class="grid checks">
         <label class="checkline">
@@ -777,12 +1109,12 @@ onMount(() => {
 
   <!-- 已加载（运行中） -->
   <section class="card">
-    <h3>{$t('models.loaded')} ({status.models.length})</h3>
-    {#if status.models.length === 0}
+    <h3>{$t('models.loaded')} ({loadedModels.length})</h3>
+    {#if loadedModels.length === 0}
       <p class="muted">{$t('models.none')}</p>
     {:else}
       <ul class="file-list">
-        {#each status.models as m}
+        {#each loadedModels as m}
           <li>
             <span class="file-name">
               {m.id}
@@ -805,6 +1137,73 @@ onMount(() => {
       </ul>
     {/if}
   </section>
+
+  {:else}
+  <!-- 云端模型：厂商配置 + 密钥 + 模型选择 -->
+  <section class="card">
+    <h3>{$t('models.cloud')}</h3>
+    <p class="muted">{$t('models.cloudHint')}</p>
+    <div class="row">
+      <select bind:value={cloudPicks}>
+        <option value="">{$t('models.cloudAdd')}</option>
+        {#each CLOUD_CATALOG as c}
+          <option value={c.id} disabled={cloud.some((p) => p.id === c.id)}>{c.name}</option>
+        {/each}
+      </select>
+      <button onclick={addProvider} disabled={!cloudPicks}>{$t('models.cloudAddBtn')}</button>
+    </div>
+  </section>
+
+  {#each cloud as p (p.id)}
+    <section class="card">
+      <div class="row space">
+        <h3>{p.name}</h3>
+        <button class="ghost" onclick={() => removeProvider(p.id)}>{$t('models.remove')}</button>
+      </div>
+      <div class="cloud-form">
+        <label>{$t('models.cloudBaseUrl')}</label>
+        <input bind:value={p.baseUrl} oninput={() => (p._saved = false)} />
+        <button class="ghost" onclick={() => openExternal(p.console)}>{$t('models.getKey')} ↗</button>
+
+        <label>
+          {$t('models.cloudKey')}
+          <span class="key-status" class:set={hasKey(p.id)}>
+            {hasKey(p.id) ? $t('models.keySet') : $t('models.keyUnset')}
+          </span>
+        </label>
+        <input
+          type="password"
+          bind:value={p._key}
+          placeholder={hasKey(p.id) ? '••••••••' : ''}
+          oninput={() => (p._saved = false)}
+          onchange={() => persistKey(p)}
+        />
+        <button class="ghost" onclick={() => fetchModels(p)} disabled={cloudBusy === p.id}>
+          {$t('models.fetchModels')}
+        </button>
+
+        <label>{$t('models.modelList')}</label>
+        <select bind:value={p._pick} onchange={() => (p._saved = false)}>
+          <option value="">{$t('models.modelPick')}</option>
+          {#each candidates(p) as m}
+            <option value={m}>{m}</option>
+          {/each}
+        </select>
+        <button
+          class="ghost"
+          title={$t('models.confirm')}
+          onclick={() => confirmProvider(p)}
+          disabled={cloudBusy === p.id}
+        >
+          {p._saved ? $t('models.saved') : $t('models.confirm')}
+        </button>
+      </div>
+    </section>
+  {/each}
+
+  {#if cloudNotice}<div class="notice">{cloudNotice}</div>{/if}
+  {#if cloudError}<div class="error">{cloudError}</div>{/if}
+  {/if}
 
   {#if notice}<div class="notice">{notice}</div>{/if}
   {#if error}<div class="error">{error}</div>{/if}

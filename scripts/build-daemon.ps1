@@ -2,7 +2,13 @@ param(
     [ValidateSet("cpu", "vulkan", "cuda")]
     [string]$Backend = "vulkan",
     [switch]$Release,
-    [switch]$Native
+    [switch]$Native,
+    # Leave out the NVIDIA runtime (`cudart64_*`, `cublas64_*`, `cublasLt64_*`),
+    # which is 477 MB of the CUDA backend's 643 MB — nearly all of it
+    # `cublasLt64_*.dll`. The lite installer ships this way and needs the target
+    # machine to already have the CUDA runtime; the full installer bundles it so
+    # a machine with only the display driver works.
+    [switch]$NoCudaRuntime
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,6 +56,43 @@ foreach ($name in $runtimeDlls) {
     } else {
         Write-Warning "missing runtime library: $name (backend $Backend)"
     }
+}
+
+# The CUDA runtime is not part of the display driver — it ships with the CUDA
+# Toolkit. A machine with only the NVIDIA driver installed has no `cudart64_*` or
+# `cublas*`, so a cuda backend that leans on them dies at load. Bundle the three
+# the backend links against so it is self-contained on any NVIDIA machine.
+#
+# `-NoCudaRuntime` leaves them out for the lite installer, which expects the
+# target machine to provide them; it is 477 MB smaller and fails to load the
+# cuda backend where they are missing.
+if ($Backend -eq "cuda" -and -not $NoCudaRuntime) {
+    $cudaBins = @()
+    if ($env:CUDA_PATH) { $cudaBins += (Join-Path $env:CUDA_PATH "bin") }
+    Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending |
+        ForEach-Object { $cudaBins += (Join-Path $_.FullName "bin") }
+
+    foreach ($pattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
+        $found = $null
+        foreach ($bin in $cudaBins) {
+            foreach ($sub in @("", "x64")) {
+                $dir = Join-Path $bin $sub
+                if (-not (Test-Path -LiteralPath $dir)) { continue }
+                $found = Get-ChildItem $dir -Filter $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($found) { break }
+            }
+            if ($found) { break }
+        }
+        if ($found) {
+            Copy-Item -LiteralPath $found.FullName -Destination (Join-Path $dstDir $found.Name) -Force
+            Write-Host "cuda runtime: $($found.Name)"
+        } else {
+            Write-Warning "CUDA runtime '$pattern' not found; installing the cuda backend will need the CUDA Toolkit on this build machine"
+        }
+    }
+} elseif ($Backend -eq "cuda") {
+    Write-Host "cuda runtime not bundled: the target machine must already provide cudart64_*, cublas64_* and cublasLt64_*"
 }
 
 foreach ($crt in @("MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll")) {

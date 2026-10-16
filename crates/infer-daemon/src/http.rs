@@ -21,7 +21,8 @@ use infer_core::{
     LoraAdapter, SamplerParams,
 };
 
-use crate::state::{record_stats, AppState, DaemonState, InFlight, Loaded, RuntimeStats};
+use crate::cloud;
+use crate::state::{record_stats, AppState, DaemonState, Dormant, InFlight, Loaded, RuntimeStats};
 
 /// Shared secret required on every request when set.
 pub type ApiKey = Option<Arc<String>>;
@@ -53,7 +54,12 @@ mod limits {
     pub const BODY_BYTES: usize = 64 * 1024 * 1024;
 }
 
-pub fn router(state: AppState, api_key: ApiKey, cors_origins: Vec<String>) -> Router {
+pub fn router(
+    state: AppState,
+    api_key: ApiKey,
+    cors_origins: Vec<String>,
+    ui_dir: Option<std::path::PathBuf>,
+) -> Router {
     let protected = Router::new()
         // OpenAI-compatible surface.
         .route("/v1", get(list_models))
@@ -76,20 +82,64 @@ pub fn router(state: AppState, api_key: ApiKey, cors_origins: Vec<String>) -> Ro
         .route("/admin/load", post(load))
         .route("/admin/unload", post(unload))
         .route("/admin/fit", post(fit_check))
+        // The models folder, read with the same rules the desktop library uses
+        // (`model-index`), so a browser opened against this daemon shows the
+        // library the app would show. Only when `--models-dir` named one.
+        .route("/admin/models", get(list_models_folder))
+        // Cloud providers: pushed by the desktop app over loopback. The key is
+        // write-only — `GET` lists the providers but never their keys.
+        .route("/admin/providers", get(list_providers).post(set_providers))
+        .route("/admin/providers/test", post(test_provider))
+        // The `auto` alias's preference: local-first (default) or cloud-first.
+        .route("/admin/routing", get(get_routing).post(set_routing))
         .route_layer(middleware::from_fn_with_state(api_key, require_key));
 
-    Router::new()
-        // Open like Ollama's banner: says what this is and where to go, and
-        // deliberately no model names, so exposing the port does not leak them.
-        .route("/", get(root))
+    let api = Router::new()
         .route("/openapi.json", get(openapi))
         .route("/docs", get(docs))
         .route("/api/version", get(ollama_version))
         .route("/health", get(health))
-        .merge(protected)
-        .layer(cors_layer(&cors_origins))
+        .merge(protected);
+
+    // With a UI to serve, `/` is the app rather than the banner: the banner is
+    // where you go when there is no UI, and an API-only daemon on a port with
+    // nothing else on it should still say what it is. The API is merged on top
+    // either way, so the UI and the engine are one port.
+    let app = match ui_dir {
+        Some(dir) => crate::ui::router(dir).merge(api),
+        None => api.route("/", get(root)),
+    };
+
+    app.layer(cors_layer(&cors_origins))
         .layer(RequestBodyLimitLayer::new(limits::BODY_BYTES))
         .with_state(state)
+}
+
+/// The models folder behind `GET /admin/models`.
+///
+/// Answers `{"dir": null, "models": []}` when no folder was configured rather
+/// than a 404: the caller is a UI asking "what is there?", and "there is no
+/// folder configured" is a fact about this daemon, not a missing endpoint. A
+/// folder that cannot be read is an error with the reason — that is a volume
+/// that went missing, and saying so beats an empty list that looks like an empty
+/// library.
+async fn list_models_folder(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(dir) = state.models_dir.as_deref().cloned() else {
+        return Ok(Json(json!({ "dir": null, "models": [] })));
+    };
+    // Reading GGUF headers is file IO, and a library on a slow disk can hold a
+    // worker for a while. Off the async runtime so a scan cannot delay the
+    // chat completions running next to it.
+    let models = tokio::task::spawn_blocking(move || model_index::scan(&dir))
+        .await
+        .map_err(|e| ApiError::Worker(format!("listing models failed: {e}")))?
+        .map_err(ApiError::Worker)?;
+    Ok(Json(json!({
+        "dir": state.models_dir.as_deref().map(|d| d.to_string_lossy().to_string()),
+        "models": models,
+    })))
 }
 
 /// Which browser origins may call this server.
@@ -256,6 +306,9 @@ pub enum ApiError {
     BadRequest(String),
     Model(String),
     Worker(String),
+    /// A cloud provider returned an error (or could not be reached). Carries the
+    /// provider's own status so the client sees, say, a 401 as a 401.
+    Upstream(StatusCode, String),
 }
 
 impl ApiError {
@@ -264,6 +317,7 @@ impl ApiError {
             ApiError::NotLoaded => StatusCode::CONFLICT,
             ApiError::NotFound(_) | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Model(_) | ApiError::Worker(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::Upstream(code, _) => *code,
         }
     }
 
@@ -273,7 +327,8 @@ impl ApiError {
             ApiError::NotFound(m)
             | ApiError::BadRequest(m)
             | ApiError::Model(m)
-            | ApiError::Worker(m) => m.clone(),
+            | ApiError::Worker(m)
+            | ApiError::Upstream(_, m) => m.clone(),
         }
     }
 }
@@ -339,7 +394,7 @@ async fn health(State(state): State<AppState>) -> Response {
 
 async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let guard = state.inner.lock().await;
-    let models: Vec<serde_json::Value> = guard
+    let mut models: Vec<serde_json::Value> = guard
         .models
         .values()
         .map(|l| {
@@ -368,9 +423,49 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
                 "loaded_secs_ago": l.loaded_at.elapsed().as_secs(),
                 "idle_secs": l.last_used.elapsed().as_secs(),
                 "perf": perf,
+                "loaded": true,
             })
         })
         .collect();
+    // Models freed while idle are still names a client can ask for — the first
+    // request reloads them — so they are listed too, marked as not loaded.
+    models.extend(guard.dormant.values().map(|d| {
+        json!({
+            "id": d.id,
+            "path": d.path,
+            "info": d.info,
+            "n_gpu_layers": d.n_gpu_layers,
+            "n_ctx": d.n_ctx,
+            "load_mtp": d.load_mtp,
+            "mmproj": d.mmproj,
+            "draft_model": d.draft_model,
+            "loras": d.loras,
+            "loaded_secs_ago": 0,
+            "idle_secs": 0,
+            "perf": serde_json::Value::Null,
+            "loaded": false,
+        })
+    }));
+    // Cloud providers are callable through this same port, so list them here
+    // too — with `model_class: llm` so a chat client keeps them, and `cloud`
+    // set so the UI can tell them from the local ones. The `auto` alias is
+    // deliberately *not* here: it is an API-side routing policy, not a model to
+    // pick from the library or the chat dropdown.
+    let providers = state
+        .cloud
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for p in providers.iter() {
+        for m in &p.models {
+            models.push(json!({
+                "id": format!("{}/{}", p.id, m),
+                "info": { "model_class": "llm" },
+                "cloud": true,
+                "provider": p.name,
+                "loaded": true,
+            }));
+        }
+    }
     Json(json!({
         "models": models,
         "default_model": guard.default_model,
@@ -383,7 +478,7 @@ struct FitRequest {
     /// Path to a GGUF already on disk.
     #[serde(default)]
     model: Option<String>,
-    /// Context to measure against; defaults to a conventional 4096.
+    /// Context to measure against; `0` (the default) sizes it automatically.
     #[serde(default)]
     n_ctx: Option<u32>,
     /// Size in bytes of a file that is *not* on disk yet.
@@ -402,7 +497,10 @@ struct FitRequest {
 /// that offloads too much gets the process killed part-way through a load,
 /// which is a worse outcome than loading something that turns out slow. So this
 /// reports, and the caller decides.
-async fn fit_check(Json(req): Json<FitRequest>) -> Result<Json<FitReport>, ApiError> {
+async fn fit_check(
+    State(state): State<AppState>,
+    Json(req): Json<FitRequest>,
+) -> Result<Json<FitReport>, ApiError> {
     // A size needs no file, which is the point: it can be checked before the
     // download that would have brought the file.
     if let Some(bytes) = req.size_bytes {
@@ -420,18 +518,357 @@ async fn fit_check(Json(req): Json<FitRequest>) -> Result<Json<FitReport>, ApiEr
     };
     let path = std::path::PathBuf::from(model);
     let n_ctx = req.n_ctx.unwrap_or(0);
+    // llama.cpp's fitter loads the checkpoint a second time inside this
+    // process, which fails while another model is resident — so an honest
+    // "not measured" beats an attempt that ends in a null result.
+    let resident = { state.inner.lock().await.models.len() };
     // Measuring reads the checkpoint's metadata, which is real file input on a
     // multi-gigabyte file; it must not run on the async runtime.
-    let report = tokio::task::spawn_blocking(move || infer_core::fit::fit(&path, n_ctx))
-        .await
-        .map_err(|e| ApiError::Model(format!("fit task failed: {e}")))?
-        .map_err(|e| ApiError::Model(e.to_string()))?;
+    let report = tokio::task::spawn_blocking(move || {
+        if resident > 0 {
+            infer_core::fit::fit_unmeasured(
+                &path,
+                n_ctx,
+                "not measured: a model is resident, and measuring would load this checkpoint a second time in the same process; unload to measure",
+            )
+        } else {
+            infer_core::fit::fit(&path, n_ctx)
+        }
+    })
+    .await
+    .map_err(|e| ApiError::Model(format!("fit task failed: {e}")))?
+    .map_err(|e| ApiError::Model(e.to_string()))?;
     Ok(Json(report))
+}
+
+/// A residency slot: one model of each kind stays resident, and loading
+/// another of the same kind releases the first.
+///
+/// Chat and vision are separate slots even though both are `llm` class,
+/// because a projector model answers a different kind of request and the two
+/// are routinely wanted at once — an OCR pass feeding a chat turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelSlot {
+    Chat,
+    Vision,
+    Embedding,
+    Rerank,
+}
+
+impl ModelSlot {
+    fn label(self) -> &'static str {
+        match self {
+            ModelSlot::Chat => "the other chat model",
+            ModelSlot::Vision => "the other vision model",
+            ModelSlot::Embedding => "the other embedding model",
+            ModelSlot::Rerank => "the other rerank model",
+        }
+    }
+}
+
+/// The slot a checkpoint occupies, read from its header alone.
+///
+/// `vision` is passed in when the caller already knows — a bundle being loaded
+/// with its projector — because the projector file is what makes it one, and
+/// that pairing is only known at load time.
+fn model_slot_for(path: &std::path::Path, vision: Option<bool>) -> Option<ModelSlot> {
+    let class = infer_core::model_class_of(path);
+    match class {
+        "embedding" => Some(ModelSlot::Embedding),
+        "rerank" => Some(ModelSlot::Rerank),
+        // An unreadable file classifies as a chat model, which is the safe
+        // default: it will simply be asked to serve as one.
+        _ => Some(if vision.unwrap_or(false) {
+            ModelSlot::Vision
+        } else {
+            ModelSlot::Chat
+        }),
+    }
+}
+
+/// The slot of a model that is already loaded.
+fn slot_of(info: &infer_core::EngineInfo) -> ModelSlot {
+    match info.model_class.as_str() {
+        "embedding" => ModelSlot::Embedding,
+        "rerank" => ModelSlot::Rerank,
+        _ if info.vision => ModelSlot::Vision,
+        _ => ModelSlot::Chat,
+    }
+}
+
+/// Release every resident model sharing `slot` but `keep`, and return them.
+async fn park_models_in_slot(state: &AppState, keep: &str, slot: ModelSlot) -> Vec<Loaded> {
+    let mut guard = state.inner.lock().await;
+    let stale: Vec<String> = guard
+        .models
+        .iter()
+        .filter(|(k, m)| k.as_str() != keep && slot_of(&m.info) == slot)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut parked = Vec::new();
+    for other in stale {
+        if let Some(l) = guard.models.remove(&other) {
+            tracing::info!(%other, "released: one model per slot is resident at a time");
+            if guard.default_model.as_deref() == Some(other.as_str()) {
+                // The chat panel should follow the model the caller just asked
+                // for, not keep pointing at the one it replaced.
+                guard.default_model = None;
+            }
+            guard.dormant.insert(other, Dormant::from_loaded(&l));
+            parked.push(l);
+        }
+    }
+    parked
+}
+
+/// Release every resident model except `keep`, parking rather than dropping.
+///
+/// Used when a load has already failed: the device can be full because *another
+/// slot's* model is sitting on it, and a caller switching models should not have
+/// to know which one is in the way. Parking keeps them reloadable, so the worst
+/// case is that they are listed as released rather than resident.
+async fn release_all_except(state: &AppState, keep: &str) -> Vec<Loaded> {
+    let mut guard = state.inner.lock().await;
+    let others: Vec<String> = guard
+        .models
+        .keys()
+        .filter(|k| k.as_str() != keep)
+        .cloned()
+        .collect();
+    let mut freed = Vec::new();
+    for id in others {
+        if let Some(l) = guard.models.remove(&id) {
+            if guard.default_model.as_deref() == Some(id.as_str()) {
+                guard.default_model = None;
+            }
+            guard.dormant.insert(id, Dormant::from_loaded(&l));
+            freed.push(l);
+        }
+    }
+    freed
+}
+
+/// Load on a worker thread, naming the model in the log either way.
+async fn spawn_engine(cfg: LoadConfig, log_id: &str) -> Result<infer_core::Engine, InferError> {
+    let log_id = log_id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        Engine::load(cfg, |ev| tracing::info!(?log_id, ?ev, "load"))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(InferError::Backend(format!("load task failed: {e}"))),
+    }
+}
+
+/// What to tell someone whose load just failed.
+///
+/// llama.cpp reports a failed allocation the same way whatever the cause — the
+/// binding surfaces it as `NullResult` — so the useful information has to be
+/// gathered here: what is already resident, how much device memory is left, and
+/// whether the file is still where it was. A load that fails with the whole
+/// picture in one line can be acted on; the same failure without it can only be
+/// repeated.
+async fn load_failure_context(path: &std::path::Path, state: &AppState) -> String {
+    let resident = {
+        let guard = state.inner.lock().await;
+        guard
+            .models
+            .values()
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>()
+    };
+    let (gpu_free, ram_free) = match infer_core::hwprofile::probe() {
+        Ok(h) => (
+            h.best_gpu().map(|g| g.vram_free_mb).unwrap_or(0),
+            h.ram_free_mb,
+        ),
+        Err(_) => (0, 0),
+    };
+
+    let mut facts = Vec::new();
+    if !resident.is_empty() {
+        facts.push(format!(
+            "{} model(s) resident: {}",
+            resident.len(),
+            resident.join(", ")
+        ));
+    }
+    if gpu_free > 0 {
+        facts.push(format!("{gpu_free} MiB of video memory free"));
+    }
+    if ram_free > 0 {
+        facts.push(format!("{ram_free} MiB of system memory free"));
+    }
+    if !path.exists() {
+        facts.push(format!("{} is no longer at that path", path.display()));
+    }
+    if facts.is_empty() {
+        return String::new();
+    }
+    format!(
+        " — {}. Offload fewer layers, use a smaller quantisation, or unload a model first.",
+        facts.join("; ")
+    )
+}
+
+/// The local generation model to route to, if one is loaded or remembered.
+fn local_llm(guard: &DaemonState) -> Option<String> {
+    guard
+        .models
+        .values()
+        .find(|l| l.info.model_class == "llm")
+        .map(|l| l.id.clone())
+        .or_else(|| {
+            guard
+                .dormant
+                .values()
+                .find(|d| d.info.model_class == "llm")
+                .map(|d| d.id.clone())
+        })
+}
+
+/// The first cloud model, as `<provider>/<model>`, if any provider is configured.
+fn first_cloud(providers: &[cloud::Provider]) -> Option<String> {
+    providers
+        .iter()
+        .find_map(|p| p.models.first().map(|m| format!("{}/{}", p.id, m)))
+}
+
+/// The `auto` alias, when it is enabled. It names a policy rather than a
+/// checkpoint, so it is only offered to API clients (`/v1/models`) while on.
+fn alias_entries(
+    guard: &DaemonState,
+    providers: &[cloud::Provider],
+    enabled: bool,
+) -> Vec<serde_json::Value> {
+    if !enabled {
+        return Vec::new();
+    }
+    let local = local_llm(guard).unwrap_or_else(|| "—".to_string());
+    let cloud = first_cloud(providers).unwrap_or_else(|| "—".to_string());
+    vec![serde_json::json!({
+        "id": "auto",
+        "object": "model",
+        "alias": true,
+        "info": { "model_class": "llm" },
+        "loaded": true,
+        "routes_to": format!("{local} / {cloud}"),
+    })]
+}
+
+/// Whether a loaded or remembered local model can see images.
+fn local_has_vision(guard: &DaemonState, id: &str) -> bool {
+    guard
+        .models
+        .get(id)
+        .map(|l| l.info.vision)
+        .or_else(|| guard.dormant.get(id).map(|d| d.info.vision))
+        .unwrap_or(false)
+}
+
+/// Whether a request carries any image, read cheaply from the raw body.
+fn body_has_images(body: &serde_json::Value) -> bool {
+    body.get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|msgs| {
+            msgs.iter().any(|msg| {
+                msg.get("content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|parts| {
+                        parts.iter().any(|p| {
+                            matches!(
+                                p.get("type").and_then(|t| t.as_str()),
+                                Some("image_url") | Some("input_image")
+                            )
+                        })
+                    })
+            })
+        })
+}
+
+/// Decide which concrete model `auto` means.
+///
+/// Local-first unless `prefer` is `cloud`, and skips a local model that cannot
+/// see an image the request carries.
+fn route_alias(
+    guard: &DaemonState,
+    providers: &[cloud::Provider],
+    prefer: &str,
+    has_images: bool,
+) -> Option<String> {
+    let local = local_llm(guard);
+    let cloud = first_cloud(providers);
+    let local_vision = local
+        .as_deref()
+        .is_some_and(|id| local_has_vision(guard, id));
+    route_choice(prefer, local, cloud, local_vision, has_images)
+}
+
+/// The pure decision behind [`route_alias`], split out so it can be tested
+/// without a loaded engine.
+fn route_choice(
+    prefer: &str,
+    local: Option<String>,
+    cloud: Option<String>,
+    local_vision: bool,
+    has_images: bool,
+) -> Option<String> {
+    if prefer == "cloud" && cloud.is_some() {
+        return cloud;
+    }
+    local.filter(|_| !has_images || local_vision).or(cloud)
+}
+
+/// What [`expand_alias`] did, so `chat` can fall back the right way.
+#[derive(Default, Clone, Copy)]
+struct AliasRoute {
+    /// The request named `auto` (and it is enabled).
+    auto: bool,
+    /// `auto` resolved to a local model.
+    local: bool,
+}
+
+/// Expand the `auto` alias in `body["model"]` to a concrete id.
+async fn expand_alias(state: &AppState, body: &mut serde_json::Value) -> ApiResult<AliasRoute> {
+    if body.get("model").and_then(serde_json::Value::as_str) != Some("auto") {
+        return Ok(AliasRoute::default());
+    }
+    let (enabled, prefer) = state
+        .routing
+        .read()
+        .map(|r| (r.enabled, r.prefer.clone()))
+        .unwrap_or_else(|_| (true, "local".to_string()));
+    if !enabled {
+        return Err(ApiError::NotFound(
+            "auto routing is off; enable it in the app, or name a concrete model".into(),
+        ));
+    }
+    let has_images = body_has_images(body);
+    let target = {
+        let guard = state.inner.lock().await;
+        let providers = state
+            .cloud
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        route_alias(&guard, providers.as_slice(), &prefer, has_images)
+    };
+    match target {
+        Some(id) => {
+            // A cloud id carries a provider prefix; a local one has no slash.
+            let local = !id.contains('/');
+            body["model"] = json!(id);
+            Ok(AliasRoute { auto: true, local })
+        }
+        None => Err(ApiError::NotFound(
+            "auto: nothing to route to — load a local model or add a cloud provider".into(),
+        )),
+    }
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<serde_json::Value> {
     let guard = state.inner.lock().await;
-    let data: Vec<serde_json::Value> = guard
+    let mut data: Vec<serde_json::Value> = guard
         .models
         .values()
         .map(|l| {
@@ -440,10 +877,165 @@ async fn list_models(State(state): State<AppState>) -> Json<serde_json::Value> {
                 "object": "model",
                 "path": l.path,
                 "info": l.info,
+                "loaded": true,
             })
         })
         .collect();
+    // Freed models are still names a client can request (they reload on use).
+    data.extend(guard.dormant.values().map(|d| {
+        json!({
+            "id": d.id,
+            "object": "model",
+            "path": d.path,
+            "info": d.info,
+            "loaded": false,
+        })
+    }));
+    drop(guard);
+    // Cloud providers, snapped so the alias list can describe them too.
+    let providers: Vec<cloud::Provider> = state.cloud.read().map(|p| p.clone()).unwrap_or_default();
+    // The `auto` alias, listed after the concrete names while it is enabled, so
+    // an API client can ask for the routing policy by name.
+    let enabled = state.routing.read().map(|r| r.enabled).unwrap_or(true);
+    let aliases = {
+        let guard = state.inner.lock().await;
+        alias_entries(&guard, &providers, enabled)
+    };
+    data.extend(aliases);
+    for p in &providers {
+        for m in &p.models {
+            data.push(json!({
+                "id": format!("{}/{}", p.id, m),
+                "object": "model",
+                "owned_by": p.id,
+                "provider": p.name,
+                "cloud": true,
+            }));
+        }
+    }
     Json(json!({ "object": "list", "data": data }))
+}
+
+/// `POST /admin/providers` — replace the cloud provider set.
+///
+/// The desktop app owns this list; it reads the keys from the OS credential
+/// store and pushes them here over loopback. Keys live only in memory.
+async fn set_providers(
+    State(state): State<AppState>,
+    Json(list): Json<Vec<cloud::ProviderIn>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let providers: Vec<cloud::Provider> = list
+        .into_iter()
+        .filter(|p| !p.id.trim().is_empty() && !p.base_url.trim().is_empty())
+        .map(|p| cloud::Provider {
+            id: p.id,
+            name: if p.name.trim().is_empty() {
+                p.base_url.clone()
+            } else {
+                p.name
+            },
+            base_url: p.base_url,
+            api_key: p.api_key,
+            models: p.models,
+        })
+        .collect();
+    let count = providers.len();
+    let ids: Vec<String> = providers.iter().map(|p| p.id.clone()).collect();
+    *state
+        .cloud
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = providers;
+    // Ids only — never a key.
+    tracing::info!(providers = ?ids, "cloud providers updated");
+    Ok(Json(json!({ "status": "ok", "count": count })))
+}
+
+/// `GET /admin/providers` — the set, without any key.
+async fn list_providers(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let providers: Vec<serde_json::Value> = state
+        .cloud
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "name": p.name,
+                "base_url": p.base_url,
+                "models": p.models,
+                "has_key": !p.api_key.is_empty(),
+            })
+        })
+        .collect();
+    Json(json!({ "providers": providers }))
+}
+
+#[derive(Deserialize)]
+struct RoutingRequest {
+    /// Turn the `auto` alias on or off. Omitted leaves it unchanged.
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// `"local"` (default) or `"cloud"`. Omitted leaves it unchanged.
+    #[serde(default)]
+    prefer: Option<String>,
+}
+
+/// `GET /admin/routing` — the `auto` alias's current on/off and preference.
+async fn get_routing(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let (enabled, prefer) = state
+        .routing
+        .read()
+        .map(|r| (r.enabled, r.prefer.clone()))
+        .unwrap_or_else(|_| (true, "local".to_string()));
+    Json(json!({ "enabled": enabled, "prefer": prefer }))
+}
+
+/// `POST /admin/routing` — set the `auto` alias's policy (partial update).
+async fn set_routing(
+    State(state): State<AppState>,
+    Json(req): Json<RoutingRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut routing = state
+        .routing
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(enabled) = req.enabled {
+        routing.enabled = enabled;
+    }
+    if let Some(prefer) = req.prefer.as_deref() {
+        // Anything but an explicit "cloud" means local-first: the safe, cheap,
+        // private default.
+        routing.prefer = if prefer.trim() == "cloud" {
+            "cloud"
+        } else {
+            "local"
+        }
+        .to_string();
+    }
+    Ok(Json(json!({
+        "status": "ok",
+        "enabled": routing.enabled,
+        "prefer": routing.prefer,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ProviderTest {
+    base_url: String,
+    #[serde(default)]
+    api_key: String,
+}
+
+/// `POST /admin/providers/test` — ask a provider what it serves, before saving.
+///
+/// Takes an unsaved base URL and key so the UI can populate the model list (and
+/// catch a bad key) while the user is still editing.
+async fn test_provider(
+    State(state): State<AppState>,
+    Json(req): Json<ProviderTest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let models = cloud::fetch_models(&state.client, &req.base_url, &req.api_key).await?;
+    Ok(Json(json!({ "status": "ok", "models": models })))
 }
 
 #[derive(Deserialize)]
@@ -511,6 +1103,11 @@ struct LoadRequest {
     keep_alive_secs: Option<u64>,
     #[serde(default)]
     set_default: Option<bool>,
+    /// Default reasoning mode for this model: `false` renders every prompt with
+    /// `enable_thinking` off, `true`/omitted leaves it on. A per-model setting
+    /// that a request may still override with its own `thinking`.
+    #[serde(default)]
+    thinking: Option<bool>,
 }
 
 fn model_id(req: &LoadRequest) -> String {
@@ -553,8 +1150,17 @@ async fn load(
     // Reject the sizes before they reach llama.cpp, where they stop being a
     // bad number and start being an allocation. Done before the file check so a
     // request that cannot be honoured does not touch the disk at all.
+    // `n_ctx: 0` is not a size, it is "size it to the machine" — let it through
+    // and the fit measurement below fills in what actually fits.
+    if let Some(v) = req.n_ctx {
+        if v > limits::N_CTX {
+            return Err(ApiError::BadRequest(format!(
+                "n_ctx must be between 0 and {}, got {v}",
+                limits::N_CTX
+            )));
+        }
+    }
     for (name, v, max) in [
-        ("n_ctx", req.n_ctx, limits::N_CTX),
         ("n_batch", req.n_batch, limits::N_BATCH),
         ("n_ubatch", req.n_ubatch, limits::N_UBATCH),
     ] {
@@ -691,17 +1297,9 @@ async fn load(
         drop_inherited_mtp(&mut cfg, asked_mtp);
     }
     let n_gpu_layers = cfg.n_gpu_layers;
-    let n_ctx = cfg.n_ctx;
     let load_mtp = cfg.load_mtp;
 
     let mut notes: Vec<String> = Vec::new();
-    if req.draft_model.is_some() {
-        notes.push(
-            "a draft model is loaded; turn on speculative decoding per request to have it \
-             draft"
-                .into(),
-        );
-    }
     if load_mtp {
         notes.push(
             "the model's bundled MTP head is loaded; turn on speculative decoding per \
@@ -728,22 +1326,49 @@ async fn load(
     // advisory too — `fit.rs` documents "never refuses a model on its own" and
     // an `Err` here would contradict that. We log and continue without a
     // report, so a transient backend/probe failure cannot brick loading.
-    let fit: Option<FitReport> = match tokio::task::spawn_blocking({
-        let path = cfg.model_path.clone();
-        let n_ctx = cfg.n_ctx;
-        move || infer_core::fit::fit(&path, n_ctx)
-    })
-    .await
-    {
-        Ok(Ok(r)) => Some(r),
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "fit: could not measure; loading without fit advice");
-            None
+    //
+    // Measured only when the measurement is actually consulted — an automatic
+    // context has to be sized from it, and `strict_fit` is by definition a
+    // request to be told — and only when nothing else is resident. llama.cpp's
+    // Fit advice is only consulted when `strict_fit` asks for it, because the
+    // fitter answers by loading the checkpoint a second time inside this
+    // process. That second load fails while another model is resident — it ends
+    // in `invalid vector subscript` from inside llama.cpp and reaches the caller
+    // as `model load: NullResult` — so it is refused rather than attempted, with
+    // a sentence saying what to do instead.
+    let fit: Option<FitReport> = if req.strict_fit.unwrap_or(false) {
+        let others_resident = {
+            let guard = state.inner.lock().await;
+            guard.models.keys().any(|k| k != &id)
+        };
+        if others_resident {
+            return Err(ApiError::BadRequest(
+                "strict_fit asks for a measurement, and a measurement loads the checkpoint a \
+                 second time in this process — which cannot be done while another model is \
+                 resident. Unload the other models, or drop strict_fit and let the load be \
+                 tried."
+                    .into(),
+            ));
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "fit task failed; loading without fit advice");
-            None
+        match tokio::task::spawn_blocking({
+            let path = cfg.model_path.clone();
+            let n_ctx = cfg.n_ctx;
+            move || infer_core::fit::fit(&path, n_ctx)
+        })
+        .await
+        {
+            Ok(Ok(r)) => Some(r),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "fit: could not measure; loading without fit advice");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "fit task failed; loading without fit advice");
+                None
+            }
         }
+    } else {
+        None
     };
 
     if let Some(fit) = fit.as_ref() {
@@ -765,6 +1390,36 @@ async fn load(
         }
     }
 
+    // An automatic context (`n_ctx: 0`) is sized from the model's own limit and
+    // the device it will run on — see `fit::auto_ctx`. Not from the fitter: that
+    // would measure the checkpoint by loading it, which is both the reason a
+    // second model could not be held and a second full load on every cold start.
+    // The ladder needs nothing measured, and gives the same answer every time.
+    let inbound_class = infer_core::model_class_of(std::path::Path::new(&req.model));
+    if cfg.n_ctx == 0 {
+        let hardware = infer_core::hwprofile::probe()
+            .map_err(|e| ApiError::Model(format!("could not read this machine's memory: {e}")))?;
+        cfg.n_ctx = infer_core::fit::auto_ctx(
+            inbound_class,
+            infer_core::fit::train_ctx(std::path::Path::new(&req.model)),
+            infer_core::fit::ModelFootprint::of(std::path::Path::new(&req.model)),
+            &hardware,
+        );
+        notes.push(format!(
+            "context sized to {} tokens automatically ({} model, {} of video memory)",
+            cfg.n_ctx,
+            inbound_class,
+            hardware
+                .gpus
+                .iter()
+                .map(|g| g.vram_total_mb)
+                .max()
+                .map(|mb| format!("{} MiB", mb))
+                .unwrap_or_else(|| "no dedicated".to_string()),
+        ));
+    }
+    let n_ctx = cfg.n_ctx;
+
     // Drop any existing model with the same id before loading the new one.
     let old = {
         let mut guard = state.inner.lock().await;
@@ -773,13 +1428,82 @@ async fn load(
     let _ = tokio::task::spawn_blocking(move || drop(old)).await;
 
     let path = cfg.model_path.clone();
+
+    // One model per slot, where a slot is what a caller actually asks for. A
+    // second chat model is wanted *instead of* the first, not beside it: two
+    // 13 GB models do not share a 24 GB card, and the failure that produces is a
+    // null result from deep inside the engine rather than anything the caller
+    // can act on. Parked models keep their configuration in `dormant`, so the
+    // next request that names one reloads it — the same path the idle reaper
+    // uses, and nothing is lost if the load below fails.
+    let incoming_slot = model_slot_for(&path, req.mmproj.as_ref().map(|_| true));
+    if let Some(slot) = incoming_slot {
+        let parked = park_models_in_slot(&state, &id, slot).await;
+        if !parked.is_empty() {
+            let names: Vec<String> = parked.iter().map(|m| m.id.clone()).collect();
+            notes.push(format!(
+                "released {} to make room (it reloads automatically when a request names it): {}",
+                slot.label(),
+                names.join(", ")
+            ));
+            let _ = tokio::task::spawn_blocking(move || drop(parked)).await;
+        }
+    }
+
+    // Kept so the model can be loaded again if the idle reaper frees it.
+    let config = cfg.clone();
     let log_id = id.clone();
-    let engine = tokio::task::spawn_blocking(move || {
-        Engine::load(cfg, |ev| tracing::info!(?log_id, ?ev, "load"))
-    })
-    .await??;
+    let engine = match spawn_engine(cfg.clone(), &log_id).await {
+        Ok(engine) => engine,
+        Err(first) => {
+            // The slot rule above already released the model this one replaces,
+            // so a failure here means the device itself is full. For a model the
+            // caller is switching to, that is worth one retry with everything
+            // else released — "switch to this model" should not require knowing
+            // which other model is in the way. It is *not* worth it for an
+            // encoder: those are small, and tearing down a chat model to make
+            // room for 600 MB is a worse answer than saying what is missing.
+            let may_release_all = matches!(
+                incoming_slot,
+                Some(ModelSlot::Chat) | Some(ModelSlot::Vision)
+            );
+            let freed = if may_release_all {
+                release_all_except(&state, &id).await
+            } else {
+                Vec::new()
+            };
+            if freed.is_empty() {
+                let context = load_failure_context(&path, &state).await;
+                return Err(ApiError::Model(format!("{first}{context}")));
+            }
+            let names: Vec<String> = freed.iter().map(|m| m.id.clone()).collect();
+            notes.push(format!(
+                "released {} and retried: the device was too full to load alongside them",
+                names.join(", ")
+            ));
+            let _ = tokio::task::spawn_blocking(move || drop(freed)).await;
+            match spawn_engine(cfg, &log_id).await {
+                Ok(engine) => engine,
+                Err(second) => {
+                    let context = load_failure_context(&path, &state).await;
+                    return Err(ApiError::Model(format!("{second}{context}")));
+                }
+            }
+        }
+    };
 
     let info = engine.info().clone();
+    // A drafter that would not load is reported rather than failing the load:
+    // the model is up and usable, just without speculative decoding.
+    if let Some(reason) = &info.draft_error {
+        notes.push(reason.clone());
+    } else if req.draft_model.is_some() {
+        notes.push(
+            "a draft model is loaded; turn on speculative decoding per request to have it \
+             draft"
+                .into(),
+        );
+    }
     let mut guard = state.inner.lock().await;
     if let Some(secs) = req.keep_alive_secs {
         guard.keep_alive = std::time::Duration::from_secs(secs);
@@ -796,6 +1520,7 @@ async fn load(
             path,
             engine,
             info: info.clone(),
+            config,
             loaded_at: now,
             last_used: now,
             n_gpu_layers,
@@ -803,11 +1528,14 @@ async fn load(
             load_mtp,
             mmproj: req.mmproj.clone(),
             draft_model: req.draft_model.clone(),
+            thinking: req.thinking,
             loras: req.lora.clone().unwrap_or_default(),
             in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             stats: std::sync::Arc::new(std::sync::Mutex::new(RuntimeStats::default())),
         },
     );
+    // It is live again, so it is no longer a candidate for reload.
+    guard.dormant.remove(&id);
     if guard.default_model.is_none() || req.set_default.unwrap_or(false) {
         guard.default_model = Some(id.clone());
     }
@@ -832,24 +1560,35 @@ async fn unload(
     body: Option<Json<UnloadRequest>>,
 ) -> Json<serde_json::Value> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
-    let removed: Vec<Loaded> = {
+    let (removed, forgotten): (Vec<Loaded>, Vec<String>) = {
         let mut guard = state.inner.lock().await;
         match req.model.as_deref() {
             Some(id) => {
-                let r = guard.models.remove(id).into_iter().collect();
+                let resident = guard.models.remove(id).into_iter().collect();
                 if guard.default_model.as_deref() == Some(id) {
                     guard.default_model = None;
                 }
-                r
+                // Unloading is the user saying "I am done with this model", so
+                // it also forgets the parked copy. Keeping it would leave the
+                // model in `/v1/models` and would let a later request reload it,
+                // which is the opposite of what unloading means.
+                let forgotten: Vec<String> = guard
+                    .dormant
+                    .remove(id)
+                    .into_iter()
+                    .map(|_| id.to_string())
+                    .collect();
+                (resident, forgotten)
             }
             None => {
                 let all: Vec<Loaded> = guard.models.drain().map(|(_, l)| l).collect();
+                let forgotten: Vec<String> = guard.dormant.drain().map(|(id, _)| id).collect();
                 guard.default_model = None;
-                all
+                (all, forgotten)
             }
         }
     };
-    let n = removed.len();
+    let n = removed.len() + forgotten.len();
     let _ = tokio::task::spawn_blocking(move || drop(removed)).await;
     Json(json!({ "status": "ok", "unloaded": n }))
 }
@@ -868,6 +1607,10 @@ struct InMsg {
     role: String,
     #[serde(default)]
     content: serde_json::Value,
+    #[serde(default)]
+    tool_calls: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -972,6 +1715,19 @@ struct ChatRequest {
     ngram_n: Option<u16>,
     #[serde(default)]
     ngram_m: Option<u16>,
+    /// Whether a reasoning model should think before answering. Omitted keeps
+    /// the model's own default.
+    #[serde(default)]
+    thinking: Option<bool>,
+    /// OpenAI `tools` array. Handed to the chat template so the model knows the
+    /// tools exist and formats calls the way the template expects.
+    #[serde(default)]
+    tools: Option<serde_json::Value>,
+    /// OpenAI `tool_choice` (`"auto"`, `"required"` or `"none"`).
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
+    #[serde(default)]
+    parallel_tool_calls: Option<bool>,
 }
 
 impl ChatRequest {
@@ -1016,6 +1772,22 @@ impl ChatRequest {
         if let Some(v) = self.ngram_m {
             s.ngram_m = v;
         }
+        if let Some(v) = self.thinking {
+            s.thinking = Some(v);
+        }
+        if let Some(tools) = &self.tools {
+            if tools.as_array().is_some_and(|a| !a.is_empty()) {
+                s.tools_json = Some(tools.to_string());
+            }
+        }
+        // Only the string forms reach the parser; a named-function object is
+        // left to the model's own judgement (the template still sees the tools).
+        if let Some(serde_json::Value::String(choice)) = &self.tool_choice {
+            s.tool_choice = Some(choice.clone());
+        }
+        if let Some(p) = self.parallel_tool_calls {
+            s.parallel_tool_calls = p;
+        }
         s
     }
 
@@ -1025,7 +1797,14 @@ impl ChatRequest {
             .iter()
             .map(|m| {
                 let (text, images) = flatten_content(&m.content)?;
-                Ok(ChatMsg::new(m.role.clone(), text).with_images(images))
+                let mut msg = ChatMsg::new(m.role.clone(), text).with_images(images);
+                if let Some(calls) = &m.tool_calls {
+                    msg = msg.with_tool_calls(calls.clone());
+                }
+                if let Some(id) = &m.tool_call_id {
+                    msg = msg.with_tool_call_id(id.clone());
+                }
+                Ok(msg)
             })
             .collect()
     }
@@ -1088,12 +1867,82 @@ struct EmbedRequest {
 }
 
 /// Resolve a model for generation, refusing anything that cannot generate.
+/// Load a model back if the idle reaper freed it.
+///
+/// Returns immediately when the model is already loaded, or when the id is
+/// unknown — the caller's own checks decide what an unknown id means. The first
+/// request after a model was freed therefore blocks for its load, which is the
+/// price of freeing VRAM while idle.
+async fn ensure_ready(state: &AppState, id: &str) -> ApiResult<()> {
+    let dormant = {
+        let guard = state.inner.lock().await;
+        if guard.models.contains_key(id) {
+            return Ok(());
+        }
+        guard.dormant.get(id).cloned()
+    };
+    let Some(d) = dormant else {
+        return Ok(());
+    };
+
+    tracing::info!(%id, "reloading a model freed while idle");
+    // One model per slot applies here too: naming a released model is a request
+    // to switch to it, and the device has no room to hold both.
+    if let Some(slot) = model_slot_for(&d.path, Some(d.info.vision)) {
+        let parked = park_models_in_slot(state, id, slot).await;
+        if !parked.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || drop(parked)).await;
+        }
+    }
+    let cfg = d.config.clone();
+    let engine = tokio::task::spawn_blocking(move || Engine::load(cfg, |_| {}))
+        .await
+        .map_err(|e| ApiError::Model(format!("reload task failed: {e}")))?
+        .map_err(|e| ApiError::Model(e.to_string()))?;
+    let info = engine.info().clone();
+    let now = Instant::now();
+
+    let mut guard = state.inner.lock().await;
+    // A racing request may have loaded it already; keep the live one.
+    if guard.models.contains_key(id) {
+        return Ok(());
+    }
+    guard.dormant.remove(id);
+    guard.models.insert(
+        id.to_string(),
+        Loaded {
+            id: id.to_string(),
+            path: d.path,
+            engine,
+            info,
+            config: d.config,
+            loaded_at: now,
+            last_used: now,
+            n_gpu_layers: d.n_gpu_layers,
+            n_ctx: d.n_ctx,
+            load_mtp: d.load_mtp,
+            mmproj: d.mmproj,
+            draft_model: d.draft_model,
+            thinking: d.thinking,
+            loras: d.loras,
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            stats: std::sync::Arc::new(std::sync::Mutex::new(RuntimeStats::default())),
+        },
+    );
+    Ok(())
+}
+
 async fn chat_engine(
     state: &AppState,
     requested: Option<&str>,
-) -> ApiResult<(EngineHandle, String, InFlight)> {
+) -> ApiResult<(EngineHandle, String, InFlight, Option<bool>)> {
+    let id = {
+        let guard = state.inner.lock().await;
+        require_model(&guard, requested, "llm")?
+    };
+    ensure_ready(state, &id).await?;
+
     let mut guard = state.inner.lock().await;
-    let id = require_model(&guard, requested)?;
     // Encoder models decode nothing: their tokens are probabilities, not a
     // continuation. Failing fast says so, instead of streaming word salad.
     let class = guard
@@ -1106,9 +1955,12 @@ async fn chat_engine(
             "{id} is a {class} model — it cannot generate text; load a chat model (class llm)",
         )));
     }
-    let engine = guard.models.get(&id).expect("resolved").engine.handle();
-    let active = guard.begin(&id).expect("resolved");
-    Ok((engine, id, active))
+    let (engine, thinking) = {
+        let loaded = guard.models.get(&id).ok_or(ApiError::NotLoaded)?;
+        (loaded.engine.handle(), loaded.thinking)
+    };
+    let active = guard.begin(&id).ok_or(ApiError::NotLoaded)?;
+    Ok((engine, id, active, thinking))
 }
 
 /// `YYYY-MM-DDThh:mm:ssZ` from the system clock.
@@ -1235,13 +2087,15 @@ async fn ollama_chat(
     State(state): State<AppState>,
     Json(req): Json<OllamaChatRequest>,
 ) -> Result<Response, ApiError> {
-    let (handle, model_id, active) = chat_engine(&state, req.model.as_deref()).await?;
+    let (handle, model_id, active, thinking) = chat_engine(&state, req.model.as_deref()).await?;
     let msgs: Vec<ChatMsg> = req
         .messages
         .iter()
         .map(|m| ChatMsg::new(m.role.clone(), m.content.clone()))
         .collect();
-    let params = sampler_from_options(&SamplerParams::default(), req.options.as_ref());
+    let mut params = sampler_from_options(&SamplerParams::default(), req.options.as_ref());
+    // Ollama has no thinking option, so the model's own default always applies.
+    params.thinking = thinking;
     // Taken before `model_id` is handed to the stream, which owns it from there.
     let perf = state.runtime_stats(&model_id).await;
     Ok(ollama_stream(
@@ -1258,13 +2112,15 @@ async fn ollama_generate(
     State(state): State<AppState>,
     Json(req): Json<OllamaGenerateRequest>,
 ) -> Result<Response, ApiError> {
-    let (handle, model_id, active) = chat_engine(&state, req.model.as_deref()).await?;
+    let (handle, model_id, active, thinking) = chat_engine(&state, req.model.as_deref()).await?;
     let mut msgs = Vec::new();
     if let Some(system) = req.system.filter(|s| !s.trim().is_empty()) {
         msgs.push(ChatMsg::new("system", system));
     }
     msgs.push(ChatMsg::new("user", req.prompt.clone()));
-    let params = sampler_from_options(&SamplerParams::default(), req.options.as_ref());
+    let mut params = sampler_from_options(&SamplerParams::default(), req.options.as_ref());
+    // Ollama has no thinking option, so the model's own default always applies.
+    params.thinking = thinking;
     let perf = state.runtime_stats(&model_id).await;
     Ok(ollama_stream(
         handle, model_id, active, msgs, params, req.stream, false, perf,
@@ -1404,21 +2260,38 @@ fn api_error(e: &InferError) -> Response {
 /// embedder and a reranker at once, and silently picking one turns a typo or a
 /// forgotten field into the wrong model answering. The error lists what is
 /// loaded, so the fix is one line away.
-fn require_model(guard: &DaemonState, requested: Option<&str>) -> ApiResult<String> {
-    if guard.models.is_empty() {
+/// Pick the model a request should run on, of the kind the route needs.
+///
+/// An exact name wins when it is that kind. A name that matches nothing — a
+/// stale id held by an agent after the loaded model was swapped — falls back to
+/// the only model of that kind, so a client does not have to be reconfigured
+/// every time the desktop app changes models.
+fn require_model(guard: &DaemonState, requested: Option<&str>, class: &str) -> ApiResult<String> {
+    if let Some(id) = guard.resolve_class(requested, class) {
+        return Ok(id);
+    }
+    if guard.models.is_empty() && guard.dormant.is_empty() {
         return Err(ApiError::NotLoaded);
     }
-    let Some(requested) = requested.filter(|m| !m.trim().is_empty()) else {
-        let mut loaded: Vec<&str> = guard.models.keys().map(String::as_str).collect();
-        loaded.sort_unstable();
-        return Err(ApiError::NotFound(format!(
+    let mut known: Vec<&str> = guard
+        .models
+        .keys()
+        .chain(guard.dormant.keys())
+        .map(String::as_str)
+        .collect();
+    known.sort_unstable();
+    match requested.filter(|m| !m.trim().is_empty()) {
+        // Several models of this kind are loaded and the name matched none:
+        // naming one is the only way to choose.
+        Some(id) => Err(ApiError::NotFound(format!(
+            "model {id:?} not found and more than one {class} model is loaded: {}",
+            known.join(", ")
+        ))),
+        None => Err(ApiError::NotFound(format!(
             "\"model\" is required; loaded: {}",
-            loaded.join(", ")
-        )));
-    };
-    guard
-        .resolve(Some(requested))
-        .ok_or_else(|| ApiError::NotFound(format!("model not found: {requested:?}")))
+            known.join(", ")
+        ))),
+    }
 }
 
 /// OpenAI-shaped `/v1/embeddings`.
@@ -1516,9 +2389,14 @@ async fn rerank(
         return Err(ApiError::NotFound("documents must not be empty".into()));
     }
 
+    let id = {
+        let guard = state.inner.lock().await;
+        require_model(&guard, req.model.as_deref(), "rerank")?
+    };
+    ensure_ready(&state, &id).await?;
+
     let (handle, model_id, active) = {
         let mut guard = state.inner.lock().await;
-        let id = require_model(&guard, req.model.as_deref())?;
         let class = guard
             .models
             .get(&id)
@@ -1529,8 +2407,13 @@ async fn rerank(
                 "{id} is a {class} model — load a reranker (class rerank) to rank documents",
             )));
         }
-        let handle = guard.models.get(&id).expect("resolved").engine.handle();
-        let active = guard.begin(&id).expect("resolved");
+        let handle = guard
+            .models
+            .get(&id)
+            .ok_or(ApiError::NotLoaded)?
+            .engine
+            .handle();
+        let active = guard.begin(&id).ok_or(ApiError::NotLoaded)?;
         (handle, id, active)
     };
 
@@ -1617,8 +2500,13 @@ async fn embed_engine(
     state: &AppState,
     requested: Option<&str>,
 ) -> ApiResult<(EngineHandle, String, InFlight)> {
+    let id = {
+        let guard = state.inner.lock().await;
+        require_model(&guard, requested, "embedding")?
+    };
+    ensure_ready(state, &id).await?;
+
     let mut guard = state.inner.lock().await;
-    let id = require_model(&guard, requested)?;
     let class = guard
         .models
         .get(&id)
@@ -1629,21 +2517,120 @@ async fn embed_engine(
             "{id} is a {class} model — load an embedding model (class embedding) to embed",
         )));
     }
-    let engine = guard.models.get(&id).expect("resolved").engine.handle();
-    let active = guard.begin(&id).expect("resolved");
+    let engine = guard
+        .models
+        .get(&id)
+        .ok_or(ApiError::NotLoaded)?
+        .engine
+        .handle();
+    let active = guard.begin(&id).ok_or(ApiError::NotLoaded)?;
     Ok((engine, id, active))
+}
+
+/// Tag each tool call with its position, the way OpenAI's stream expects.
+///
+/// The non-streaming shape carries no `index`, but a client assembling a
+/// streamed reply orders the calls by it.
+fn stream_tool_calls(calls: &serde_json::Value) -> serde_json::Value {
+    let indexed: Vec<serde_json::Value> = calls
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let mut v = c.clone();
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("index".into(), json!(i));
+                    }
+                    v
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::Value::Array(indexed)
 }
 
 async fn chat(
     State(state): State<AppState>,
-    Json(req): Json<ChatRequest>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
-    let (handle, model_id, active) = chat_engine(&state, req.model.as_deref()).await?;
+    // The `auto` alias names a policy, not a model; decide which concrete one it
+    // means now. `route` records what happened so `auto` can fall back either
+    // way — local to cloud when the local model cannot serve the request, and
+    // cloud to local when the provider is unreachable.
+    let route = expand_alias(&state, &mut body).await?;
+
+    // A model named `<providerId>/<model>` is served by that cloud provider;
+    // anything else is a local model. Decided here, before any local state is
+    // touched, so a cloud request never contends with the model lock.
+    let routed = {
+        let providers = state
+            .cloud
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cloud::route(
+            providers.as_slice(),
+            body.get("model").and_then(serde_json::Value::as_str),
+        )
+    };
+    if let Some((provider, native)) = routed {
+        match cloud::proxy_chat(&state.client, &provider, native, body.clone()).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) if route.auto => {
+                // Cloud-first `auto` (or an `auto` with no local model) could not
+                // reach the provider. Fall back to the local model rather than
+                // fail, which is the stability `auto` exists for.
+                let local = {
+                    let guard = state.inner.lock().await;
+                    local_llm(&guard)
+                };
+                match local {
+                    Some(id) => body["model"] = json!(id),
+                    None => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let req: ChatRequest = serde_json::from_value(body.clone())
+        .map_err(|e| ApiError::BadRequest(format!("bad chat request: {e}")))?;
+    let engine = chat_engine(&state, req.model.as_deref()).await;
+    let (handle, model_id, active, thinking) = match engine {
+        Ok(triple) => triple,
+        Err(e) if route.local => {
+            // `auto`'s local model could not take the request — not loaded,
+            // context full, no vision — and no token has been produced yet, so
+            // the cloud can answer it whole. Only `auto` does this; a concrete
+            // local name that fails is the honest answer.
+            let cloud = {
+                let providers = state
+                    .cloud
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                first_cloud(providers.as_slice())
+                    .and_then(|cid| cloud::route(providers.as_slice(), Some(&cid)))
+            };
+            match cloud {
+                Some((provider, native)) => {
+                    body["model"] = json!(format!("{}/{}", provider.id, native));
+                    return cloud::proxy_chat(&state.client, &provider, native, body).await;
+                }
+                None => return Err(e),
+            }
+        }
+        Err(e) => return Err(e),
+    };
     // Taken while `model_id` is still ours; the streaming branch moves it into
     // the blocking task that finishes the reply.
     let perf = state.runtime_stats(&model_id).await;
 
-    let params = req.sampler();
+    let mut params = req.sampler();
+    // A request that names no thinking mode inherits the model's own default,
+    // set at load time.
+    if params.thinking.is_none() {
+        params.thinking = thinking;
+    }
     let msgs = req.chat_msgs()?;
 
     if !req.stream {
@@ -1660,16 +2647,33 @@ async fn chat(
 
         record_stats(perf.as_ref(), &stats);
 
+        // A reply that asked for tools reports `tool_calls`, not `stop`: the
+        // caller has to run them and send the results back.
+        let mut message = json!({ "role": "assistant", "content": text });
+        if let Some(calls) = &stats.tool_calls {
+            message["tool_calls"] = calls.clone();
+        }
+        if let Some(reasoning) = &stats.reasoning_content {
+            message["reasoning_content"] = json!(reasoning);
+        }
+        let finish_reason = if stats.tool_calls.is_some() {
+            "tool_calls"
+        } else if stats.hit_token_cap {
+            "length"
+        } else {
+            "stop"
+        };
+
         return Ok(Json(json!({
             "object": "chat.completion",
             "model": model_id,
             "choices": [{
                 "index": 0,
-                "message": { "role": "assistant", "content": text },
+                "message": message,
                 // A reply cut off by `max_tokens` is not a finished reply, and
                 // a client that stitches the pieces together has to be able to
                 // tell the two apart.
-                "finish_reason": if stats.hit_token_cap { "length" } else { "stop" },
+                "finish_reason": finish_reason,
             }],
             "usage": {
                 "prompt_tokens": stats.prompt_tokens,
@@ -1726,19 +2730,32 @@ async fn chat(
         let final_ev = match result {
             Ok(stats) => {
                 record_stats(perf.as_ref(), &stats);
-                // See the non-streaming path: a truncated reply reports itself.
-                let finish_reason = if stats.hit_token_cap {
+                // See the non-streaming path: a truncated reply reports itself,
+                // and a reply that asked for tools reports `tool_calls`.
+                let finish_reason = if stats.tool_calls.is_some() {
+                    "tool_calls"
+                } else if stats.hit_token_cap {
                     "length"
                 } else {
                     "stop"
                 };
+                let mut delta = json!({});
+                if let Some(calls) = &stats.tool_calls {
+                    // OpenAI's stream carries the calls in the last chunk, each
+                    // tagged with its `index` so an assembling client can order
+                    // them.
+                    delta["tool_calls"] = stream_tool_calls(calls);
+                }
+                if let Some(reasoning) = &stats.reasoning_content {
+                    delta["reasoning_content"] = json!(reasoning);
+                }
                 Event::default().data(
                     json!({
                         "id": chat_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model_id,
-                        "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
+                        "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
                         "stats": stats,
                     })
                     .to_string(),
@@ -1776,7 +2793,25 @@ mod tests {
 
     fn app(key: Option<&str>) -> Router {
         let state = AppState::new(Duration::from_secs(0), LoadConfig::new(""));
-        router(state, key.map(|k| Arc::new(k.to_string())), Vec::new())
+        router(
+            state,
+            key.map(|k| Arc::new(k.to_string())),
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// The same server with a models folder and a UI directory, for the paths
+    /// that only exist when they were pointed at one.
+    fn app_with_dirs(key: Option<&str>, models: Option<&std::path::Path>, ui: Option<&std::path::Path>) -> Router {
+        let mut state = AppState::new(Duration::from_secs(0), LoadConfig::new(""));
+        state = state.with_models_dir(models.map(|p| p.to_path_buf()));
+        router(
+            state,
+            key.map(|k| Arc::new(k.to_string())),
+            Vec::new(),
+            ui.map(|p| p.to_path_buf()),
+        )
     }
 
     /// `get` would shadow `axum::routing::get`, so this is named `probe`.
@@ -2025,6 +3060,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tools_map_onto_the_sampler() {
+        let req: ChatRequest = serde_json::from_value(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [
+                { "type": "function", "function": { "name": "get_weather", "parameters": {} } }
+            ],
+            "tool_choice": "required",
+            "parallel_tool_calls": true,
+        }))
+        .expect("chat request");
+        let p = req.sampler();
+        let tools = p.tools_json.expect("tools carried through");
+        assert!(tools.contains("get_weather"));
+        assert_eq!(p.tool_choice.as_deref(), Some("required"));
+        assert!(p.parallel_tool_calls);
+    }
+
+    #[test]
+    fn tools_absent_or_unnamed_leaves_the_sampler_plain() {
+        let req: ChatRequest = serde_json::from_value(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [],
+        }))
+        .expect("chat request");
+        assert!(req.sampler().tools_json.is_none());
+
+        // A named-function object is not one of the string forms the template
+        // understands, so it is dropped rather than mangled into a grammar.
+        let req: ChatRequest = serde_json::from_value(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tool_choice": { "type": "function", "function": { "name": "f" } },
+        }))
+        .expect("chat request");
+        assert!(req.sampler().tool_choice.is_none());
+    }
+
+    #[test]
+    fn tool_messages_keep_their_calls_and_ids() {
+        let req: ChatRequest = serde_json::from_value(json!({
+            "messages": [
+                { "role": "assistant", "content": null, "tool_calls": [
+                    { "id": "call_1", "type": "function",
+                      "function": { "name": "f", "arguments": "{}" } }
+                ] },
+                { "role": "tool", "tool_call_id": "call_1", "content": "42" }
+            ]
+        }))
+        .expect("chat request");
+        let msgs = req.chat_msgs().expect("messages");
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].tool_calls.is_some());
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("call_1"));
+    }
+
     fn spec() -> serde_json::Value {
         serde_json::from_str(include_str!("../openapi.json")).expect("openapi.json parses")
     }
@@ -2108,18 +3198,144 @@ mod tests {
         app(None).oneshot(req).await.unwrap().status()
     }
 
+    /// The response body, for the cases where two different failures share one
+    /// status code and only the message tells them apart.
+    async fn post_error(path: &str, body: serde_json::Value) -> String {
+        let mut req = TestRequest::new(Body::from(serde_json::to_vec(&body).expect("body")));
+        *req.method_mut() = Method::POST;
+        *req.uri_mut() = path.parse().expect("uri");
+        req.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let res = app(None).oneshot(req).await.unwrap();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The provider list round-trips through the daemon, but the key never comes
+    /// back out, and the configured models show up in `/v1/models`.
+    #[tokio::test]
+    async fn providers_round_trip_without_leaking_keys() {
+        let router = app(None);
+
+        let body = json!([{
+            "id": "deepseek",
+            "name": "DeepSeek",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "sk-secret",
+            "models": ["deepseek-chat"]
+        }]);
+        let mut req = TestRequest::new(Body::from(serde_json::to_vec(&body).expect("body")));
+        *req.method_mut() = Method::POST;
+        *req.uri_mut() = "/admin/providers".parse().expect("uri");
+        req.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert_eq!(
+            router.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let res = router
+            .clone()
+            .oneshot(probe("/admin/providers", None))
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes())
+            .into_owned();
+        assert!(text.contains("\"has_key\":true"), "{text}");
+        assert!(!text.contains("sk-secret"), "key leaked: {text}");
+
+        let res = router
+            .clone()
+            .oneshot(probe("/v1/models", None))
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes())
+            .into_owned();
+        assert!(text.contains("deepseek/deepseek-chat"), "{text}");
+        assert!(!text.contains("sk-secret"), "key leaked in models: {text}");
+
+        // The chat client reads /admin/status, so cloud models must be there too.
+        let res = router.oneshot(probe("/admin/status", None)).await.unwrap();
+        let text = String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes())
+            .into_owned();
+        assert!(text.contains("deepseek/deepseek-chat"), "{text}");
+        assert!(text.contains("\"cloud\":true"), "{text}");
+    }
+
+    fn l() -> Option<String> {
+        Some("local-model".to_string())
+    }
+    fn c() -> Option<String> {
+        Some("deepseek/deepseek-chat".to_string())
+    }
+
+    #[test]
+    fn auto_is_local_first_and_cloud_is_the_fallback() {
+        // Local first with both available.
+        assert_eq!(
+            route_choice("local", l(), c(), false, false),
+            Some("local-model".into())
+        );
+        // Cloud first when asked.
+        assert_eq!(
+            route_choice("cloud", l(), c(), false, false),
+            Some("deepseek/deepseek-chat".into())
+        );
+        // No local: use cloud.
+        assert_eq!(
+            route_choice("local", None, c(), false, false),
+            Some("deepseek/deepseek-chat".into())
+        );
+        // An image a non-vision local cannot read goes to the cloud.
+        assert_eq!(
+            route_choice("local", l(), c(), false, true),
+            Some("deepseek/deepseek-chat".into())
+        );
+        // A vision local keeps it.
+        assert_eq!(
+            route_choice("local", l(), c(), true, true),
+            Some("local-model".into())
+        );
+        // Nothing to route to.
+        assert_eq!(route_choice("local", None, None, false, false), None);
+    }
+
+    #[test]
+    fn image_detection_reads_content_parts() {
+        assert!(!body_has_images(&json!({
+            "messages": [{ "role": "user", "content": "hi" }]
+        })));
+        assert!(body_has_images(&json!({
+            "messages": [{ "role": "user", "content": [
+                { "type": "image_url", "image_url": { "url": "data:x" } }
+            ] }]
+        })));
+    }
+
     /// A size that cannot be allocated is refused here rather than handed to
     /// llama.cpp, where an oversized `n_ctx` is an allocation failure that
     /// takes the whole process down.
     #[tokio::test]
     async fn load_refuses_sizes_that_cannot_be_allocated() {
-        for n_ctx in [0u32, limits::N_CTX + 1, u32::MAX] {
+        for n_ctx in [limits::N_CTX + 1, u32::MAX] {
             assert_eq!(
                 post_status("/admin/load", json!({ "model": "m.gguf", "n_ctx": n_ctx })).await,
                 StatusCode::BAD_REQUEST,
                 "n_ctx {n_ctx} must be refused"
             );
         }
+        // `0` asks for an automatic size, so it is a valid request; the missing
+        // file is what stops it. NotFound shares the 400 status, so the message
+        // is what proves the context was not the reason.
+        let body = post_error("/admin/load", json!({ "model": "m.gguf", "n_ctx": 0 })).await;
+        assert!(
+            body.contains("model file not found"),
+            "an automatic context must be accepted, got: {body}"
+        );
         assert_eq!(
             post_status(
                 "/admin/load",
@@ -2200,5 +3416,109 @@ mod tests {
             Some("http://127.0.0.1:5173"),
             "the dev server is one of ours"
         );
+    }
+
+    /// A scratch folder for these tests, named so parallel runs cannot collide.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nexllama-http-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    async fn body_of(res: axum::response::Response) -> Vec<u8> {
+        axum::body::to_bytes(res.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("body")
+            .to_vec()
+    }
+
+    /// A daemon given no folder answers "no library" rather than a 404 — the UI
+    /// asks this on every open, and a 404 there would read as a broken server.
+    #[tokio::test]
+    async fn the_models_endpoint_answers_empty_without_a_folder() {
+        let res = app(None)
+            .oneshot(probe("/admin/models", None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_of(res).await).expect("json");
+        assert!(json["dir"].is_null());
+        assert_eq!(json["models"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// With a folder, the same endpoint lists it, and it is the same listing the
+    /// desktop library would show: one row per model, projector and drafter
+    /// paired with their weights.
+    #[tokio::test]
+    async fn the_models_endpoint_lists_the_folder_it_was_pointed_at() {
+        let dir = scratch("models");
+        let model = dir.join("my-model");
+        std::fs::create_dir_all(&model).expect("model dir");
+        std::fs::write(model.join("my-model.gguf"), b"gguf").expect("weights");
+        std::fs::write(model.join("my-model-mmproj.gguf"), b"gguf").expect("projector");
+
+        let res = app_with_dirs(None, Some(&dir), None)
+            .oneshot(probe("/admin/models", None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_of(res).await).expect("json");
+        assert_eq!(json["models"].as_array().map(Vec::len), Some(1));
+        assert_eq!(json["models"][0]["name"], "my-model");
+        assert_eq!(json["models"][0]["kind"], "vision");
+        assert!(json["dir"]
+            .as_str()
+            .is_some_and(|d| std::path::Path::new(d) == dir));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The folder lists models; it does not expose the files in it.
+    #[tokio::test]
+    async fn the_models_endpoint_needs_the_token_like_the_rest() {
+        assert_eq!(
+            status_of(Some("secret"), "/admin/models", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// With `--ui-dir`, `/` is the app and the API is still there — the point of
+    /// serving both on one port.
+    #[tokio::test]
+    async fn a_ui_directory_replaces_the_banner_and_keeps_the_api() {
+        let dir = scratch("ui");
+        std::fs::write(dir.join("index.html"), "<!doctype html><title>Nexllama</title>")
+            .expect("index");
+        std::fs::create_dir_all(dir.join("assets")).expect("assets");
+        std::fs::write(dir.join("assets").join("app.js"), "console.log(1)").expect("asset");
+
+        let app = app_with_dirs(None, None, Some(&dir));
+
+        let res = app.clone().oneshot(probe("/", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let html = String::from_utf8(body_of(res).await).expect("utf8");
+        assert!(html.contains("<title>Nexllama</title>"), "`/` should be the app");
+
+        let res = app
+            .clone()
+            .oneshot(probe("/assets/app.js", None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "built assets are served as they are");
+
+        // A path that is not a file still opens the app, so a bookmark survives.
+        let res = app.clone().oneshot(probe("/chat", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // And the engine is on the same port.
+        let res = app.oneshot(probe("/health", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

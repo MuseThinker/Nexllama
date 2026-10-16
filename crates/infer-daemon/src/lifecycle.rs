@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::state::{AppState, Loaded};
+use crate::state::{AppState, Dormant, Loaded};
 
 /// Periodically unloads any model idle longer than keep_alive (0 = keep forever).
 pub fn spawn_reaper(state: AppState, tick: Duration) {
@@ -33,6 +33,10 @@ pub fn spawn_reaper(state: AppState, tick: Duration) {
                         if guard.default_model.as_deref() == Some(id.as_str()) {
                             guard.default_model = None;
                         }
+                        // Remember how to load it again: freeing the weights must
+                        // not turn the model into an unknown one for the next
+                        // request that names it.
+                        guard.dormant.insert(id.clone(), Dormant::from_loaded(&l));
                         removed.push(l);
                     }
                 }

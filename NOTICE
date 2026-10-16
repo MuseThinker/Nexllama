@@ -1,7 +1,7 @@
 # Third-party notices
 
-Nexllama is distributed under the MIT OR Apache-2.0 dual license
-(see `LICENSE-MIT` and `LICENSE-APACHE`). It builds on the work below.
+Nexllama is distributed under the MIT License
+(see `LICENSE`). It builds on the work below.
 
 ## llama.cpp / GGML
 

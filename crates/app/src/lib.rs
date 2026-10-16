@@ -4,6 +4,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use infer_hub::{GgufFile, HubClient, RepoSummary};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
 
 #[cfg(windows)]
@@ -144,6 +146,25 @@ fn bind_host(settings: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// The port the daemon should listen on.
+///
+/// A stored value that is missing, zero, out of range, or not a number falls
+/// back to the default: a typo here would otherwise leave the app unable to
+/// reach its own daemon, with the port it actually took only in the log. Both a
+/// JSON number and a numeric string are accepted, since the settings page may
+/// have written either.
+fn configured_port(settings: &serde_json::Value) -> u16 {
+    let raw = settings.get("port");
+    let value = raw.and_then(serde_json::Value::as_u64).or_else(|| {
+        raw.and_then(serde_json::Value::as_str)
+            .and_then(|s| s.trim().parse().ok())
+    });
+    value
+        .and_then(|v| u16::try_from(v).ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(DEFAULT_PORT)
+}
+
 /// Bearer token handed to the daemon, if the user configured one.
 /// Where the daemon's access token is kept in the OS credential store.
 const SECRET_SERVICE: &str = "com.nexllama.desktop";
@@ -178,14 +199,212 @@ fn store_secret(value: &str) -> Result<(), String> {
 /// The credential store wins; the copy in `settings.json` is only a fallback
 /// for a token saved before it moved, and is migrated out on the next save.
 fn api_key(settings: &serde_json::Value) -> Option<String> {
-    secret().or_else(|| {
-        settings
-            .get("apiKey")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    })
+    secret().or_else(|| settings_api_key(settings))
+}
+
+/// The access token carried in the settings file, if it has one.
+///
+/// Split out from [`api_key`] so it can be tested on its own: the credential
+/// store it otherwise consults first is per-machine state, and a test that
+/// reads it asserts whatever happens to be on the machine running it.
+fn settings_api_key(settings: &serde_json::Value) -> Option<String> {
+    settings
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Credential-store account for a cloud provider's key.
+///
+/// One entry per provider, so removing a provider does not disturb the others.
+fn cloud_account(id: &str) -> String {
+    format!("cloud:{id}")
+}
+
+/// Read a cloud provider's key/token from the OS credential store.
+fn cloud_secret(id: &str) -> Option<String> {
+    let entry = keyring::Entry::new(SECRET_SERVICE, &cloud_account(id)).ok()?;
+    entry.get_password().ok().filter(|s| !s.trim().is_empty())
+}
+
+/// Store a cloud provider's key/token, or clear it when empty.
+fn store_cloud_secret(id: &str, value: &str) -> Result<(), String> {
+    let entry =
+        keyring::Entry::new(SECRET_SERVICE, &cloud_account(id)).map_err(|e| e.to_string())?;
+    if value.is_empty() {
+        return match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            // Nothing stored yet is the ordinary case for clearing a key.
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        };
+    }
+    entry.set_password(value).map_err(|e| e.to_string())
+}
+
+/// The daemon's base URL as this app reaches it: a wildcard bind is dialled on
+/// loopback, since that always answers.
+fn daemon_base(settings: &serde_json::Value) -> String {
+    let host = bind_host(settings);
+    let host = match host.trim() {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
+        other => other.to_string(),
+    };
+    format!("http://{host}:{}", configured_port(settings))
+}
+
+/// A cloud provider as the UI sends it: the non-secret parts plus, when the user
+/// has just typed one, the key. The key is written to the credential store and
+/// forwarded to the daemon; it never reaches the settings file.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudProviderArg {
+    id: String,
+    #[serde(default)]
+    name: String,
+    base_url: String,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    key: String,
+}
+
+/// The saved providers, with keys left blank (they are read from the store).
+fn providers_from_settings(app: &tauri::AppHandle) -> Vec<CloudProviderArg> {
+    load_settings(app)
+        .get("cloudProviders")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|p| {
+                    let id = p.get("id").and_then(|v| v.as_str())?.to_string();
+                    if p.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+                        return None;
+                    }
+                    let base_url = p.get("baseUrl").and_then(|v| v.as_str())?.to_string();
+                    let name = p
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&id)
+                        .to_string();
+                    let models = p
+                        .get("models")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|m| m.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(CloudProviderArg {
+                        id,
+                        name,
+                        base_url,
+                        models,
+                        key: String::new(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Push cloud providers to the daemon, keys included.
+///
+/// A key that arrives with the list is written to the credential store (so a
+/// later restart finds it) and forwarded; a provider without one falls back to
+/// whatever the store already holds. Keys travel only over loopback and never
+/// touch the settings file. The daemon keeps them in memory, so this runs again
+/// after every daemon start. Returns how many providers were sent.
+async fn push_providers(
+    app: &tauri::AppHandle,
+    list: Vec<CloudProviderArg>,
+) -> Result<(usize, usize), String> {
+    let settings = load_settings(app);
+    let mut payload: Vec<serde_json::Value> = Vec::new();
+    let mut with_key = 0usize;
+    for p in list {
+        if p.id.trim().is_empty() || p.base_url.trim().is_empty() {
+            continue;
+        }
+        let typed = p.key.trim();
+        let api_key = if typed.is_empty() {
+            // Nothing typed: take what the store already holds for this provider.
+            cloud_secret(&p.id).unwrap_or_default()
+        } else {
+            // Persist for the next start, but a credential-store failure must not
+            // stop the key reaching the daemon now.
+            if let Err(e) = store_cloud_secret(&p.id, typed) {
+                eprintln!("Nexllama: could not store the key for {}: {e}", p.id);
+            }
+            typed.to_string()
+        };
+        if !api_key.is_empty() {
+            with_key += 1;
+        }
+        let name = if p.name.trim().is_empty() {
+            p.base_url.clone()
+        } else {
+            p.name
+        };
+        payload.push(serde_json::json!({
+            "id": p.id,
+            "name": name,
+            "base_url": p.base_url,
+            "api_key": api_key,
+            "models": p.models,
+        }));
+    }
+
+    let url = format!("{}/admin/providers", daemon_base(&settings));
+    let mut req = reqwest::Client::new().post(&url).json(&payload);
+    if let Some(token) = api_key(&settings) {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("{status}: {body}"));
+    }
+    Ok((payload.len(), with_key))
+}
+
+/// The `auto` alias preference stored in settings: `"local"` (default) or `"cloud"`.
+fn synergy_prefer(settings: &serde_json::Value) -> String {
+    settings
+        .get("synergyPrefer")
+        .and_then(|v| v.as_str())
+        .filter(|s| *s == "cloud" || *s == "local")
+        .unwrap_or("local")
+        .to_string()
+}
+
+/// Whether `auto` routing is on (default false: the user opts in).
+fn synergy_enabled(settings: &serde_json::Value) -> bool {
+    settings
+        .get("synergyEnabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Tell the daemon how the `auto` alias should behave. Best-effort.
+async fn push_routing(app: &tauri::AppHandle, enabled: bool, prefer: &str) -> Result<(), String> {
+    let settings = load_settings(app);
+    let url = format!("{}/admin/routing", daemon_base(&settings));
+    let mut req = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({ "enabled": enabled, "prefer": prefer }));
+    if let Some(token) = api_key(&settings) {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("{}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+    }
+    Ok(())
 }
 
 /// Whether the current bind address is reachable from off this machine.
@@ -287,6 +506,13 @@ fn backend_exe(app: &tauri::AppHandle, name: &str) -> Option<PathBuf> {
 }
 
 fn dev_daemon() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(p) = exe.parent().map(|d| d.join(DAEMON_EXE)) {
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
     for profile in ["debug", "release"] {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join(format!("../../target/{profile}/{DAEMON_EXE}"));
@@ -402,6 +628,52 @@ fn preferred_backend() -> &'static str {
     })
 }
 
+/// The GPU backend this machine should run on, whether or not it is installed.
+///
+/// Unlike [`resolve_backend`], this ignores what is on disk: it is what drives
+/// the "download the missing GPU backend" step, so an accelerator the installer
+/// did not carry is fetched rather than given up on.
+fn desired_gpu_backend() -> Option<&'static str> {
+    let names = gpu_names();
+    let nvidia = names.iter().any(|n| n.contains("nvidia")) || has_nvidia();
+    if nvidia {
+        return Some("cuda");
+    }
+    let other = names.iter().any(|n| {
+        n.contains("amd") || n.contains("radeon") || n.contains("intel") || n.contains("arc")
+    });
+    if other {
+        return Some("vulkan");
+    }
+    if cfg!(target_os = "macos") && names.iter().any(|n| n.contains("apple")) {
+        return Some("metal");
+    }
+    None
+}
+
+/// Fetch the machine's GPU backend if it is not present yet. Best-effort.
+///
+/// Returns the backend it installed, or `None` when there was nothing to do
+/// (no GPU, backend already present, or no signed manifest configured).
+async fn ensure_gpu_backend(app: &tauri::AppHandle, state: &DaemonProc) -> Option<String> {
+    let backend = desired_gpu_backend()?;
+    if backend_exe(app, backend).is_some() {
+        return None;
+    }
+    // Nothing to download from; CPU it is, and the UI can say why.
+    manifest_url(app)?;
+    match install_backend(app, state, backend).await {
+        Ok(_) => {
+            eprintln!("Nexllama: installed the missing {backend} backend");
+            Some(backend.to_string())
+        }
+        Err(e) => {
+            eprintln!("Nexllama: could not install the {backend} backend: {e}");
+            None
+        }
+    }
+}
+
 fn available_backends(app: &tauri::AppHandle) -> Vec<&'static str> {
     BACKENDS
         .iter()
@@ -410,21 +682,42 @@ fn available_backends(app: &tauri::AppHandle) -> Vec<&'static str> {
         .collect()
 }
 
+/// The backends that suit this machine, best first, `cpu` always last.
+///
+/// A CUDA build hard-links NVIDIA's libraries (`cublas64_*`, `cudart64_*`), so
+/// it is only a candidate when an NVIDIA GPU is actually present. Listing it
+/// unconditionally meant a machine with only an Intel iGPU — whose preference is
+/// Vulkan — fell through to CUDA on an installer that bundles `cpu` and `cuda`
+/// and nothing else, and the daemon then died on a missing DLL at startup.
+fn backend_order(nvidia: bool, other_gpu: bool, apple: bool) -> Vec<&'static str> {
+    let mut order = Vec::new();
+    if apple {
+        order.push("metal");
+    }
+    if nvidia {
+        order.push("cuda");
+    }
+    if other_gpu {
+        order.push("vulkan");
+    }
+    order.push("cpu");
+    order
+}
+
 fn resolve_backend(app: &tauri::AppHandle, requested: &str) -> String {
     // `backend_exe` already refuses unknown names, so anything else falls
     // through to auto-detection rather than being used to build a path.
     if requested != "auto" && backend_exe(app, requested).is_some() {
         return requested.to_string();
     }
-    let preferred = preferred_backend();
-    // Try the platform's own answer first, then whatever else is bundled.
-    let order: [&str; 4] = match preferred {
-        "metal" => ["metal", "vulkan", "cuda", "cpu"],
-        "cuda" => ["cuda", "vulkan", "metal", "cpu"],
-        "vulkan" => ["vulkan", "metal", "cuda", "cpu"],
-        _ => ["metal", "cuda", "vulkan", "cpu"],
-    };
-    for b in order {
+    let names = gpu_names();
+    let nvidia = names.iter().any(|n| n.contains("nvidia")) || has_nvidia();
+    let other_gpu = names.iter().any(|n| {
+        n.contains("amd") || n.contains("radeon") || n.contains("intel") || n.contains("arc")
+    });
+    let apple = cfg!(target_os = "macos") && names.iter().any(|n| n.contains("apple"));
+
+    for b in backend_order(nvidia, other_gpu, apple) {
         if backend_exe(app, b).is_some() {
             return b.to_string();
         }
@@ -463,6 +756,9 @@ fn backend_info(app: tauri::AppHandle) -> serde_json::Value {
         "resolved": resolve_backend(&app, &requested),
         "available": available_backends(&app),
         "gpus": gpu_names(),
+        // The backend this machine's GPU wants, installed or not — what the UI
+        // offers to download when it is missing.
+        "gpu_backend": desired_gpu_backend(),
     })
 }
 
@@ -549,7 +845,47 @@ fn spawn_daemon(
         .unwrap_or("auto")
         .to_string();
     let backend = resolve_backend(app, &requested);
-    let bin = daemon_binary(app, &backend)?;
+    // Try the chosen backend, and if it cannot come up — a GPU build whose
+    // runtime is missing on this machine, say — fall back to CPU rather than
+    // failing the start. A slow answer beats a dialog nobody can act on.
+    match try_spawn_backend(
+        app,
+        &settings,
+        &backend,
+        model.clone(),
+        keep_alive_secs,
+        n_gpu_layers,
+        n_ctx,
+    ) {
+        Ok(port) => Ok(port),
+        Err(e) if backend != "cpu" && backend_exe(app, "cpu").is_some() => {
+            eprintln!("Nexllama: {backend} backend failed to start ({e}); falling back to cpu");
+            try_spawn_backend(
+                app,
+                &settings,
+                "cpu",
+                model,
+                keep_alive_secs,
+                n_gpu_layers,
+                n_ctx,
+            )
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Spawn one specific backend and wait for it to answer.
+#[allow(clippy::too_many_arguments)]
+fn try_spawn_backend(
+    app: &tauri::AppHandle,
+    settings: &serde_json::Value,
+    backend: &str,
+    model: Option<String>,
+    keep_alive_secs: Option<u64>,
+    n_gpu_layers: Option<u32>,
+    n_ctx: Option<u32>,
+) -> Result<u16, String> {
+    let bin = daemon_binary(app, backend)?;
     let workdir = bin.parent().map(|p| p.to_path_buf());
 
     let mut cmd = Command::new(&bin);
@@ -580,23 +916,24 @@ fn spawn_daemon(
     }
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
-    let host = bind_host(&settings);
+    let host = bind_host(settings);
+    let port = configured_port(settings);
     // The daemon refuses to start unauthenticated on a routable address, which
     // would otherwise show up here as a process that exits immediately and a
     // log nobody reads. Fail before spawning, where the fix can be named.
-    if is_exposed(&host) && api_key(&settings).is_none() {
+    if is_exposed(&host) && api_key(settings).is_none() {
         return Err(
             "listening on every interface needs an access token; set one in Settings → \
              Network, or bind to 127.0.0.1"
                 .into(),
         );
     }
-    cmd.arg("--port").arg(DEFAULT_PORT.to_string());
+    cmd.arg("--port").arg(port.to_string());
     cmd.arg("--host").arg(&host);
     // Passed through the environment rather than on the command line: a
     // process's arguments are readable by every other process on this machine,
     // and this is the one value here worth keeping out of them.
-    if let Some(key) = api_key(&settings) {
+    if let Some(key) = api_key(settings) {
         cmd.env("NEXLLAMA_API_KEY", key);
     }
     // Speculative decoding learns which n-grams tend to be followed by what;
@@ -605,27 +942,19 @@ fn spawn_daemon(
         cmd.arg("--ngram-cache").arg(dir.join("ngram-cache.bin"));
     }
 
-    let mut models: Vec<String> = settings
-        .get("autoLoad")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    if models.is_empty() {
-        if let Some(m) = settings
-            .get("model")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            models.push(m.to_string());
-        }
-    }
+    // Model(s) to load at start. An explicit request wins; otherwise the ones
+    // the user had loaded last time are brought back, so a restart (including
+    // after an update) returns to the same setup. A path that has moved or been
+    // deleted is skipped — the daemon already tolerates a startup model that
+    // will not load — rather than failing the whole start.
+    let mut models: Vec<String> = Vec::new();
     if let Some(m) = model {
-        if !models.contains(&m) {
-            models.push(m);
+        models.push(m);
+    } else if let Some(list) = settings.get("autoLoad").and_then(|v| v.as_array()) {
+        for p in list.iter().filter_map(|v| v.as_str()) {
+            if Path::new(p).exists() {
+                models.push(p.to_string());
+            }
         }
     }
     // A bundle is several files: the projector is what lets the model read
@@ -722,6 +1051,18 @@ fn spawn_daemon(
             cmd.arg("--rope-freq-scale").arg(v.to_string());
         }
     }
+    // Draft length for a startup model, on whichever drafter it uses: the
+    // bundled head reads `--mtp-n-max`, a side checkpoint `--draft-n-max`.
+    // Passing the head's flag for a side checkpoint would load the head too.
+    if let Some(v) = num("draftNMax") {
+        if v > 0 {
+            if mtp_head {
+                cmd.arg("--mtp-n-max").arg(v.to_string());
+            } else if files.iter().any(|f| f.draft.is_some()) {
+                cmd.arg("--draft-n-max").arg(v.to_string());
+            }
+        }
+    }
 
     // Lets the daemon notice when this app goes away, even when it is killed
     // rather than closed. Windows additionally puts the child in a job object
@@ -735,13 +1076,30 @@ fn spawn_daemon(
     // the process existed meant a daemon that died on a missing DLL — or never
     // got the port because something else already held it — looked exactly
     // like a healthy start, right up to the point nothing could reach it.
-    let ready = wait_ready(&mut child, &host, Duration::from_secs(30));
+    let ready = wait_ready(&mut child, &host, port, Duration::from_secs(30));
 
     let state = app.state::<DaemonProc>();
     *lock(&state.child)? = Some(child);
     *lock(&state.phase)? = Phase::Running;
     ready?;
-    Ok(DEFAULT_PORT)
+    // Cloud providers live only in the daemon's memory, so every start re-sends
+    // them. Best-effort: a failure here leaves local inference untouched, and the
+    // app pushes again whenever the user edits a provider.
+    {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let list = providers_from_settings(&app);
+            if let Err(e) = push_providers(&app, list).await {
+                eprintln!("Nexllama: pushing cloud providers failed: {e}");
+            }
+            let prefer = synergy_prefer(&load_settings(&app));
+            let enabled = synergy_enabled(&load_settings(&app));
+            if let Err(e) = push_routing(&app, enabled, &prefer).await {
+                eprintln!("Nexllama: pushing routing preference failed: {e}");
+            }
+        });
+    }
+    Ok(port)
 }
 
 /// Wait until the daemon answers on its port, or until it is plainly not going
@@ -750,7 +1108,7 @@ fn spawn_daemon(
 /// Returns `Ok` both when the port answers and when the process is still alive
 /// but slow: loading a startup model happens before the socket is bound, and
 /// failing a start that is merely slow would be worse than not checking.
-fn wait_ready(child: &mut Child, host: &str, timeout: Duration) -> Result<(), String> {
+fn wait_ready(child: &mut Child, host: &str, port: u16, timeout: Duration) -> Result<(), String> {
     let probe = match host.trim() {
         // Unspecified addresses accept every interface, so loopback answers.
         "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
@@ -762,7 +1120,7 @@ fn wait_ready(child: &mut Child, host: &str, timeout: Duration) -> Result<(), St
         // skipping the check beats guessing where to connect.
         Err(_) => return Ok(()),
     };
-    let addr = std::net::SocketAddr::new(ip, DEFAULT_PORT);
+    let addr = std::net::SocketAddr::new(ip, port);
     let deadline = Instant::now() + timeout;
     loop {
         // An exit is the case worth reporting, and it says everything: the log
@@ -781,12 +1139,12 @@ fn wait_ready(child: &mut Child, host: &str, timeout: Duration) -> Result<(), St
             return match pid {
                 Some(pid) if pid == child.id() => Ok(()),
                 Some(pid) => Err(format!(
-                    "port {DEFAULT_PORT} is already served by another process (pid {pid}); \
+                    "port {port} is already served by another process (pid {pid}); \
                      close the other Nexllama window or stop that daemon, then start again"
                 )),
                 // A server that is not ours answering without a pid is still not ours.
                 None => Err(format!(
-                    "port {DEFAULT_PORT} is already in use by a process that is not this \
+                    "port {port} is already in use by a process that is not this \
                      daemon's; stop it, then start again"
                 )),
             };
@@ -849,9 +1207,9 @@ fn stop_child(state: &DaemonProc) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn daemon_start(
+async fn daemon_start(
     app: tauri::AppHandle,
-    state: tauri::State<DaemonProc>,
+    state: tauri::State<'_, DaemonProc>,
     model: Option<String>,
     keep_alive_secs: Option<u64>,
     n_gpu_layers: Option<u32>,
@@ -874,7 +1232,7 @@ fn daemon_start(
                     // applied to a process that is running, and reporting
                     // success anyway is how a change looks applied when it was
                     // quietly dropped.
-                    return Ok(DEFAULT_PORT);
+                    return Ok(configured_port(&load_settings(&app)));
                 }
                 *phase = Phase::Stopped;
             }
@@ -885,6 +1243,11 @@ fn daemon_start(
         // alongside it.
         *phase = Phase::Starting;
     }
+
+    // A machine with a GPU whose backend is not installed (this build did not
+    // carry it, or an older install) fetches it now — signed and checksummed —
+    // so the reply runs on the GPU instead of quietly falling back to CPU.
+    ensure_gpu_backend(&app, &state).await;
 
     let result = spawn_daemon(&app, model, keep_alive_secs, n_gpu_layers, n_ctx);
     note_start(&state, &result);
@@ -925,7 +1288,8 @@ fn daemon_status(app: tauri::AppHandle, state: tauri::State<DaemonProc>) -> serd
         },
         Err(_) => false,
     };
-    let requested = load_settings(&app)
+    let settings = load_settings(&app);
+    let requested = settings
         .get("backend")
         .and_then(|v| v.as_str())
         .unwrap_or("auto")
@@ -933,9 +1297,10 @@ fn daemon_status(app: tauri::AppHandle, state: tauri::State<DaemonProc>) -> serd
     let backend = resolve_backend(&app, &requested);
     serde_json::json!({
         "running": running,
-        "port": DEFAULT_PORT,
+        "port": configured_port(&settings),
         "backend": backend,
-        "host": bind_host(&load_settings(&app)),
+        "gpu_backend": desired_gpu_backend(),
+        "host": bind_host(&settings),
         "binary": daemon_binary(&app, &backend).ok().map(|p| p.to_string_lossy().to_string()),
         // A start refused at launch has nowhere else to surface itself, so the
         // status carries it and the library card can say what to fix.
@@ -1026,6 +1391,114 @@ fn set_settings(app: tauri::AppHandle, settings: serde_json::Value) -> Result<()
     write_settings(&app, &stored)
 }
 
+/// Store a cloud provider's key/token in the OS credential store.
+#[tauri::command]
+fn cloud_key_set(id: String, key: String) -> Result<(), String> {
+    store_cloud_secret(&id, &key)
+}
+
+/// Forget a cloud provider's key/token.
+#[tauri::command]
+fn cloud_key_clear(id: String) -> Result<(), String> {
+    store_cloud_secret(&id, "")
+}
+
+/// Which of the named providers already have a key stored (ids only — never the
+/// value, so the UI can show "set / not set" without the secret crossing IPC).
+#[tauri::command]
+fn cloud_key_present(ids: Vec<String>) -> Vec<String> {
+    ids.into_iter()
+        .filter(|id| cloud_secret(id).is_some())
+        .collect()
+}
+
+/// Send the configured providers (with their keys) to the daemon.
+///
+/// The UI passes the current list, keys included, so a key the user just typed
+/// is stored and forwarded in the same step; with no list, the saved providers
+/// are read back and their keys taken from the credential store.
+#[tauri::command]
+async fn cloud_push_providers(
+    app: tauri::AppHandle,
+    providers: Option<Vec<CloudProviderArg>>,
+) -> Result<serde_json::Value, String> {
+    let list = match providers {
+        Some(list) => list,
+        None => providers_from_settings(&app),
+    };
+    let (count, with_key) = push_providers(&app, list).await?;
+    // `withKey` lets the UI tell "saved" from "saved, but the key did not make
+    // it" — the failure this whole path exists to avoid.
+    Ok(serde_json::json!({ "count": count, "withKey": with_key }))
+}
+
+/// Ask a provider what it serves, via the daemon, before the user saves it.
+/// Arguments for `cloud_fetch_models`, as one object.
+///
+/// A single struct argument rather than two positional ones: Tauri renames the
+/// command's arguments, and an object with explicit camelCase fields leaves no
+/// room for `base_url`/`key` to be bound to each other by mistake.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudProbe {
+    base_url: String,
+    #[serde(default)]
+    key: String,
+}
+
+#[tauri::command]
+async fn cloud_fetch_models(
+    app: tauri::AppHandle,
+    probe: CloudProbe,
+) -> Result<serde_json::Value, String> {
+    let settings = load_settings(&app);
+    let url = format!("{}/admin/providers/test", daemon_base(&settings));
+    let mut req = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({ "base_url": &probe.base_url, "api_key": &probe.key }));
+    if let Some(token) = api_key(&settings) {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let value: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let message = value
+            .get("error")
+            .and_then(|e| e.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| status.to_string());
+        return Err(message);
+    }
+    Ok(value)
+}
+
+/// Set the `auto` alias policy (on/off and `"local"`/`"cloud"`) and push it.
+///
+/// Either field may be omitted to leave it unchanged.
+#[tauri::command]
+async fn set_routing(
+    app: tauri::AppHandle,
+    enabled: Option<bool>,
+    prefer: Option<String>,
+) -> Result<(), String> {
+    let mut settings = load_settings(&app);
+    if let Some(obj) = settings.as_object_mut() {
+        if let Some(e) = enabled {
+            obj.insert("synergyEnabled".to_string(), serde_json::Value::Bool(e));
+        }
+        if let Some(p) = &prefer {
+            let p = if p.trim() == "cloud" { "cloud" } else { "local" };
+            obj.insert(
+                "synergyPrefer".to_string(),
+                serde_json::Value::String(p.to_string()),
+            );
+        }
+    }
+    write_settings(&app, &settings)?;
+    push_routing(&app, synergy_enabled(&settings), &synergy_prefer(&settings)).await
+}
+
 #[tauri::command]
 fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
@@ -1045,6 +1518,9 @@ fn models_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map(PathBuf::from);
     let dir = match configured {
         Some(d) => d,
+        // Fresh install: keep models on the system drive, where the model
+        // libraries people already have usually live.
+        None if cfg!(windows) => PathBuf::from(r"C:\models"),
         None => app
             .path()
             .app_data_dir()
@@ -1111,14 +1587,22 @@ fn startup_files(model: &str, root: Option<&Path>) -> StartupFiles {
     // and is exactly the case where there is nothing to get wrong.
     let at_root = root.is_some_and(|r| same_dir(dir, r));
     let mut files = Vec::new();
-    collect_gguf_files(dir, dir, &mut files);
+    model_index::collect_gguf_files(dir, dir, &mut files);
     if at_root {
         // The root also contains whole subfolders of other models, and those
-        // are none of this file's business.
+        // are none of this file's business — except one named for a drafter
+        // (`MTP/`, an EAGLE or DFlash checkpoint), which belongs to the weights
+        // beside it. The relative filename carries the folder name, so files
+        // collected from there already classify as drafts.
         files.retain(|f| {
-            f["path"]
-                .as_str()
-                .is_some_and(|p| Path::new(p).parent() == Some(dir))
+            f["path"].as_str().is_some_and(|p| {
+                let parent = Path::new(p).parent();
+                parent == Some(dir)
+                    || parent
+                        .and_then(Path::file_name)
+                        .and_then(|n| n.to_str())
+                        .is_some_and(model_index::is_drafter_dir)
+            })
         });
         if files.iter().filter(|f| f["role"] == "main").count() != 1 {
             return out;
@@ -1126,7 +1610,7 @@ fn startup_files(model: &str, root: Option<&Path>) -> StartupFiles {
     }
     // `read_dir` order is a property of the filesystem, not of the model: the
     // same folder has to keep yielding the same drafter.
-    sort_files(&mut files);
+    model_index::sort_files(&mut files);
     let pick = |role: &str| {
         files
             .iter()
@@ -1146,235 +1630,32 @@ fn same_dir(a: &Path, b: &Path) -> bool {
         .eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
-fn sort_files(files: &mut [serde_json::Value]) {
-    files.sort_by(|a, b| {
-        a["filename"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["filename"].as_str().unwrap_or(""))
-    });
-}
-
-/// A short label for the drafter a side-mounted file implements, from its name.
+/// A safe folder name for a repository id.
 ///
-/// The engine makes the same call from the checkpoint header when it loads;
-/// this is the list's guess from the filename, so the choice is readable
-/// before anything has been loaded.
-fn draft_kind_label(filename: &str) -> &'static str {
-    let n = filename.to_ascii_lowercase();
-    if n.contains("dflash") {
-        "DFlash"
-    } else if n.contains("eagle") {
-        "EAGLE-3"
-    } else if n.contains("mtp") || n.contains("nextn") {
-        "MTP"
-    } else {
-        "draft"
-    }
-}
-
-fn role_of(filename: &str) -> &'static str {
-    let n = filename.to_ascii_lowercase();
-    if n.contains("mmproj") || n.contains("projector") {
-        "projector"
-    } else if n.contains("draft")
-        || n.contains("eagle")
-        || n.contains("mtp")
-        || n.contains("dflash")
-    {
-        "draft"
-    } else if n.contains("lora") || n.contains("adapter") {
-        "lora"
-    } else if n.contains("vocoder") {
-        "vocoder"
-    } else {
-        "main"
-    }
-}
-
-fn collect_gguf_files(dir: &Path, base: &Path, out: &mut Vec<serde_json::Value>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_gguf_files(&path, base, out);
-            continue;
-        }
-        let is_gguf = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("gguf"))
-            .unwrap_or(false);
-        if !is_gguf {
-            continue;
-        }
-        let rel = path.strip_prefix(base).unwrap_or(&path);
-        let filename = rel.to_string_lossy().to_string();
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        out.push(serde_json::json!({
-            "filename": filename,
-            "role": role_of(&filename),
-            "size": size,
-            "path": path.to_string_lossy(),
-        }));
-    }
-}
-
-fn bundle(name: &str, dir: &str, files: Vec<serde_json::Value>) -> serde_json::Value {
-    let pick = |role: &str| {
-        files
-            .iter()
-            .find(|f| f["role"] == role)
-            .map(|f| f["path"].clone())
-    };
-    // The name is a hint; the header is the verdict. Main weights get named
-    // after the family they serve — "…-MTP", "…-EAGLE" — exactly the way draft
-    // heads are, so a folder can hold two files whose names both say "draft"
-    // while only one is a full model. Among the candidates, the largest one
-    // whose header can actually be read is the main file: a stripped head is
-    // never the biggest GGUF in its own folder, and loading the second-biggest
-    // file as the model is the one outcome worse than offering nothing.
-    let main = {
-        let mut candidates: Vec<&serde_json::Value> = files
-            .iter()
-            .filter(|f| matches!(f["role"].as_str(), Some("main") | Some("draft")))
-            .collect();
-        candidates.sort_by_key(|f| std::cmp::Reverse(f["size"].as_u64().unwrap_or(0)));
-        candidates
-            .iter()
-            .find(|f| {
-                f["path"]
-                    .as_str()
-                    .map(|p| gguf_probe::probe(p).is_ok())
-                    .unwrap_or(false)
-            })
-            .map(|f| f["path"].clone())
-    };
-    let loras: Vec<serde_json::Value> = files
-        .iter()
-        .filter(|f| f["role"] == "lora")
-        .map(|f| f["path"].clone())
+/// `owner/name` becomes `owner--name`: a separator the filesystem accepts on
+/// every platform, so a repository id can be used as a directory name as it
+/// stands. Anything that could escape the models folder is dropped rather than
+/// sanitised into something ambiguous.
+fn repo_folder_name(repo: &str) -> String {
+    let cleaned: String = repo
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .collect();
-    let size: u64 = files.iter().filter_map(|f| f["size"].as_u64()).sum();
-    // Read the family out of the main file's header so the library can group it
-    // and chat can refuse the models that cannot chat.
-    let probe = main
-        .as_ref()
-        .and_then(|p| p.as_str())
-        .and_then(|p| gguf_probe::probe(p).ok());
-    let class = probe
-        .as_ref()
-        .map(|p| p.classify().as_str().to_string())
-        .unwrap_or_else(|| gguf_probe::ModelClass::Llm.as_str().to_string());
-    let mtp = probe.as_ref().is_some_and(gguf_probe::Probe::has_mtp);
-    serde_json::json!({
-        "name": name,
-        "dir": dir,
-        "size": size,
-        "main": main,
-        "projector": pick("projector"),
-        "draft": pick("draft"),
-        "loras": loras,
-        "class": class,
-        "mtp": mtp,
-        "draft_kind": pick("draft").and_then(|d| d.as_str().map(draft_kind_label)),
-        "kind": if pick("projector").is_some() {
-            "vision"
-        } else if pick("draft").is_some() {
-            "speculative"
-        } else {
-            class.as_str()
-        },
-        "files": files,
-    })
+    let cleaned = cleaned.trim_matches('.').to_string();
+    if cleaned.is_empty() {
+        "model".to_string()
+    } else {
+        cleaned
+    }
 }
 
 #[tauri::command]
 fn list_local_models(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, String> {
     let dir = models_dir(&app)?;
-    let mut bundles = Vec::new();
-    let mut loose: Vec<serde_json::Value> = Vec::new();
-    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.is_dir() {
-            let mut files = Vec::new();
-            collect_gguf_files(&path, &path, &mut files);
-            sort_files(&mut files);
-            if !files.is_empty() {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("model")
-                    .to_string();
-                bundles.push(bundle(&name, &name, files));
-            }
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("gguf"))
-            .unwrap_or(false)
-        {
-            let filename = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("model")
-                .to_string();
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            loose.push(serde_json::json!({
-                "filename": filename,
-                "role": role_of(&filename),
-                "size": size,
-                "path": path.to_string_lossy(),
-            }));
-        }
-    }
-    // The folder the user pointed the app at is often a single model's own
-    // folder — projector, draft checkpoint and bundled head beside the weights.
-    // Listing those as five separate models asked which one to load, and every
-    // answer except the weights was wrong.
-    sort_files(&mut loose);
-    bundles.extend(root_bundles(loose));
-    bundles.sort_by(|a, b| {
-        a["name"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(b["name"].as_str().unwrap_or(""))
-    });
-    Ok(bundles)
-}
-
-/// Turns the loose `.gguf` files sitting in the models folder itself into rows.
-///
-/// Exactly one of them being the main file means the rest are that model's own
-/// files, so they belong in one row. Two or more main files means a folder of
-/// unrelated models with no way to tell whose projector is whose, so each file
-/// keeps a row of its own.
-fn root_bundles(files: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
-    let mut mains = files.iter().filter(|f| f["role"] == "main");
-    let (Some(main), None) = (mains.next(), mains.next()) else {
-        return files
-            .into_iter()
-            .map(|f| {
-                let name = stem_of(f["filename"].as_str());
-                bundle(&name, "", vec![f])
-            })
-            .collect();
-    };
-    let name = stem_of(main["filename"].as_str());
-    vec![bundle(&name, "", files)]
-}
-
-/// The row's name is what a file is called without its extension.
-fn stem_of(filename: Option<&str>) -> String {
-    let filename = filename.unwrap_or("model");
-    Path::new(filename)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(filename)
-        .to_string()
+    // The same rules the daemon uses for GET /admin/models, so a library opened
+    // in a browser and one opened in the app cannot disagree about what a model is.
+    model_index::scan(&dir)
 }
 
 #[tauri::command]
@@ -1387,7 +1668,7 @@ async fn hub_search(
     let limit = limit.unwrap_or(20);
     match author.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
         // Naming the author turns "hundreds of qwen repos" into a list worth
-        // reading; see `TRUSTED_AUTHORS` for why those three.
+        // reading; see `TRUSTED_AUTHORS` for why those four.
         Some(author) => client.search_by_author(author, &query, limit).await,
         None => client.search(&query, limit).await,
     }
@@ -1418,11 +1699,19 @@ async fn hub_download(
     // supplied path, which made this command an arbitrary-file-write primitive:
     // aim it at the backend folder and the next daemon start would run a
     // downloaded `infer-daemon.exe`.
-    let dir = models_dir(&app)?;
-    let filename = filename.trim().to_string();
-    if !filename.to_ascii_lowercase().ends_with(".gguf") {
-        return Err("only .gguf files can be downloaded".to_string());
-    }
+let dir = models_dir(&app)?;
+       let filename = filename.trim().to_string();
+       if !filename.to_ascii_lowercase().ends_with(".gguf") {
+           return Err("only .gguf files can be downloaded".to_string());
+       }
+       // One folder per model, named after the repository. A model is several
+       // files — weights, sometimes a projector and a draft — and dropping them
+       // into the models root mixes them with whatever else is there: the
+       // library can no longer tell whose projector is whose, and the download
+       // list stops being readable. The library treats a folder as a model, so
+       // this is also what makes a freshly downloaded model appear as one entry.
+       let dir = dir.join(repo_folder_name(&repo));
+       std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let client = HubClient::new();
     let handle = app.clone();
     let repo_ev = repo.clone();
@@ -1600,6 +1889,52 @@ async fn fetch_manifest(app: &tauri::AppHandle, url: &str) -> Result<BackendMani
     Ok(manifest)
 }
 
+/// Like [`fetch_https`], but emits an `event` after every chunk so the UI can
+/// show a progress bar for a multi-hundred-megabyte backend download.
+async fn fetch_https_progress(
+    app: &tauri::AppHandle,
+    url: &str,
+    max_bytes: u64,
+    event: &str,
+) -> Result<Vec<u8>, String> {
+    use tauri::Emitter;
+    require_https(url)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    if resp.url().scheme() != "https" {
+        return Err(format!("redirected to a non-HTTPS URL: {}", resp.url()));
+    }
+    let total = resp.content_length();
+    if let Some(len) = total {
+        if len > max_bytes {
+            return Err(format!("{len} bytes is over the {max_bytes} byte limit"));
+        }
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(total.unwrap_or(0).min(max_bytes) as usize);
+    let mut downloaded: u64 = 0;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        downloaded += chunk.len() as u64;
+        if downloaded > max_bytes {
+            return Err(format!("the download exceeded the {max_bytes} byte limit"));
+        }
+        out.extend_from_slice(&chunk);
+        let _ = app.emit(
+            event,
+            serde_json::json!({ "downloaded": downloaded, "total": total }),
+        );
+    }
+    Ok(out)
+}
+
 /// Whether `candidate` is at least `installed`, comparing dotted numbers.
 ///
 /// Anything unparsable compares as older, so a version that changes shape
@@ -1629,6 +1964,9 @@ fn manifest_url(app: &tauri::AppHandle) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
+        // A URL baked in at build time means the app ships with an update
+        // source and the user never has to type one.
+        .or_else(|| option_env!("NEXLLAMA_UPDATE_URL").map(str::to_string))
 }
 
 fn installed_version(app: &tauri::AppHandle) -> String {
@@ -1696,6 +2034,10 @@ fn backend_update_status(app: tauri::AppHandle) -> serde_json::Value {
     serde_json::json!({
         "current": installed_version(&app),
         "manifest_url": manifest_url(&app),
+        // Whether a source is compiled in, so the UI can say the user does not
+        // have to type one.
+        "builtin_url": option_env!("NEXLLAMA_UPDATE_URL"),
+        "key_set": trusted_update_key(&app).is_ok(),
         "available": available_backends(&app),
     })
 }
@@ -1734,12 +2076,25 @@ async fn apply_backend_update(
     state: tauri::State<'_, DaemonProc>,
     backend: String,
 ) -> Result<serde_json::Value, String> {
-    let url = manifest_url(&app).ok_or("no update manifest URL configured")?;
-    let manifest = fetch_manifest(&app, &url).await?;
+    install_backend(&app, &state, &backend).await
+}
+
+/// Download, verify and unpack one backend from the signed manifest.
+///
+/// Shared by the manual "apply update" command and the automatic GPU-backend
+/// install that runs before a start, so a machine whose GPU backend is not in
+/// the installer fetches it instead of silently falling back to CPU.
+async fn install_backend(
+    app: &tauri::AppHandle,
+    state: &DaemonProc,
+    backend: &str,
+) -> Result<serde_json::Value, String> {
+    let url = manifest_url(app).ok_or("no update manifest URL configured")?;
+    let manifest = fetch_manifest(app, &url).await?;
     // Downgrades are how a known-bad build gets reinstalled, and "newer" is
     // decided locally against what is already on disk rather than trusted from
     // the manifest.
-    let current = installed_version(&app);
+    let current = installed_version(app);
     if current != "bundled" && !version_at_least(&manifest.version, &current) {
         return Err(format!(
             "refusing to downgrade: {current} is installed, the manifest offers {}",
@@ -1749,7 +2104,7 @@ async fn apply_backend_update(
     // `backend` is a manifest key and therefore remote-controlled. It is about
     // to become a directory that gets deleted and unpacked into, so it has to
     // be one of ours before anything else happens.
-    if !is_backend_name(&backend) {
+    if !is_backend_name(backend) {
         return Err(format!(
             "unknown backend '{backend}'; expected one of: {}",
             BACKENDS.join(", ")
@@ -1757,10 +2112,10 @@ async fn apply_backend_update(
     }
     let entry = manifest
         .backends
-        .get(&backend)
+        .get(backend)
         .ok_or_else(|| format!("backend '{backend}' not present in manifest"))?;
 
-    let bytes = fetch_https(&entry.url, MAX_BACKEND_BYTES).await?;
+    let bytes = fetch_https_progress(app, &entry.url, MAX_BACKEND_BYTES, "update://progress").await?;
     let got = sha256_hex(&bytes);
     if !got.eq_ignore_ascii_case(&entry.sha256) {
         return Err(format!(
@@ -1773,10 +2128,10 @@ async fn apply_backend_update(
     // replaced — and stopped for real: an update that cannot stop it must fail
     // rather than overwrite files out from under a running process.
     let was_running = *lock(&state.phase)? == Phase::Running;
-    stop_child(&state)?;
+    stop_child(state)?;
 
-    let root = backends_root(&app)?;
-    let dest = child_of(&root, &backend);
+    let root = backends_root(app)?;
+    let dest = child_of(&root, backend);
     if dest.exists() && !is_within(&root, &dest) {
         return Err(format!(
             "refusing to unpack outside the backends folder: {}",
@@ -1798,7 +2153,7 @@ async fn apply_backend_update(
     // having an update start it anyway is the kind of surprise that puts a
     // model back in VRAM when the user had taken it out.
     let restarted = if was_running {
-        spawn_daemon(&app, None, None, None, None)?;
+        spawn_daemon(app, None, None, None, None)?;
         true
     } else {
         false
@@ -1812,9 +2167,19 @@ async fn apply_backend_update(
     }))
 }
 
+/// Bring the main window back from the tray.
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--autostart"]),
@@ -1835,11 +2200,8 @@ pub fn run() {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             if auto {
-                let model = settings
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string());
+                // The service comes up with nothing loaded; the model is chosen
+                // in the library. Only the daemon-level knobs are handed over.
                 let keep = settings.get("keepAliveSecs").and_then(|v| v.as_u64());
                 let ngl = settings
                     .get("nGpuLayers")
@@ -1849,7 +2211,7 @@ pub fn run() {
                     .get("nCtx")
                     .and_then(|v| v.as_u64())
                     .map(|v| v as u32);
-                let result = spawn_daemon(&handle, model, keep, ngl, nctx);
+                let result = spawn_daemon(&handle, None, keep, ngl, nctx);
                 if let Err(e) = &result {
                     eprintln!("[nexllama] daemon autostart skipped: {e}");
                 }
@@ -1857,7 +2219,47 @@ pub fn run() {
                 // the reason: the library card reads it back from the status.
                 note_start(&handle.state::<DaemonProc>(), &result);
             }
+
+            // Closing the window hides the app to the tray rather than quitting
+            // it, so the service (and any loaded model) stays resident the way a
+            // background daemon should. Only "Quit" from the tray leaves, and
+            // that path runs the exit handler that stops the daemon.
+            let open = MenuItem::with_id(app, "open", "Open Nexllama", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit Nexllama", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
+            TrayIconBuilder::with_id("main")
+                .icon(
+                    app.default_window_icon()
+                        .expect("window icon is bundled")
+                        .clone(),
+                )
+                .tooltip("Nexllama")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "open" => show_main(app),
+                    // A real exit: the run-loop teardown stops the daemon.
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main(tray.app_handle());
+                    }
+                })
+                .build(app)?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             backend_info,
@@ -1869,6 +2271,12 @@ pub fn run() {
             get_settings,
             set_settings,
             set_autostart,
+            cloud_key_set,
+            cloud_key_clear,
+            cloud_key_present,
+            cloud_push_providers,
+            cloud_fetch_models,
+            set_routing,
             models_dir_cmd,
             open_models_dir,
             list_local_models,
@@ -1972,39 +2380,25 @@ mod tests {
         std::fs::remove_dir_all(there).ok();
     }
 
-    /// One model plus its own files is one row in the library; a folder of
-    /// unrelated models keeps one row each.
+    /// A HuggingFace download of an MTP head lands in its own `MTP/` folder
+    /// beside the weights. That folder is the model's drafter, so starting on
+    /// the weights has to bring it along.
     #[test]
-    fn loose_files_in_the_models_folder_form_one_row() {
-        let entry = |filename: &str| {
-            serde_json::json!({
-                "filename": filename,
-                "role": role_of(filename),
-                "size": 1u64,
-                "path": format!("C:/models/{filename}"),
-            })
-        };
-        let bundle = |files: Vec<serde_json::Value>| root_bundles(files);
+    fn a_drafter_folder_beside_the_weights_is_picked_up() {
+        let root = std::env::temp_dir().join(format!("nexllama-mtpdir-{}", std::process::id()));
+        let mtp = root.join("MTP");
+        std::fs::create_dir_all(&mtp).unwrap();
+        let weights = root.join("model.gguf");
+        let head = mtp.join("mtp-model-Q4_0.gguf");
+        std::fs::write(&weights, b"not a gguf").unwrap();
+        std::fs::write(&head, b"not a gguf").unwrap();
 
-        let one = bundle(vec![
-            entry("mmproj-x.gguf"),
-            entry("base-model.gguf"),
-            entry("dflash-x.gguf"),
-        ]);
-        assert_eq!(one.len(), 1);
-        assert_eq!(one[0]["name"], "base-model");
-        assert_eq!(
-            one[0]["main"].as_str().and_then(|p| p.rsplit('/').next()),
-            Some("base-model.gguf")
-        );
-        assert!(one[0]["projector"].is_string());
-        assert!(one[0]["draft"].is_string());
-        assert_eq!(one[0]["files"].as_array().map(Vec::len), Some(3));
+        let root_s = root.to_string_lossy().to_string();
+        let files = startup_files(&weights.to_string_lossy(), Some(Path::new(&root_s)));
+        assert_eq!(files.draft.as_deref(), head.to_str());
+        assert_eq!(files.projector, None);
 
-        let many = bundle(vec![entry("a-model.gguf"), entry("b-model.gguf")]);
-        assert_eq!(many.len(), 2);
-        assert_eq!(many[0]["name"], "a-model");
-        assert_eq!(many[1]["name"], "b-model");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2035,6 +2429,68 @@ mod tests {
 
         let settings = serde_json::json!({ "bindHost": "  " });
         assert_eq!(bind_host(&settings), "127.0.0.1");
+    }
+
+    /// CUDA is only a candidate when an NVIDIA GPU is present; a machine with no
+    /// discrete GPU must never fall through to it (its daemon would not load).
+    #[test]
+    fn cuda_is_only_offered_when_nvidia_is_present() {
+        assert_eq!(backend_order(false, false, false), vec!["cpu"]);
+        assert_eq!(backend_order(true, false, false), vec!["cuda", "cpu"]);
+        assert_eq!(backend_order(false, true, false), vec!["vulkan", "cpu"]);
+        assert_eq!(
+            backend_order(true, true, false),
+            vec!["cuda", "vulkan", "cpu"]
+        );
+        assert_eq!(backend_order(false, false, true), vec!["metal", "cpu"]);
+        // No GPU at all is CPU first and only — never CUDA.
+        assert!(!backend_order(false, false, false).contains(&"cuda"));
+    }
+
+    /// The credential store must actually persist a value, not fall back to an
+    /// inert backend. Ignored by default because it writes to the OS store and
+    /// needs one present (a headless CI box may not have it).
+    #[test]
+    #[ignore = "writes to the OS credential store"]
+    fn keyring_round_trips_a_secret() {
+        store_cloud_secret("probe-test", "hello-123").expect("store");
+        assert_eq!(cloud_secret("probe-test").as_deref(), Some("hello-123"));
+        store_cloud_secret("probe-test", "").expect("clear");
+        assert!(cloud_secret("probe-test").is_none());
+    }
+
+    /// A port the app cannot interpret must not leave it unable to reach its own
+    /// daemon; every bad shape falls back to the default.
+    #[test]
+    fn the_port_defaults_unless_a_valid_one_is_stored() {
+        assert_eq!(configured_port(&serde_json::json!({})), DEFAULT_PORT);
+        // A string, as a settings page may have written it.
+        assert_eq!(
+            configured_port(&serde_json::json!({ "port": "8080" })),
+            8080
+        );
+        assert_eq!(configured_port(&serde_json::json!({ "port": 8080 })), 8080);
+        // Out of range or nonsense.
+        assert_eq!(
+            configured_port(&serde_json::json!({ "port": 0 })),
+            DEFAULT_PORT
+        );
+        assert_eq!(
+            configured_port(&serde_json::json!({ "port": 70000 })),
+            DEFAULT_PORT
+        );
+        assert_eq!(
+            configured_port(&serde_json::json!({ "port": -1 })),
+            DEFAULT_PORT
+        );
+        assert_eq!(
+            configured_port(&serde_json::json!({ "port": "abc" })),
+            DEFAULT_PORT
+        );
+        assert_eq!(
+            configured_port(&serde_json::json!({ "port": "  " })),
+            DEFAULT_PORT
+        );
     }
 
     #[test]
@@ -2161,11 +2617,11 @@ mod tests {
 
     #[test]
     fn blank_api_key_means_no_auth() {
-        assert_eq!(api_key(&serde_json::json!({})), None);
-        assert_eq!(api_key(&serde_json::json!({ "apiKey": "" })), None);
-        assert_eq!(api_key(&serde_json::json!({ "apiKey": "  " })), None);
+        assert_eq!(settings_api_key(&serde_json::json!({})), None);
+        assert_eq!(settings_api_key(&serde_json::json!({ "apiKey": "" })), None);
+        assert_eq!(settings_api_key(&serde_json::json!({ "apiKey": "  " })), None);
         assert_eq!(
-            api_key(&serde_json::json!({ "apiKey": " secret " })).as_deref(),
+            settings_api_key(&serde_json::json!({ "apiKey": " secret " })).as_deref(),
             Some("secret")
         );
     }

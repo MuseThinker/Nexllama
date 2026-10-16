@@ -4,7 +4,7 @@
     "title": "Nexllama daemon",
     "version": "0.1.0",
     "summary": "Local llama.cpp inference over HTTP",
-    "description": "Serves chat, embeddings and reranking for GGUF models loaded on this machine.\n\nTwo request surfaces are available and both are first-class:\n\n* **OpenAI** (`/v1/...`) — the shape most tools and SDKs already speak.\n* **Ollama** (`/api/...`) — the short paths and NDJSON streaming Ollama uses.\n\n`GET /` returns a banner, `GET /v1` and `GET /api/tags` list the loaded models, so pointing a client at the base URL is enough to see what is there.\n\n**Every `/v1` and `/api` route requires `model` explicitly.** One machine can hold a chat model, an embedder and a reranker at once, and guessing which one a request meant turns a typo into the wrong model answering. Omit it and the error names what is loaded. The desktop chat panel is the only place with a remembered default.\n\nIf the daemon was started with `--api-key`, every route below except `/`, `/health`, `/api/version`, `/openapi.json` and `/docs` requires `Authorization: Bearer <key>`."
+    "description": "Serves chat, embeddings and reranking for GGUF models loaded on this machine.\n\nTwo request surfaces are available and both are first-class:\n\n* **OpenAI** (`/v1/...`) — the shape most tools and SDKs already speak.\n* **Ollama** (`/api/...`) — the short paths and NDJSON streaming Ollama uses.\n\n`GET /` returns a banner, `GET /v1` and `GET /api/tags` list the loaded models, so pointing a client at the base URL is enough to see what is there.\n\n**`model` selects among the models of the route's kind.** One machine can hold a chat model, an embedder and a reranker at once. A `model` that matches nothing falls back to the only model of that kind, so swapping the loaded model in the desktop app does not break a client still holding the old name; when more than one model of the kind is loaded, the name is required and the error lists what is there. The desktop chat panel is the only place with a remembered default.\n\nIf the daemon was started with `--api-key`, every route below except `/`, `/health`, `/api/version`, `/openapi.json` and `/docs` requires `Authorization: Bearer <key>`."
   },
   "servers": [{ "url": "http://127.0.0.1:15656", "description": "local daemon" }],
   "tags": [
@@ -133,7 +133,8 @@
           "max_tokens": { "type": "integer" },
           "speculative": { "type": "boolean", "description": "n-gram speculative decoding; exact, but only pays off on repetitive text." },
           "ngram_n": { "type": "integer" },
-          "ngram_m": { "type": "integer" }
+          "ngram_m": { "type": "integer" },
+          "thinking": { "type": "boolean", "description": "Let a reasoning model think before answering. Omit to use the model's own default; a template that does not support the flag ignores it." }
         },
         "required": ["messages"]
       },
@@ -323,7 +324,7 @@
           "name": { "type": "string", "description": "Alias to load it under; defaults to the file stem." },
           "n_gpu_layers": { "type": "integer" },
           "main_gpu": { "type": "integer" },
-          "n_ctx": { "type": "integer" },
+          "n_ctx": { "type": "integer", "description": "Context size. 0 (or omitted) sizes it automatically: the largest that fits this machine, capped at the model's training length." },
           "n_batch": { "type": "integer" },
           "n_ubatch": { "type": "integer" },
           "threads": { "type": "integer" },
@@ -337,6 +338,7 @@
           "rope_freq_scale": { "type": "number" },
           "load_mtp": { "type": "boolean" },
           "mtp_n_max": { "type": "integer", "description": "Tokens the MTP head may propose per round; 0 means use the engine default. Forces load_mtp." },
+          "thinking": { "type": "boolean", "description": "Default reasoning mode for this model: false renders every prompt with thinking off, true (or omitted) leaves it on. A chat request may still override it." },
           "strict_fit": { "type": "boolean", "description": "Refuse the load when Smart Fit says the model does not fit, rather than only warning." },
           "mmproj": { "type": "string", "description": "Multimodal projector, for image input." },
           "draft_model": { "type": "string", "description": "A separate draft checkpoint — DFlash or EAGLE-3 — that proposes continuations for the target to verify. The other half of speculative decoding from `load_mtp`, which uses heads bundled in the target." },
@@ -352,7 +354,7 @@
         "description": "Either `model` (a path on disk) or `size_bytes` (a not-yet-downloaded file).",
         "properties": {
           "model": { "type": "string", "description": "Path to a GGUF on disk." },
-          "n_ctx": { "type": "integer", "description": "Context to measure against; defaults to 4096." },
+          "n_ctx": { "type": "integer", "description": "Context to measure against; 0 (the default) sizes it automatically." },
           "size_bytes": { "type": "integer", "description": "Size of a file that is not on disk yet, for pre-download checks." }
         }
       },
@@ -502,6 +504,18 @@
         "responses": { "200": { "description": "status", "content": { "application/json": { "schema": { "type": "object" } } } } }
       }
     },
+    "/admin/models": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "The models folder, listed the way the desktop library lists it",
+        "description": "Reads `--models-dir` with the same rules the app's library uses: a folder of weights with its projector and drafter is one model, unrelated files are one each. Answers `{\"dir\": null, \"models\": []}` when no folder was configured.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "the library", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "500": { "description": "the folder could not be read", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
     "/admin/load": {
       "post": {
         "tags": ["admin"],
@@ -534,6 +548,30 @@
           "200": { "description": "report", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FitReport" } } } },
           "400": { "description": "bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
+      }
+    },
+    "/admin/providers": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "List configured cloud providers (never their keys)",
+        "security": [{ "bearerAuth": [] }],
+        "responses": { "200": { "description": "providers", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "post": {
+        "tags": ["admin"],
+        "summary": "Replace the configured cloud providers",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "array", "items": { "type": "object" } }, "example": [{ "id": "deepseek", "name": "DeepSeek", "base_url": "https://api.deepseek.com/v1", "api_key": "sk-...", "models": ["deepseek-chat"] }] } } },
+        "responses": { "200": { "description": "updated", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/admin/providers/test": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Ask a provider what it serves, before saving it",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" }, "example": { "base_url": "https://api.deepseek.com/v1", "api_key": "sk-..." } } } },
+        "responses": { "200": { "description": "models", "content": { "application/json": { "schema": { "type": "object" } } } } }
       }
     },
     "/v1/chat/completions": {

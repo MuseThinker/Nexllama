@@ -6,9 +6,9 @@ license.workspace = true
 
 [dependencies]
 gguf-probe = { path = "../gguf-probe" }
-llama-cpp-4 = { version = "0.7.0", default-features = false, features = ["openmp", "mtmd", "dynamic-link"] }
+llama-cpp-4 = { version = "0.8.0", default-features = false, features = ["openmp", "mtmd", "dynamic-link"] }
 # Needed for the rank-pooling output, which the safe wrapper sizes incorrectly.
-llama-cpp-sys-4 = "0.7.0"
+llama-cpp-sys-4 = "0.8.0"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -31,3 +31,7 @@ path = "examples/bench.rs"
 [[example]]
 name = "prefix_check"
 path = "examples/prefix_check.rs"
+
+[[example]]
+name = "turns"
+path = "examples/turns.rs"

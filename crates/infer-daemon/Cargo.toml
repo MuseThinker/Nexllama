@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 infer-core = { path = "../infer-core" }
+model-index = { path = "../model-index" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -19,7 +20,11 @@ tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
 tokio-stream = "0.1"
-tower-http = { version = "0.6", features = ["cors", "limit"] }
+tower-http = { version = "0.6", features = ["cors", "limit", "fs"] }
+# Proxying cloud providers on the same port as the local engine. rustls so the
+# container needs no system CA bundle wired up. `http2` for multiplexed upstream
+# calls; system-proxy stays off so a host proxy does not slow a direct provider.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

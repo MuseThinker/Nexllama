@@ -13,6 +13,14 @@ pub struct ChatMsg {
     /// of base64 back out.
     #[serde(default, skip_serializing)]
     pub images: Vec<Vec<u8>>,
+    /// The tool calls an assistant turn requested, as the OpenAI `tool_calls`
+    /// array. Passed back to the chat template so the model sees what it asked
+    /// for before the results arrive.
+    #[serde(default)]
+    pub tool_calls: Option<serde_json::Value>,
+    /// For a `tool` result: the id of the call it answers.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMsg {
@@ -21,11 +29,23 @@ impl ChatMsg {
             role: role.into(),
             content: content.into(),
             images: Vec::new(),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
     pub fn with_images(mut self, images: Vec<Vec<u8>>) -> Self {
         self.images = images;
+        self
+    }
+
+    pub fn with_tool_calls(mut self, calls: serde_json::Value) -> Self {
+        self.tool_calls = Some(calls);
+        self
+    }
+
+    pub fn with_tool_call_id(mut self, id: impl Into<String>) -> Self {
+        self.tool_call_id = Some(id.into());
         self
     }
 
@@ -54,6 +74,22 @@ pub struct GenStats {
     /// "length"` — a truncated reply and a finished one look identical from
     /// the text alone.
     pub hit_token_cap: bool,
+    /// Tool calls the model asked for, as an OpenAI `tool_calls` array.
+    ///
+    /// Set only when the request declared tools and the reply parsed into
+    /// calls. `None` means the model answered in plain text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    /// The reply's answer text with any tool-call markup and reasoning removed.
+    ///
+    /// Filled only for requests that declared tools; those hold their reply back
+    /// for parsing, so this is also what was emitted to the caller. Not part of
+    /// the serialised stats — it is the caller's own content, not a measurement.
+    #[serde(skip)]
+    pub parsed_content: Option<String>,
+    /// The reasoning the model produced, split out when tools were declared.
+    #[serde(skip)]
+    pub reasoning_content: Option<String>,
 }
 
 impl GenStats {

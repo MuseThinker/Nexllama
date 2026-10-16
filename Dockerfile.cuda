@@ -38,8 +38,10 @@ RUN if [ -n "$CRATES_MIRROR" ]; then \
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates/infer-core ./crates/infer-core
-COPY crates/infer-daemon ./crates/infer-daemon
+# Every workspace member: the root `Cargo.toml` names them all, so a manifest
+# that was not copied fails the build before anything is compiled. `crates/app`
+# is the desktop app's own workspace and is excluded in `.dockerignore`.
+COPY crates ./crates
 RUN cargo build --release -p infer-daemon --features "$FEATURES"
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime

@@ -21,3 +21,16 @@ export async function pickFolder(title) {
   const selected = await open({ directory: true, multiple: false, title });
   return selected ?? null;
 }
+
+/// Open a URL in the system browser. A webview `<a target="_blank">` does not
+/// leave the app, so this goes through the opener plugin on the desktop and
+/// falls back to a new tab in the browser dev server.
+export async function openExternal(url) {
+  if (!url) return;
+  if (!hasTauri) {
+    window.open(url, '_blank', 'noopener');
+    return;
+  }
+  const { openUrl } = await import('@tauri-apps/plugin-opener');
+  await openUrl(url);
+}

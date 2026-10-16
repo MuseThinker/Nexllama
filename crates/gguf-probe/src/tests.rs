@@ -61,6 +61,7 @@ enum KvValue {
 
 const STRING_TAG: u32 = 8;
 const ARRAY_TAG: u32 = 9;
+const U32_TAG: u32 = 4;
 
 fn read(bytes: Vec<u8>) -> Result<Probe> {
     read_header(Cursor::new(bytes))
@@ -367,4 +368,74 @@ fn an_ordinary_model_has_no_mtp() {
     ))
     .unwrap();
     assert!(!p.has_mtp());
+}
+
+/// `<arch>.context_length` is the trained context, and it arrives as either a
+/// u32 or a u64 depending on the converter — both have to be read.
+#[test]
+fn the_training_context_is_read_from_the_architecture_key() {
+    const U32_TAG: u32 = 4;
+    const U64_TAG: u32 = 10;
+    let p = read(gguf(vec![
+        ("general.architecture", STRING_TAG, KvValue::String("qwen2")),
+        ("qwen2.context_length", U32_TAG, KvValue::U32(32768)),
+    ]))
+    .unwrap();
+    assert_eq!(p.context_length, Some(32768));
+
+    let p = read(gguf(vec![
+        ("general.architecture", STRING_TAG, KvValue::String("llama")),
+        ("llama.context_length", U64_TAG, KvValue::U64(131072)),
+    ]))
+    .unwrap();
+    assert_eq!(p.context_length, Some(131072));
+
+    // A header that never states one reports nothing rather than a guess.
+    let p = read(gguf(vec![(
+        "general.architecture",
+        STRING_TAG,
+        KvValue::String("qwen2"),
+    )]))
+    .unwrap();
+    assert_eq!(p.context_length, None);
+}
+
+/// The KV cache is what a context costs, and what decides whether it fits. The
+/// shape comes from the header, and a header that does not state it says so
+/// rather than reporting zero — a caller that read zero as "free" would size a
+/// cache it cannot hold.
+#[test]
+fn the_kv_cache_shape_is_read_when_the_header_states_it() {
+    // Grouped-query attention: 8 key/value heads against 40 attention heads, an
+    // explicit key width, 48 layers. K and V, two bytes each.
+    let p = read(gguf(vec![
+        ("general.architecture", STRING_TAG, KvValue::String("qwen3")),
+        ("qwen3.block_count", U32_TAG, KvValue::U32(48)),
+        ("qwen3.attention.head_count", U32_TAG, KvValue::U32(40)),
+        ("qwen3.attention.head_count_kv", U32_TAG, KvValue::U32(8)),
+        ("qwen3.attention.key_length", U32_TAG, KvValue::U32(128)),
+    ]))
+    .unwrap();
+    assert_eq!(p.kv_bytes_per_token(), Some(48 * 8 * 128 * 2 * 2));
+
+    // No GQA: the attention head count *is* the key/value head count, and the
+    // head width is the embedding width divided by it — what llama.cpp derives
+    // when the header leaves `key_length` out.
+    let p = read(gguf(vec![
+        ("general.architecture", STRING_TAG, KvValue::String("llama")),
+        ("llama.block_count", U32_TAG, KvValue::U32(32)),
+        ("llama.attention.head_count", U32_TAG, KvValue::U32(32)),
+        ("llama.embedding_length", U32_TAG, KvValue::U32(4096)),
+    ]))
+    .unwrap();
+    assert_eq!(p.kv_bytes_per_token(), Some(32 * 32 * 128 * 2 * 2));
+
+    // An encoder has no KV cache to size, and a header that says nothing
+    // answers nothing.
+    let p = read(gguf(vec![
+        ("general.architecture", STRING_TAG, KvValue::String("bert")),
+        ("bert.embedding_length", U32_TAG, KvValue::U32(768)),
+    ]))
+    .unwrap();
+    assert_eq!(p.kv_bytes_per_token(), None);
 }

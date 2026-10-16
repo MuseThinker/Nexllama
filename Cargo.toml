@@ -5,6 +5,7 @@ members = [
     "crates/infer-daemon",
     "crates/infer-hub",
     "crates/gguf-probe",
+    "crates/model-index",
 ]
 exclude = [
     "crates/app",
@@ -13,7 +14,7 @@ exclude = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 authors = ["Nexllama contributors"]
 
 [workspace.dependencies]
@@ -28,3 +29,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+# The registry's bindgen 0.73.2 advertises `syn = ">=2, <4"` but does not
+# compile against syn 3.x (its `ParseQuote for syn::file::File` impl is gone),
+# and the rest of the graph hard-requires syn 3. Pin bindgen to the vendored
+# copy whose syn requirement is narrowed to 2.x so the two can coexist.
+[patch.crates-io]
+bindgen = { path = "vendor/bindgen" }

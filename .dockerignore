@@ -1,6 +1,5 @@
 target/
 models/
-frontend/
 crates/app/
 scripts/
 .git/
@@ -8,3 +7,10 @@ scripts/
 **/*.log
 Dockerfile*
 docker-compose*.yml
+
+# The web image builds the UI, so the frontend's sources must reach the build
+# context — but not what a local `npm install` already left behind. Sending
+# node_modules means a Windows-built tree into a Linux `npm ci` and a layer that
+# no longer matches the lockfile.
+frontend/node_modules/
+frontend/dist/

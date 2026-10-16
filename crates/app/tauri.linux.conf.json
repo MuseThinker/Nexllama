@@ -1,10 +1,33 @@
 {
   "bundle": {
-    "targets": ["deb", "appimage"],
-    "icon": ["icons/icon.png"],
+    "targets": ["deb", "rpm", "appimage"],
+    "icon": [
+      "icons/icon.png",
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png"
+    ],
     "linux": {
       "deb": {
-        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "librsvg2-2",
+          "libayatana-appindicator3-1",
+          "libgomp1",
+          "libssl3 | libssl3t64"
+        ]
+      },
+      "rpm": {
+        "depends": [
+          "webkit2gtk4.1",
+          "gtk3",
+          "librsvg2",
+          "libayatana-appindicator-gtk3",
+          "libgomp",
+          "openssl-libs"
+        ]
       }
     }
   }

@@ -121,6 +121,11 @@ pub struct Probe {
     pub architecture: Option<String>,
     /// `general.name`, free text, only ever used as a hint.
     pub name: Option<String>,
+    /// `<arch>.context_length`, the context the model was trained for.
+    ///
+    /// The ceiling for an automatic context: asking for more than this spends KV
+    /// cache to extend past what the model saw in training.
+    pub context_length: Option<u64>,
     /// `rerank.head_count` when present; a ranker writes one, a plain encoder does not.
     pub rerank_heads: Option<u64>,
     /// `pooling_type`, numbered as `llama_pooling_type`. `4` is rank, which is how
@@ -139,6 +144,58 @@ pub struct Probe {
     /// Whether any tensor is named `…nextn…`, the fallback signal for a GGUF that
     /// carries the head without the key.
     pub nextn_tensors: bool,
+    /// `<arch>.block_count`, the number of transformer layers.
+    pub block_count: Option<u64>,
+    /// `<arch>.attention.head_count`, the attention heads.
+    pub head_count: Option<u64>,
+    /// `<arch>.attention.head_count_kv`, the key/value heads.
+    ///
+    /// Absent on models without grouped-query attention, where the count is the
+    /// attention head count.
+    pub head_count_kv: Option<u64>,
+    /// `<arch>.attention.key_length`, the width of one key (head dimension).
+    ///
+    /// Absent on most models, which leave it to be derived from the embedding
+    /// width and the head count.
+    pub key_length: Option<u64>,
+    /// `<arch>.embedding_length`, the model's width.
+    pub embedding_length: Option<u64>,
+}
+
+impl Probe {
+    /// Bytes of KV cache one token of one sequence costs, when the header states
+    /// the shape.
+    ///
+    /// This is what decides whether a context *fits*: the cache is the part of a
+    /// load that scales with the context, and a model whose weights already fill
+    /// a card has nothing left for it. Counting it beats guessing from the card's
+    /// size, which is what let a 27B be handed a 32k cache on a 24 GiB card and
+    /// spill onto the CPU.
+    ///
+    /// Assumes K and V at two bytes each, which is llama.cpp's default cache
+    /// type. `None` when the header does not say enough — an encoder, or a
+    /// model whose keys this reader does not know — and the caller falls back to
+    /// its own estimate rather than treating the answer as zero.
+    pub fn kv_bytes_per_token(&self) -> Option<u64> {
+        let layers = self.block_count.filter(|n| *n > 0)?;
+        let kv_heads = self
+            .head_count_kv
+            .or(self.head_count)
+            .filter(|n| *n > 0)?;
+        let head_dim = match self.key_length.filter(|n| *n > 0) {
+            Some(n) => n,
+            None => {
+                let embd = self.embedding_length.filter(|n| *n > 0)?;
+                let heads = self.head_count.filter(|n| *n > 0)?;
+                embd / heads
+            }
+        };
+        if head_dim == 0 {
+            return None;
+        }
+        // K and V, two bytes per element each.
+        Some(layers * kv_heads * head_dim * 2 * 2)
+    }
 }
 
 impl Probe {
@@ -260,11 +317,17 @@ fn read_header<R: BufRead + Seek>(mut reader: R) -> Result<Probe, ProbeError> {
     let mut found = Probe {
         architecture: None,
         name: None,
+        context_length: None,
         rerank_heads: None,
         pooling_type: None,
         cls_head: false,
         nextn_layers: None,
         nextn_tensors: false,
+        block_count: None,
+        head_count: None,
+        head_count_kv: None,
+        key_length: None,
+        embedding_length: None,
     };
 
     for _ in 0..kv_count {
@@ -277,6 +340,12 @@ fn read_header<R: BufRead + Seek>(mut reader: R) -> Result<Probe, ProbeError> {
             }
             ("general.name", GgufType::String) => {
                 found.name = Some(read_string(&mut reader)?);
+            }
+            (key, GgufType::U32) if key.ends_with(".context_length") => {
+                found.context_length = Some(u64::from(read_u32(&mut reader)?));
+            }
+            (key, GgufType::U64) if key.ends_with(".context_length") => {
+                found.context_length = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));
             }
             ("rerank.head_count", GgufType::U32) => {
                 found.rerank_heads = Some(u64::from(read_u32(&mut reader)?));
@@ -296,6 +365,38 @@ fn read_header<R: BufRead + Seek>(mut reader: R) -> Result<Probe, ProbeError> {
             }
             (key, GgufType::U64) if key.ends_with(".nextn_predict_layers") => {
                 found.nextn_layers = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));
+            }
+            // The shape of the KV cache, for callers that have to know whether a
+            // context fits. Same suffix trick: the architecture is the prefix.
+            (key, GgufType::U32) if key.ends_with(".block_count") => {
+                found.block_count = Some(u64::from(read_u32(&mut reader)?));
+            }
+            (key, GgufType::U64) if key.ends_with(".block_count") => {
+                found.block_count = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));
+            }
+            (key, GgufType::U32) if key.ends_with(".attention.head_count_kv") => {
+                found.head_count_kv = Some(u64::from(read_u32(&mut reader)?));
+            }
+            (key, GgufType::U64) if key.ends_with(".attention.head_count_kv") => {
+                found.head_count_kv = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));
+            }
+            (key, GgufType::U32) if key.ends_with(".attention.head_count") => {
+                found.head_count = Some(u64::from(read_u32(&mut reader)?));
+            }
+            (key, GgufType::U64) if key.ends_with(".attention.head_count") => {
+                found.head_count = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));
+            }
+            (key, GgufType::U32) if key.ends_with(".attention.key_length") => {
+                found.key_length = Some(u64::from(read_u32(&mut reader)?));
+            }
+            (key, GgufType::U64) if key.ends_with(".attention.key_length") => {
+                found.key_length = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));
+            }
+            (key, GgufType::U32) if key.ends_with(".embedding_length") => {
+                found.embedding_length = Some(u64::from(read_u32(&mut reader)?));
+            }
+            (key, GgufType::U64) if key.ends_with(".embedding_length") => {
+                found.embedding_length = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));
             }
             (_, value_type) => skip_value(&mut reader, value_type)?,
         }

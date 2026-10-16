@@ -1,4 +1,6 @@
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -6,23 +8,36 @@ use serde::Deserialize;
 use crate::download::{download_file, ProgressEvent};
 use crate::error::{HubError, Result};
 
-pub const DEFAULT_ENDPOINT: &str = "https://hf-mirror.com";
+/// The upstream Hub. Preferred wherever it can be reached: it is the source of
+/// truth, and everything else is a courtesy for networks that cannot reach it.
+pub const UPSTREAM_ENDPOINT: &str = "https://huggingface.co";
+
+/// A mirror of the Hub, used when the upstream is unreachable from this machine.
+pub const MIRROR_ENDPOINT: &str = "https://hf-mirror.com";
+
+/// The endpoint to use when nothing else decides it.
+///
+/// Kept as a name rather than a value because the right answer depends on the
+/// machine — see [`resolve_endpoint`].
+pub const DEFAULT_ENDPOINT: &str = UPSTREAM_ENDPOINT;
 
 /// The authors whose GGUFs are worth reaching for first.
 ///
 /// Quantising well is a craft — a bad quant costs accuracy that no amount of
-/// context or sampling gets back — and three names cover nearly everything
-/// worth running locally:
+/// context or sampling gets back — and four names cover nearly everything worth
+/// running locally:
 ///
 /// * **bartowski** — the broadest catalogue, one model at many sizes;
 /// * **Unsloth** — dynamic quants (`UD` series) and the releases that carry
 ///   the extra heads MTP drafting needs;
 /// * **z-lab** — the DFlash draft models, which is how a dense model with no
-///   MTP head gets speculative decoding at all.
+///   MTP head gets speculative decoding at all;
+/// * **ggml-org** — the project's own reference quants for models it ships
+///   support for (gpt-oss and friends).
 ///
 /// Nothing is restricted to these: they are what the download page offers
 /// first, and searching still covers the whole Hub.
-pub const TRUSTED_AUTHORS: [&str; 3] = ["bartowski", "Unsloth", "z-lab"];
+pub const TRUSTED_AUTHORS: [&str; 4] = ["bartowski", "Unsloth", "z-lab", "ggml-org"];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GgufFile {
@@ -43,11 +58,61 @@ pub struct HubClient {
     token: Option<String>,
 }
 
+/// Which Hub this machine should talk to, decided once per process.
+///
+/// `HF_ENDPOINT` wins outright, so a user with a mirror of their own needs no
+/// code change. Otherwise the only question worth asking is whether the
+/// upstream can be reached from here. Shipping an IP-to-country table instead
+/// would be stale the moment it was written, and wrong behind any VPN or proxy;
+/// a connection attempt answers the case that actually occurs — a network where
+/// the upstream does not answer and the mirror does — without asking a third
+/// party where the user is.
+fn resolve_endpoint() -> String {
+    if let Ok(value) = std::env::var("HF_ENDPOINT") {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    static RESOLVED: OnceLock<String> = OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            let endpoint = if upstream_reachable() {
+                UPSTREAM_ENDPOINT
+            } else {
+                MIRROR_ENDPOINT
+            };
+            tracing::info!(endpoint, "huggingface endpoint selected");
+            endpoint.to_string()
+        })
+        .clone()
+}
+
+/// Whether a connection to the upstream completes inside the timeout.
+///
+/// A TCP connect is the cheapest honest signal, and it needs no TLS handshake
+/// and no third-party lookup. It is also the right failure mode: where the
+/// upstream is blocked, the name usually does not resolve or the connection is
+/// dropped, and both cases answer "use the mirror".
+fn upstream_reachable() -> bool {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+    match (UPSTREAM_HOST, 443u16).to_socket_addrs() {
+        Ok(addresses) => addresses
+            .into_iter()
+            .any(|address| TcpStream::connect_timeout(&address, PROBE_TIMEOUT).is_ok()),
+        Err(e) => {
+            tracing::debug!(error = %e, "huggingface: cannot resolve the upstream host");
+            false
+        }
+    }
+}
+
+/// Host of [`UPSTREAM_ENDPOINT`], kept beside it so the two cannot drift apart.
+const UPSTREAM_HOST: &str = "huggingface.co";
+
 impl HubClient {
     pub fn new() -> Self {
-        let endpoint =
-            std::env::var("HF_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
-        Self::with_endpoint(endpoint)
+        Self::with_endpoint(resolve_endpoint())
     }
 
     pub fn with_endpoint(endpoint: impl Into<String>) -> Self {
@@ -209,9 +274,7 @@ impl HubClient {
         // A `#` or `?` in a name would otherwise be read as a fragment or query,
         // and the download would come back truncated — or 404, with no hint why.
         // Encoded one segment at a time so the separators stay separators.
-        let encode_path = |s: &str| {
-            s.split('/').map(url_encode).collect::<Vec<_>>().join("/")
-        };
+        let encode_path = |s: &str| s.split('/').map(url_encode).collect::<Vec<_>>().join("/");
         let url = format!(
             "{}/{}/resolve/main/{}",
             self.endpoint,

@@ -1,0 +1,9 @@
+[package]
+name = "model-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gguf-probe = { path = "../gguf-probe" }
+serde_json.workspace = true

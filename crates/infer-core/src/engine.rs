@@ -86,7 +86,9 @@ pub struct LoadConfig {
     pub n_batch: u32,
     /// Physical (micro) batch size.
     pub n_ubatch: u32,
-    /// CPU threads for generation. None = auto (physical cores).
+    /// CPU threads for generation. None = llama.cpp's default (4). Raising it is
+    /// a regression on this GPU-bound path, where extra threads only add host
+    /// contention.
     pub n_threads: Option<i32>,
     /// CPU threads for prompt processing. None = same as n_threads.
     pub n_threads_batch: Option<i32>,
@@ -147,11 +149,13 @@ pub struct LoadConfig {
 
     /// Reuse the KV state of a prefix this model has already encoded.
     ///
-    /// Off by default, and deliberately so: this is a stateful optimisation, and
-    /// getting it wrong does not raise an error, it produces a reply drawn from
-    /// the wrong point in the conversation. Turn it on once it has been measured
-    /// against the model actually being served.
-    #[serde(default)]
+    /// On by default. It is a stateful optimisation, so a bug would not raise an
+    /// error — it would answer from the wrong point in the conversation. That is
+    /// why `prefix_check` verifies the restored state against a cache-off run,
+    /// and why it is switched off automatically whenever a drafter (an MTP head
+    /// or a side-mounted draft) is loaded, since those keep position state of
+    /// their own.
+    #[serde(default = "default_true")]
     pub prefix_cache: bool,
     /// How many prompts to remember.
     #[serde(default)]
@@ -213,8 +217,8 @@ impl LoadConfig {
             lora: Vec::new(),
             ngram_cache: None,
             mmproj: None,
-            // Opt-in: see the note on `prefix_cache`.
-            prefix_cache: false,
+            // On by default; see the note on `prefix_cache`.
+            prefix_cache: true,
             prefix_cache_entries: 4,
             prefix_cache_max_mb: 512,
             adaptive_draft: true,
@@ -274,6 +278,23 @@ impl SpecGate {
     /// Whether drafting should be attempted for the next reply.
     fn allows(&self) -> bool {
         !self.disabled
+    }
+
+    /// Draft length to use, scaled by the acceptance measured so far.
+    ///
+    /// Two drafts is the measured sweet spot on both a dense and a MoE target:
+    /// the accepted-token count barely moves between one and two, so the second
+    /// draft only has to survive its own verification to pay off, while a third
+    /// is rejected often enough to lose. Under a poor measured acceptance even
+    /// the second draft is not worth its verification pass. `max` is the
+    /// configured budget — also the KV-snapshot count the contexts were built
+    /// with — so the result never exceeds it.
+    fn draft_len(&self, max: u32) -> u32 {
+        let capped = max.clamp(1, 2);
+        match self.accept {
+            Some(a) if a < 0.5 => 1,
+            _ => capped,
+        }
     }
 
     /// Fold one reply's drafting results into the decision.
@@ -680,6 +701,14 @@ pub struct EngineInfo {
     /// Capability, not state: `load_mtp` says whether it was loaded.
     #[serde(default)]
     pub mtp: bool,
+    /// Why a requested drafter is not in play, when it failed to load.
+    ///
+    /// A drafter that will not load — an MTP head llama.cpp cannot read, a
+    /// checkpoint that does not match the target — is not worth failing the
+    /// whole model over. The weights are fine, so they are served without it and
+    /// the reason is reported here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_error: Option<String>,
 }
 
 /// Progress emitted while a model is loading.
@@ -975,6 +1004,13 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
         .map(gguf_probe::Probe::classify)
         .unwrap_or(gguf_probe::ModelClass::Llm);
 
+    // The model's chat templates, parsed once and kept for the worker's life —
+    // parsing them is not free. They are what lets a request turn reasoning on or
+    // off (`enable_thinking`), which the legacy apply path cannot express. `None`
+    // means the model ships no usable template, and every prompt falls back to
+    // the legacy path unchanged.
+    let templates = ChatTemplates::from_model(&model, None).ok();
+
     // Rejecting a draft walks the cache backwards one token at a time, and a
     // hybrid or recurrent cache only gives those rows back if it was built with
     // a snapshot per drafted token. Whichever drafter this load asked for
@@ -1012,6 +1048,14 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
             .with_n_rs_seq(rs_seq);
         if class != gguf_probe::ModelClass::Llm {
             ctx_params = ctx_params.with_embeddings(true);
+            // An encoder is fed a whole sequence at once, and llama.cpp
+            // asserts `n_ubatch >= n_tokens` rather than splitting one. With the
+            // generation defaults (512) a 512-token document is fine and a
+            // 513-token one kills the process with an assertion — which reads to
+            // the caller as the service simply vanishing. The micro-batch is
+            // raised to the context instead, so any input the context accepts
+            // can be encoded.
+            ctx_params = ctx_params.with_n_ubatch(crate::encoder_ubatch(cfg.n_ubatch, cfg.n_ctx));
         }
         if let Some(p) = pooling {
             ctx_params = ctx_params.with_pooling_type(p);
@@ -1122,6 +1166,9 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
     // its own model and context — built here rather than per request, because a
     // second KV cache is not something to rebuild for every reply.
     let draft_kind = cfg.draft_model.as_deref().map(draft_kind);
+    // Set when a requested drafter cannot be brought up. The model still loads;
+    // this is reported so the caller knows drafting is off and why.
+    let mut draft_error: Option<String> = None;
     let draft_model = match cfg.draft_model.as_ref() {
         Some(path) => {
             if class != gguf_probe::ModelClass::Llm {
@@ -1156,8 +1203,11 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
             match LlamaModel::load_from_file(backend, path, &params) {
                 Ok(m) => Some(m),
                 Err(e) => {
-                    let _ = ready.send(LoadEvent::Error(format!("draft model load: {e:?}")));
-                    return;
+                    tracing::warn!(error = ?e, "draft model failed to load; loading without it");
+                    draft_error = Some(format!(
+                        "the draft model could not be loaded, so speculative decoding is off ({e})"
+                    ));
+                    None
                 }
             }
         }
@@ -1197,8 +1247,12 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
                     Some(c)
                 }
                 Err(e) => {
-                    let _ = ready.send(LoadEvent::Error(format!("draft context: {e:?}")));
-                    return;
+                    tracing::warn!(error = ?e, "draft context failed; loading without a drafter");
+                    draft_error = Some(format!(
+                        "the draft model loaded but its context could not be created, so \
+                         speculative decoding is off ({e:?})"
+                    ));
+                    None
                 }
             }
         }
@@ -1237,11 +1291,13 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
 
     let mut cache = DraftCache::load(cfg.ngram_cache.clone());
 
-    // Prefix reuse stays off whenever anything is drafting. A draft model and an
-    // MTP head each keep position state alongside the target's, and a restored
-    // target state would leave the two disagreeing about where in the
-    // conversation they are — which verification would then reject.
-    let mut prefix = if cfg.prefix_cache && mtp_n_max == 0 && cfg.draft_model.is_none() {
+    // Prefix reuse. A drafting turn keeps its own draft-side cache alongside the
+    // target's, and the two have to move together: `PromptCache` therefore
+    // remembers both halves of a drafting snapshot and only ever hands a
+    // drafting snapshot back to a drafting turn (and a plain one to a plain
+    // turn). Restoring one without the other is what used to make this whole
+    // feature switch off the moment a drafter was loaded.
+    let mut prefix = if cfg.prefix_cache {
         PromptCache::new(
             cfg.prefix_cache_entries.max(1) as usize,
             cfg.prefix_cache_max_mb as usize * 1024 * 1024,
@@ -1249,6 +1305,16 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
     } else {
         PromptCache::disabled()
     };
+
+    // The ids currently resident in the target cache, reply included. The next
+    // turn extends this sequence rather than rebuilding it whenever its prompt
+    // begins with exactly these — which is the shape every chat turn takes. It
+    // is the cheap half of prefix reuse: nothing is copied to keep it, which is
+    // what makes it work on a hybrid model whose serialised state is enormous.
+    // `live_draft` says whether the draft cache holds those same positions too,
+    // so a drafting turn never resumes a prefix a plain turn left behind.
+    let mut live: Vec<i32> = Vec::new();
+    let mut live_draft = false;
 
     let mut spec = if cfg.adaptive_draft {
         SpecGate::enabled(cfg.accept_floor as f64)
@@ -1289,6 +1355,65 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
         None => None,
     };
 
+    // llama.cpp builds contexts with warmup disabled and leaves the run to the
+    // caller (`llama_set_warmup` is deprecated). Without it the first real
+    // decode pays for CUDA graph capture and scratch-buffer setup — the "first
+    // message hangs, later ones are instant" a fresh load shows. Warm here, on a
+    // throwaway batch, so that cost lands on Load rather than the first reply.
+    //
+    // Generation models only. An encoder has no decode path at all — asking one
+    // to decode is what turned a load of a 0.6 GB embedding model into an
+    // assertion failure that took the whole process with it, which the caller
+    // saw as the service disappearing rather than as a bad warmup.
+    if class == gguf_probe::ModelClass::Llm {
+        let _ = ready.send(LoadEvent::Phase("warming up".into()));
+        if let Err(e) = warmup_context(&mut ctx, &model, cfg.n_batch.max(1) as usize) {
+            tracing::warn!("warmup decode failed, continuing without it: {e}");
+        }
+    }
+    // The draft and verification graphs are shapes of their own, captured on
+    // first use. One throwaway generation runs the exact path the first real
+    // reply will take, so a speculative model warms it too — with its own cache,
+    // prefix cache and gate, so the warmup leaves no trace in the real ones.
+    if class == gguf_probe::ModelClass::Llm && (mtp_n_max > 0 || draft_ctx.is_some()) {
+        let mut warm_cache = DraftCache::load(None);
+        let warm_drafting = AtomicBool::new(true);
+        let mut warm_prefix = PromptCache::disabled();
+        let mut warm_live: Vec<i32> = Vec::new();
+        let mut warm_live_draft = false;
+        let mut warm_spec = SpecGate::open();
+        let (reply, _rx) = mpsc::channel();
+        let msgs = [ChatMsg::new("user", "hi")];
+        let params = SamplerParams {
+            thinking: Some(false),
+            speculative: true,
+            max_tokens: 1,
+            ..SamplerParams::default()
+        };
+        if let Err(e) = run_generate(
+            &model,
+            &mut ctx,
+            &vision,
+            templates.as_ref(),
+            &msgs,
+            &params,
+            &reply,
+            &mut warm_cache,
+            &warm_drafting,
+            &mut warm_prefix,
+            &mut warm_live,
+            &mut warm_live_draft,
+            &mut warm_spec,
+            &mut mtp_draft_ctx,
+            mtp_n_max,
+            &mut draft_ctx,
+            draft_kind,
+            draft_n_max,
+        ) {
+            tracing::warn!("warmup generation failed, continuing without it: {e}");
+        }
+    }
+
     let info = EngineInfo {
         model_path: Some(cfg.model_path.clone()),
         description: model.desc(256).unwrap_or_default(),
@@ -1308,6 +1433,7 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
         n_embd: sequence_floats(&model, ctx.pooling_type()) as i32,
         pooling: format!("{:?}", ctx.pooling_type()).to_ascii_lowercase(),
         mtp: probed.as_ref().is_some_and(gguf_probe::Probe::has_mtp),
+        draft_error,
     };
     let _ = ready.send(LoadEvent::Ready(info));
 
@@ -1349,12 +1475,15 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
                     &model,
                     &mut ctx,
                     &vision,
+                    templates.as_ref(),
                     &msgs,
                     &params,
                     &reply,
                     &mut cache,
                     &drafting,
                     &mut prefix,
+                    &mut live,
+                    &mut live_draft,
                     &mut spec,
                     &mut mtp_draft_ctx,
                     mtp_n_max,
@@ -1531,12 +1660,15 @@ fn run_generate<'m, 'd>(
     model: &LlamaModel,
     ctx: &mut LlamaContext<'m>,
     vision: &Option<MtmdContext>,
+    templates: Option<&ChatTemplates>,
     msgs: &[ChatMsg],
     params: &SamplerParams,
     reply: &Sender<GenEvent>,
     cache: &mut DraftCache,
     drafting: &AtomicBool,
     prefix: &mut PromptCache,
+    live: &mut Vec<i32>,
+    live_draft: &mut bool,
     spec: &mut SpecGate,
     mtp_draft_ctx: &mut Option<LlamaContext<'m>>,
     // (see `run_generate`)
@@ -1548,7 +1680,8 @@ fn run_generate<'m, 'd>(
     let n_ctx = ctx.n_ctx() as usize;
     let n_batch = ctx.n_batch().max(1) as usize;
 
-    ctx.clear_kv_cache();
+    // The reply text is accumulated thread-locally; start this turn clean.
+    reset_emitted();
 
     // The draft heads work from the target's hidden states, and an image has
     // none of those. Rather than fail the request somebody attached a picture
@@ -1556,67 +1689,155 @@ fn run_generate<'m, 'd>(
     // draft this turn — the same answer, one pass per token.
     let images: usize = msgs.iter().map(ChatMsg::image_count).sum();
 
-    // Prefix reuse. A restored state stands for the first `start` tokens of this
-    // prompt, which encoding then skips — that skipping is the entire saving,
-    // since the wait before the first token is mostly re-encoding a
-    // conversation the model has already seen.
+    // Whether to draft at all. A gate that has measured drafting as not paying
+    // for itself closes here, before any draft context is touched.
+    let speculate = params.speculative && spec.allows();
+
+    // Which drafter this turn would actually use, resolved before the prefix
+    // lookup: a drafting turn has to put the draft side of a snapshot back too,
+    // so it may only match a snapshot that carries one.
+    let mtp_path = speculate && mtp_n_max > 0 && images == 0 && mtp_draft_ctx.is_some();
+    let side_path =
+        speculate && !mtp_path && images == 0 && draft_kind.is_some() && draft_ctx.is_some();
+    let need_draft = mtp_path || side_path;
+
+    // A DFlash/EAGLE side drafter keeps continuation state this binding cannot
+    // serialise, so a turn that would use one never resumes a prefix — it clears
+    // and encodes whole, exactly as it did before any of this existed.
+    let reuse_capable = !(side_path && draft_kind != Some(DraftKind::Mtp));
+
+    // Prefix reuse, in the shape that actually pays on a hybrid model. The usual
+    // prompt is the previous turn's prompt-plus-reply with one user message
+    // appended, and all of it is still in the cache — so leaving it there and
+    // encoding only the tail is the entire saving. Serialising that cache to
+    // copy it back costs *more* than re-encoding, because the recurrent state is
+    // the bulk of it, so the snapshot below is a fallback for a diverged prompt
+    // only and is paid for only when one occurs.
+    let had_live = !live.is_empty();
     let mut start = 0usize;
-    if prefix.is_enabled() && images == 0 {
-        if let Ok(tokens) = tokenize_text_prompt(model, msgs) {
+    let mut reuse = false;
+    let mut save_snapshot = false;
+    if prefix.is_enabled() && images == 0 && reuse_capable {
+        if let Ok(tokens) = tokenize_text_prompt(templates, model, msgs, params) {
             let ids: Vec<i32> = tokens.iter().map(|t| t.0).collect();
-            if let Some(len) = prefix.longest_prefix(&ids) {
-                // Only worth using when there is a suffix left to encode. An
-                // exact match would have to re-decode the final token to get
-                // logits for the first generated one, and re-decoding a position
-                // the restored state already covers is the one arrangement here
-                // that has not been shown to be safe.
+            if !live.is_empty()
+                && live.len() < ids.len()
+                && ids[..live.len()] == live[..]
+                && (!need_draft || *live_draft)
+            {
+                // A strict extension of what is resident: keep the cache and
+                // encode only the suffix. An exact match is refused — the last
+                // token has to be decoded again for its logits, and re-decoding
+                // a position the cache already covers is the one arrangement
+                // here that has not been shown to be safe.
+                start = live.len();
+                reuse = true;
+            } else if let Some(len) = prefix.longest_prefix(&ids, need_draft) {
                 if len < ids.len() {
-                    if let Some(state) = prefix.state_for(len) {
-                        if unsafe { restore_state(ctx, state) } {
-                            start = len;
+                    // A restore needs an empty cache to land in. If it does not
+                    // take, `reuse` stays false and the prompt is encoded whole
+                    // below — half a restore is worse than none.
+                    ctx.clear_kv_cache();
+                    if let Some(entry) = prefix.snapshot_for(len) {
+                        if unsafe { restore_state(ctx, &entry.state) } {
+                            // The draft side has to come back with the target's,
+                            // or the head would sit behind the target and reject
+                            // every proposal. A snapshot with no draft state is
+                            // simply not used on a drafting turn.
+                            let draft_ok = match entry.draft.as_deref() {
+                                None => true,
+                                Some(bytes) if mtp_path => mtp_draft_ctx
+                                    .as_mut()
+                                    .is_some_and(|c| unsafe { restore_state(c, bytes) }),
+                                Some(bytes) if side_path => draft_ctx
+                                    .as_mut()
+                                    .is_some_and(|c| unsafe { restore_state(c, bytes) }),
+                                Some(_) => false,
+                            };
+                            if draft_ok {
+                                start = len;
+                                reuse = true;
+                            }
                         }
                     }
                 }
             }
         }
+        // A prompt that diverged from a conversation already in progress is the
+        // one case a snapshot can still help later (an edit, a branch, a
+        // regenerated answer), so it is saved here and nowhere else.
+        save_snapshot = !reuse && had_live;
     }
-
-    // Whether to draft at all. A gate that has measured drafting as not paying
-    // for itself closes here, before any draft context is touched.
-    let speculate = params.speculative && spec.allows();
+    if !reuse {
+        ctx.clear_kv_cache();
+    }
 
     // MTP prefills through its own session, because the draft head needs the
     // target's hidden state for *every* prompt token and only the session can
     // hand that over. Prefilling here first would leave the head with nothing
     // to draft from.
-    if speculate && mtp_n_max > 0 && images == 0 {
-        if let Some(draft) = mtp_draft_ctx.as_mut() {
-            let stats = generate_mtp(
+    if mtp_path {
+        let mut resident: Vec<i32> = Vec::new();
+        let stats = {
+            let draft = mtp_draft_ctx
+                .as_mut()
+                .expect("mtp_path implies a draft context");
+            generate_mtp(
                 model,
                 ctx,
                 draft,
                 vision,
+                templates,
                 msgs,
                 params,
                 reply,
                 n_ctx,
-                mtp_n_max as i32,
-            )?;
-            spec.record(&stats);
-            let _ = reply.send(GenEvent::Done(stats));
-            return Ok(());
+                spec.draft_len(mtp_n_max) as i32,
+                start,
+                &mut resident,
+            )?
+        };
+        // Both caches now hold prompt plus reply at the same positions, so the
+        // ids are what the next turn continues from. Only a later diverged turn
+        // pays for a serialised copy, and only because this one was mid-thread.
+        if save_snapshot {
+            let draft_state = mtp_draft_ctx.as_ref().and_then(|c| unsafe { save_state(c) });
+            if let Some(state) = unsafe { save_state(ctx) } {
+                prefix.insert(resident.clone(), state, draft_state);
+            }
         }
+        if prefix.is_enabled() && images == 0 {
+            *live = resident;
+            *live_draft = true;
+        } else {
+            live.clear();
+            *live_draft = false;
+        }
+        spec.record(&stats);
+        let mut stats = stats;
+        let parsed = finish_reply(reply);
+        stats.tool_calls = parsed.tool_calls;
+        stats.parsed_content = parsed.content;
+        stats.reasoning_content = parsed.reasoning;
+        let _ = reply.send(GenEvent::Done(stats));
+        return Ok(());
     }
 
     // A separate draft model outranks the n-gram drafter as well: it proposes
     // from learned weights rather than from repeats in this conversation, so
     // when one is loaded it is the better guess.
-    if speculate && images == 0 {
-        if let (Some(kind), Some(draft)) = (draft_kind, draft_ctx.as_mut()) {
-            // An MTP head drafted from a side-mounted checkpoint is still an MTP
-            // head — same loop, same session, only the weights it reads are a
-            // second file rather than the target's own.
-            let stats = if kind == DraftKind::Mtp {
+    if side_path {
+        let kind = draft_kind.expect("side_path implies a draft kind");
+        let mut resident: Vec<i32> = Vec::new();
+        let stats = {
+            let draft = draft_ctx
+                .as_mut()
+                .expect("side_path implies a draft context");
+            if kind == DraftKind::Mtp {
+                // An MTP head drafted from a side-mounted checkpoint is still an
+                // MTP head — same loop, same session, only the weights it reads
+                // are a second file rather than the target's own.
+                //
                 // `MtpSession` is typed as though both contexts came out of one
                 // model, which describes the bundled case and nothing else.
                 // Upstream pairs a target with a separate MTP checkpoint just as
@@ -1636,11 +1857,14 @@ fn run_generate<'m, 'd>(
                     ctx,
                     side,
                     vision,
+                    templates,
                     msgs,
                     params,
                     reply,
                     n_ctx,
-                    draft_n_max as i32,
+                    spec.draft_len(draft_n_max) as i32,
+                    start,
+                    &mut resident,
                 )?
             } else {
                 generate_draft_model(
@@ -1648,35 +1872,56 @@ fn run_generate<'m, 'd>(
                     ctx,
                     draft,
                     kind,
+                    templates,
                     msgs,
                     params,
                     reply,
                     n_ctx,
-                    draft_n_max as i32,
+                    spec.draft_len(draft_n_max) as i32,
                 )?
-            };
-            spec.record(&stats);
-            let _ = reply.send(GenEvent::Done(stats));
-            return Ok(());
+            }
+        };
+        // A DFlash/EAGLE checkpoint keeps continuation state this binding does
+        // not serialise, so those turns leave no snapshot and simply re-encode
+        // next time; a side-mounted MTP head moves in step with the target, so
+        // its ids are kept for the next turn to continue from.
+        if kind == DraftKind::Mtp && save_snapshot {
+            let draft_state = draft_ctx.as_ref().and_then(|c| unsafe { save_state(c) });
+            if let Some(state) = unsafe { save_state(ctx) } {
+                prefix.insert(resident.clone(), state, draft_state);
+            }
         }
+        if kind == DraftKind::Mtp && prefix.is_enabled() && images == 0 {
+            *live = resident;
+            *live_draft = true;
+        } else {
+            // DFlash/EAGLE leaves the cache holding prompt plus reply but no
+            // serialisable continuation, so nothing is resumed from it.
+            live.clear();
+            *live_draft = false;
+        }
+        spec.record(&stats);
+        let mut stats = stats;
+        let parsed = finish_reply(reply);
+        stats.tool_calls = parsed.tool_calls;
+        stats.parsed_content = parsed.content;
+        stats.reasoning_content = parsed.reasoning;
+        let _ = reply.send(GenEvent::Done(stats));
+        return Ok(());
     }
 
     let t_start = Instant::now();
-    let (prompt_tokens, n_past, hist) =
-        fill_prompt(model, ctx, vision, msgs, n_ctx, n_batch, start)?;
+    let (prompt_tokens, n_past, hist) = fill_prompt(
+        model, ctx, vision, templates, params, msgs, n_ctx, n_batch, start,
+    )?;
     let prompt_ms = t_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Remember the prompt as it stands *now*, before a single token is
-    // generated: what is in the cache at this moment is exactly the prompt, and
-    // that is what the next turn shares as its prefix.
-    if prefix.is_enabled() && images == 0 && !hist.is_empty() {
-        if let Some(state) = unsafe { save_state(ctx) } {
-            let ids: Vec<i32> = hist.iter().map(|t| t.0).collect();
-            prefix.insert(ids, state);
-        }
-    }
+    // The generators report back the exact ids they left in the cache, reply
+    // included, so the next turn can skip re-encoding the answer to the previous
+    // question as well as the conversation before it.
+    let mut resident: Vec<i32> = hist.iter().map(|t| t.0).collect();
 
-    let stats = if speculate {
+    let mut stats = if speculate {
         generate_speculative(
             model,
             ctx,
@@ -1689,6 +1934,7 @@ fn run_generate<'m, 'd>(
             prompt_ms,
             cache,
             drafting,
+            &mut resident,
         )?
     } else {
         generate_plain(
@@ -1701,8 +1947,28 @@ fn run_generate<'m, 'd>(
             n_past,
             prompt_tokens,
             prompt_ms,
+            &mut resident,
         )?
     };
+
+    // Remember what is in the cache now, once the reply is part of it: the ids
+    // are the cheap continuation, the serialised snapshot only the fallback.
+    if save_snapshot {
+        if let Some(state) = unsafe { save_state(ctx) } {
+            prefix.insert(resident.clone(), state, None);
+        }
+    }
+    if prefix.is_enabled() && images == 0 {
+        *live = resident;
+        *live_draft = false;
+    } else {
+        live.clear();
+        *live_draft = false;
+    }
+    let parsed = finish_reply(reply);
+    stats.tool_calls = parsed.tool_calls;
+    stats.parsed_content = parsed.content;
+    stats.reasoning_content = parsed.reasoning;
     let _ = reply.send(GenEvent::Done(stats));
     Ok(())
 }
@@ -1740,6 +2006,32 @@ unsafe fn restore_state(ctx: &mut LlamaContext, state: &[u8]) -> bool {
     read == state.len()
 }
 
+/// Decode one throwaway batch, then drop its KV state.
+///
+/// Current llama.cpp sets up graphs and scratch buffers per shape on the first
+/// decode of that shape; doing one here means the first real request reuses that
+/// work rather than paying for it. Best-effort: a warmup that fails leaves the
+/// model loaded and merely slow on the first reply — which is where it started.
+fn warmup_context(ctx: &mut LlamaContext, model: &LlamaModel, n_batch: usize) -> Result<()> {
+    // Never past the context: a warmup that asked for more rows than the cache
+    // holds would fail, and it is the cache shape we are trying to warm anyway.
+    let tokens = n_batch.clamp(1, ctx.n_ctx().max(1) as usize);
+    let mut batch = LlamaBatch::new(tokens, 1);
+    let bos = model.token_bos();
+    for i in 0..tokens {
+        // The values are discarded; logits on the last row keep the batch shape
+        // the decode path expects.
+        let logits = i + 1 == tokens;
+        batch
+            .add(bos, i as i32, &[0], logits)
+            .map_err(|e| InferError::Decode(e.to_string()))?;
+    }
+    let decoded = ctx.decode(&mut batch);
+    // Whatever happened, leave no warmup tokens behind.
+    ctx.clear_kv_cache();
+    decoded.map_err(|e| InferError::Decode(e.to_string()))
+}
+
 /// Encode the conversation into the KV cache and report where it ended.
 ///
 /// Returns the prompt length in tokens, the new `n_past`, and the token sequence
@@ -1749,10 +2041,13 @@ unsafe fn restore_state(ctx: &mut LlamaContext, state: &[u8]) -> bool {
 /// Text-only conversations take the plain batching path. As soon as an image is
 /// present the prompt goes through libmtmd instead, because the tokens standing
 /// in for a picture are image *embeddings*, which a token batch cannot carry.
+#[allow(clippy::too_many_arguments)]
 fn fill_prompt(
     model: &LlamaModel,
     ctx: &mut LlamaContext,
     vision: &Option<MtmdContext>,
+    templates: Option<&ChatTemplates>,
+    params: &SamplerParams,
     msgs: &[ChatMsg],
     n_ctx: usize,
     n_batch: usize,
@@ -1763,10 +2058,12 @@ fn fill_prompt(
         if images > 0 {
             return Err(InferError::VisionUnavailable { images });
         }
-        return fill_text_prompt(model, ctx, msgs, n_ctx, n_batch, start);
+        return fill_text_prompt(model, ctx, templates, params, msgs, n_ctx, n_batch, start);
     };
     // An image prompt takes the mtmd path, which owns its own encoding and has
     // no token prefix to match against, so any cached offset is ignored here.
+    // It also keeps the legacy template path: libmtmd renders the conversation
+    // itself, and reasoning control is a text-only concern for now.
 
     let prompt = render_prompt(model, msgs, vision)?;
 
@@ -1820,35 +2117,117 @@ fn fill_prompt(
 ///
 /// Split out because the prefix cache needs the token ids *before* anything is
 /// encoded, and encoding is precisely what it exists to avoid.
-fn tokenize_text_prompt(model: &LlamaModel, msgs: &[ChatMsg]) -> Result<Vec<LlamaToken>> {
-    let messages = msgs
-        .iter()
-        .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
-
-    let prompt = model
-        .apply_chat_template(None, &messages, true)
-        .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
+fn tokenize_text_prompt(
+    templates: Option<&ChatTemplates>,
+    model: &LlamaModel,
+    msgs: &[ChatMsg],
+    params: &SamplerParams,
+) -> Result<Vec<LlamaToken>> {
+    let prompt = render_chat(templates, model, msgs, params)?;
 
     model
         .str_to_token(&prompt, AddBos::Always)
         .map_err(|e| InferError::Tokenize(e.to_string()))
 }
 
+/// One message as the OpenAI shape `ChatApplyParams` expects, carrying the
+/// tool-call fields when the turn is part of a tool exchange.
+fn message_json(m: &ChatMsg) -> serde_json::Value {
+    let mut v = serde_json::json!({ "role": m.role, "content": m.content });
+    if let Some(calls) = &m.tool_calls {
+        v["tool_calls"] = calls.clone();
+    }
+    if let Some(id) = &m.tool_call_id {
+        v["tool_call_id"] = serde_json::json!(id);
+    }
+    v
+}
+
+/// Render a conversation to a prompt string.
+///
+/// Takes the Jinja template path when the caller names a thinking mode or
+/// declares tools — the only two things the legacy apply path cannot express.
+/// Otherwise the legacy path is used unchanged, so a request that says nothing
+/// about thinking renders exactly as it always did. A template that does not
+/// understand a flag ignores it.
+fn render_chat(
+    templates: Option<&ChatTemplates>,
+    model: &LlamaModel,
+    msgs: &[ChatMsg],
+    params: &SamplerParams,
+) -> Result<String> {
+    let tools = params
+        .tools_json
+        .as_deref()
+        .filter(|t| !t.trim().is_empty());
+    // Tools need the Jinja path: the legacy call has no way to hand them over,
+    // so the model would never see them and the reply would never contain a
+    // call. A thinking mode needs it for the same reason.
+    if let Some(templates) = templates.filter(|_| params.thinking.is_some() || tools.is_some()) {
+        let wire: Vec<serde_json::Value> = msgs.iter().map(message_json).collect();
+        let json =
+            serde_json::to_string(&wire).map_err(|e| InferError::ChatTemplate(e.to_string()))?;
+        let mut apply = ChatApplyParams::new(json)
+            .with_enable_thinking(params.thinking.unwrap_or(true))
+            .with_add_generation_prompt(true);
+        if let Some(tools) = tools {
+            apply = apply
+                .with_tools(tools.to_owned())
+                // Parse-time setting: split thinking blocks into
+                // `reasoning_content`, so the answer is not polluted by them.
+                .with_reasoning_format(ReasoningFormat::Auto);
+            if let Some(choice) = params
+                .tool_choice
+                .as_deref()
+                .and_then(|c| ToolChoice::parse_oaicompat(c).ok())
+            {
+                apply = apply.with_tool_choice(choice);
+            }
+            apply = apply.with_parallel_tool_calls(params.parallel_tool_calls);
+        }
+        let applied = templates
+            .apply(&apply)
+            .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
+        let prompt = applied.prompt.clone();
+        // Held only when tools were declared: such a reply is not streamed token
+        // by token, and this is what splits it apart once it finishes.
+        PARSER.with(|p| {
+            *p.borrow_mut() = if tools.is_some() {
+                Some(ReplyParser { chat: applied })
+            } else {
+                None
+            };
+        });
+        return Ok(prompt);
+    }
+    PARSER.with(|p| *p.borrow_mut() = None);
+
+    let messages = msgs
+        .iter()
+        .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
+    model
+        .apply_chat_template(None, &messages, true)
+        .map_err(|e| InferError::ChatTemplate(e.to_string()))
+}
+
 /// The ordinary text path: tokenize, then decode in `n_batch` slices.
 ///
 /// `start` is how many leading tokens are already in the KV cache, contributed
 /// by the prefix cache. Those are skipped; the rest are decoded as usual.
+#[allow(clippy::too_many_arguments)]
 fn fill_text_prompt(
     model: &LlamaModel,
     ctx: &mut LlamaContext,
+    templates: Option<&ChatTemplates>,
+    params: &SamplerParams,
     msgs: &[ChatMsg],
     n_ctx: usize,
     n_batch: usize,
     start: usize,
 ) -> Result<(usize, i32, Vec<LlamaToken>)> {
-    let tokens = tokenize_text_prompt(model, msgs)?;
+    let tokens = tokenize_text_prompt(templates, model, msgs, params)?;
 
     if tokens.len() >= n_ctx {
         return Err(InferError::ContextFull {
@@ -2036,6 +2415,9 @@ fn generate_plain(
     mut n_past: i32,
     prompt_tokens: usize,
     prompt_ms: f64,
+    // Ids the cache holds when this returns: the prompt, then every token that
+    // reached the KV. The caller keys the next turn's reusable prefix on it.
+    resident: &mut Vec<i32>,
 ) -> Result<GenStats> {
     let n_batch = ctx.n_batch().max(1) as usize;
     let mut batch = LlamaBatch::new(n_batch, 1);
@@ -2077,6 +2459,7 @@ fn generate_plain(
         n_past += 1;
         ctx.decode(&mut batch)
             .map_err(|e| InferError::Decode(e.to_string()))?;
+        resident.push(token.0);
     }
     emit_tail(&mut pending, reply)?;
 
@@ -2115,11 +2498,17 @@ fn generate_mtp<'m>(
     ctx: &mut LlamaContext<'m>,
     draft_ctx: &mut LlamaContext<'m>,
     vision: &Option<MtmdContext>,
+    templates: Option<&ChatTemplates>,
     msgs: &[ChatMsg],
     params: &SamplerParams,
     reply: &Sender<GenEvent>,
     n_ctx: usize,
     mtp_n_max: i32,
+    // First `start` prompt tokens are already in both caches, restored by the
+    // caller; only the suffix is prefilled here. Zero means nothing is in yet.
+    start: usize,
+    // Ids both caches hold when this returns, prompt then reply.
+    resident: &mut Vec<i32>,
 ) -> Result<GenStats> {
     let n_batch = ctx.n_batch().max(1) as usize;
     let k_max = (mtp_n_max.max(1) as usize).min(n_batch.saturating_sub(1));
@@ -2136,17 +2525,9 @@ fn generate_mtp<'m>(
     }
     let _ = vision;
 
-    let messages = msgs
-        .iter()
-        .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
-    let rendered = model
-        .apply_chat_template(None, &messages, true)
-        .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
-    let prompt = model
-        .str_to_token(&rendered, AddBos::Always)
-        .map_err(|e| InferError::Tokenize(e.to_string()))?;
+    // The drafter must see the same prompt the target would, thinking mode
+    // included, or the two disagree about the conversation from token zero.
+    let prompt = tokenize_text_prompt(templates, model, msgs, params)?;
     if prompt.len() >= n_ctx {
         return Err(InferError::ContextFull {
             used: prompt.len(),
@@ -2154,9 +2535,6 @@ fn generate_mtp<'m>(
         });
     }
 
-    // Verification has to sample from every position in the batch, so this
-    // reuses the n-gram path's reasoning: the plain hand-rolled chain cannot
-    // read a row other than -1.
     let mut cs_params = CommonSamplerParams::new();
     let mut sc = cs_params.scalars();
     sc.min_keep = 1;
@@ -2180,25 +2558,34 @@ fn generate_mtp<'m>(
     let mut session = MtpSession::new_with_config(ctx, draft_ctx, config)
         .map_err(|e| InferError::Decode(format!("MTP session: {e}")))?;
 
-    // The session borrows both contexts, so the draft cache can only be emptied
-    // through it. A request that failed mid-round leaves the head's positions
-    // ahead of the target's, and the next prefill would then be rejected.
-    session
-        .clear_draft_kv_cache_seq(None, None, None)
-        .map_err(|e| InferError::Decode(format!("MTP draft cache reset: {e}")))?;
+    // A resumed request already has the head's cache in step with the target's,
+    // put there by the caller, and emptying it here would throw that away. Only
+    // a fresh prefill starts from an empty draft cache: the session borrows both
+    // contexts, so the cache can only be emptied through it, and a request that
+    // failed mid-round leaves the head's positions ahead of the target's, which
+    // the next prefill would then reject.
+    if start == 0 {
+        session
+            .clear_draft_kv_cache_seq(None, None, None)
+            .map_err(|e| InferError::Decode(format!("MTP draft cache reset: {e}")))?;
+    }
 
     // The draft head needs the whole prompt to have gone through the target, so
     // prefill goes through the session rather than straight to the context.
     // Every ubatch has to pass `process`, not just the last one: the head keeps
     // a hidden-state row per token, and a ubatch it never saw is a hole in it.
+    // A resumed request encodes only the suffix — the prefix is already in both
+    // caches, which is the whole point of having remembered it.
     let t_start = Instant::now();
     let mut batch = LlamaBatch::new(n_batch.max(k_max + 1), 1);
     let prompt_tokens = prompt.len();
     let total = prompt.len();
-    let mut n_past = 0i32;
-    for (chunk_idx, chunk) in prompt.chunks(n_batch).enumerate() {
+    let mut n_past = start as i32;
+    resident.clear();
+    resident.extend(prompt.iter().map(|t| t.0));
+    for (chunk_idx, chunk) in prompt[start..].chunks(n_batch).enumerate() {
         batch.clear();
-        let base = chunk_idx * n_batch;
+        let base = start + chunk_idx * n_batch;
         for (i, &tok) in chunk.iter().enumerate() {
             batch
                 .add(tok, (base + i) as i32, &[0], base + i == total - 1)
@@ -2279,6 +2666,7 @@ fn generate_mtp<'m>(
                 .decode_target_and_process(&mut batch)
                 .map_err(|e| InferError::Decode(format!("MTP decode: {e}")))?;
             n_past += 1;
+            resident.push(next.0);
             next = sampler
                 .sample(session.target_context_mut(), -1, false)
                 .map_err(|e| InferError::Decode(format!("MTP sample: {e}")))?;
@@ -2323,6 +2711,9 @@ fn generate_mtp<'m>(
         // last confirmed position, so it always ends in the new `next`.
         let accepted = out.len() - 1;
         let (kept_drafts, sampled) = out.split_at(accepted);
+        // The batch above was anchored on the previous `next`, which is what the
+        // cache gained first; `next` is about to become the token after it.
+        let anchor = next;
         next = sampled[0];
 
         // Drop the rejected tail from the target cache. `p1 = None` means "to
@@ -2356,6 +2747,8 @@ fn generate_mtp<'m>(
 
         accepted_draft += accepted;
         n_past += kept;
+        resident.push(anchor.0);
+        resident.extend(kept_drafts.iter().map(|t| t.0));
 
         // Emit the accepted drafts; the trailing sampled token goes out at the
         // top of the next round, which is where it is also checked against the
@@ -2387,6 +2780,7 @@ fn generate_mtp<'m>(
         accepted_draft_tokens: accepted_draft,
         draft_rounds,
         hit_token_cap: params.hit_token_cap(generated),
+        ..Default::default()
     })
 }
 
@@ -2479,6 +2873,7 @@ fn generate_draft_model<'m, 'd>(
     ctx: &mut LlamaContext<'m>,
     draft_ctx: &mut LlamaContext<'d>,
     kind: DraftKind,
+    templates: Option<&ChatTemplates>,
     msgs: &[ChatMsg],
     params: &SamplerParams,
     reply: &Sender<GenEvent>,
@@ -2500,17 +2895,9 @@ fn generate_draft_model<'m, 'd>(
         });
     }
 
-    let messages = msgs
-        .iter()
-        .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
-    let rendered = model
-        .apply_chat_template(None, &messages, true)
-        .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
-    let prompt = model
-        .str_to_token(&rendered, AddBos::Always)
-        .map_err(|e| InferError::Tokenize(e.to_string()))?;
+    // The drafter must see the same prompt the target would, thinking mode
+    // included, or the two disagree about the conversation from token zero.
+    let prompt = tokenize_text_prompt(templates, model, msgs, params)?;
     if prompt.len() >= n_ctx {
         return Err(InferError::ContextFull {
             used: prompt.len(),
@@ -2735,6 +3122,7 @@ fn generate_draft_model<'m, 'd>(
         accepted_draft_tokens: accepted_draft,
         draft_rounds,
         hit_token_cap: params.hit_token_cap(generated),
+        ..Default::default()
     })
 }
 
@@ -2764,6 +3152,9 @@ fn generate_speculative(
     prompt_ms: f64,
     cache: &mut DraftCache,
     drafting: &AtomicBool,
+    // Ids the cache holds when this returns. Kept in step with `n_past` at every
+    // commit point, because the caller keys the next turn's prefix on it.
+    resident: &mut Vec<i32>,
 ) -> Result<GenStats> {
     let n = params.ngram_n.max(1);
     let m = params.ngram_m.max(1);
@@ -2912,6 +3303,10 @@ fn generate_speculative(
 
                     if trimmed {
                         n_past += 1 + accepted as i32;
+                        // The anchor and the accepted drafts are in the cache;
+                        // the token that follows them lands there below.
+                        resident.push(next.0);
+                        resident.extend(draft[..accepted].iter().map(|t| t.0));
                     } else {
                         // Hybrid models (recurrent + attention layers) refuse to
                         // drop a range from the cache, so there is no way to
@@ -2930,6 +3325,7 @@ fn generate_speculative(
                         ctx.clear_kv_cache();
                         decode_sequence(ctx, &replay)?;
                         n_past = replay.len() as i32;
+                        *resident = replay.iter().map(|t| t.0).collect();
                     }
                 } else {
                     n_past += 1 + accepted as i32;
@@ -2978,6 +3374,7 @@ fn generate_speculative(
                 n_past
             ))
         })?;
+        resident.push(to_decode.0);
         next = sampler
             .sample(ctx, -1, false)
             .map_err(|e| InferError::Decode(format!("sample next token: {e}")))?;
@@ -2999,6 +3396,7 @@ fn generate_speculative(
         accepted_draft_tokens: accepted_draft,
         draft_rounds,
         hit_token_cap: params.hit_token_cap(generated),
+        ..Default::default()
     })
 }
 
@@ -3073,6 +3471,101 @@ pub(crate) fn draft_len(drafted: usize, room: usize, k_max: usize, n_batch: usiz
     drafted.min(room).min(k_max).min(n_batch.saturating_sub(1))
 }
 
+// The bytes emitted so far on this worker thread, and the parser for the prompt
+// they came from.
+//
+// Every token the reply sends passes through `emit_token`, which makes it the
+// one place that sees the whole reply. When the request declared tools the reply
+// is parsed once it is complete — the template's parser splits it into content,
+// reasoning and tool calls — so the bytes and that parser are kept here, on the
+// worker's own thread (the only thread that ever runs a generation), rather than
+// threaded through every generator's signature.
+thread_local! {
+    static EMITTED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PARSER: std::cell::RefCell<Option<ReplyParser>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The parser for the tool-bearing request in flight.
+///
+/// A tool call is only recognisable once its closing marker arrives, and text
+/// already sent cannot be taken back, so a reply that might contain one is not
+/// streamed token by token: nothing is sent during generation and the parsed
+/// content is emitted once, just before `Done`.
+struct ReplyParser {
+    chat: ChatParams,
+}
+
+/// Whether the generation in flight is holding its reply back for parsing.
+fn streaming_held() -> bool {
+    PARSER.with(|p| p.borrow().is_some())
+}
+
+/// Forget the previous reply's text and parser before a new generation.
+fn reset_emitted() {
+    EMITTED.with(|e| e.borrow_mut().clear());
+    PARSER.with(|p| *p.borrow_mut() = None);
+}
+
+fn take_emitted() -> String {
+    EMITTED.with(|e| {
+        let bytes = std::mem::take(&mut *e.borrow_mut());
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
+/// What a finished reply contributes to the response.
+#[derive(Default)]
+struct ParsedReply {
+    content: Option<String>,
+    reasoning: Option<String>,
+    tool_calls: Option<serde_json::Value>,
+}
+
+/// Parse the finished reply into content, reasoning and tool calls.
+///
+/// A reply with no tools is returned empty and left untouched: its text was
+/// already streamed as it arrived, and there is nothing to pull apart. For a
+/// tool-bearing reply the held-back content is emitted here, before `Done`.
+fn finish_reply(reply: &Sender<GenEvent>) -> ParsedReply {
+    let Some(chat) = PARSER.with(|p| p.borrow().as_ref().map(|r| r.chat.clone())) else {
+        return ParsedReply::default();
+    };
+    let text = take_emitted();
+    let Ok(parsed) = chat.parse(&text, false) else {
+        // Parsing is presentation, not substance: if it fails the raw text
+        // stands in, so a reply is never lost to it. Logged because a failed
+        // parse of a tool-bearing reply looks, to the caller, like the model
+        // simply chose not to call anything.
+        tracing::warn!("tool reply did not parse; returning it as plain text");
+        let _ = reply.send(GenEvent::Token(text));
+        return ParsedReply::default();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&parsed) else {
+        return ParsedReply::default();
+    };
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let content = field("content");
+    let reasoning = field("reasoning_content");
+    let tool_calls = value
+        .get("tool_calls")
+        .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+        .cloned();
+    if let Some(content) = &content {
+        let _ = reply.send(GenEvent::Token(content.clone()));
+    }
+    ParsedReply {
+        content,
+        reasoning,
+        tool_calls,
+    }
+}
+
 /// Append one token's bytes to the stream, emitting every complete UTF-8 prefix.
 fn emit_token(
     model: &LlamaModel,
@@ -3083,6 +3576,10 @@ fn emit_token(
     let piece = model
         .token_to_bytes(token, Special::Plaintext)
         .map_err(|e| InferError::Tokenize(e.to_string()))?;
+    // Only a held-back reply is read back as a whole, so only it is kept.
+    if streaming_held() {
+        EMITTED.with(|e| e.borrow_mut().extend_from_slice(&piece));
+    }
     pending.extend_from_slice(&piece);
     emit_utf8(pending, reply)
 }
@@ -3121,6 +3618,12 @@ fn build_sampler(params: &SamplerParams, n_vocab: i32) -> LlamaSampler {
 /// generation loop stops instead of spending the rest of `max_tokens` on output
 /// nobody will read.
 fn emit_utf8(pending: &mut Vec<u8>, reply: &Sender<GenEvent>) -> Result<()> {
+    // A tool-bearing reply is held back and emitted whole once parsed, so its
+    // text is dropped here rather than sent as it arrives.
+    if streaming_held() {
+        pending.clear();
+        return Ok(());
+    }
     loop {
         match std::str::from_utf8(pending) {
             Ok(s) => {
@@ -3156,6 +3659,10 @@ fn emit_utf8(pending: &mut Vec<u8>, reply: &Sender<GenEvent>) -> Result<()> {
 }
 
 fn emit_tail(pending: &mut Vec<u8>, reply: &Sender<GenEvent>) -> Result<()> {
+    if streaming_held() {
+        pending.clear();
+        return Ok(());
+    }
     if !pending.is_empty() {
         let s = String::from_utf8_lossy(pending).into_owned();
         reply

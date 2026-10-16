@@ -26,8 +26,11 @@ RUN if [ -n "$CRATES_MIRROR" ]; then \
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY crates/infer-core ./crates/infer-core
-COPY crates/infer-daemon ./crates/infer-daemon
+# Every workspace member, not only the daemon's own path dependencies: the root
+# `Cargo.toml` names them all, so a manifest that was not copied fails the build
+# before anything is compiled — and the list only grows. `crates/app` is the
+# desktop app's own workspace and is excluded in `.dockerignore`.
+COPY crates ./crates
 
 RUN if [ -n "$FEATURES" ]; then \
       cargo build --release -p infer-daemon --features "$FEATURES"; \

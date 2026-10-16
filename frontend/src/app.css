@@ -10,6 +10,7 @@
   --faint: #5b6067;
   --danger: #c65a52;
   --warn: #b98a3c;
+  --ok: #4caf72;
   --radius: 12px;
   --radius-sm: 9px;
   color-scheme: dark;
@@ -27,6 +28,7 @@
   --faint: #9aa0a7;
   --danger: #b23b32;
   --warn: #8a6318;
+  --ok: #2f8f57;
   color-scheme: light;
 }
 
@@ -357,6 +359,10 @@ strong.on {
 
 .grid .field {
   margin-bottom: 0;
+  /* A label long enough to wrap used to push its input below the others.
+     Anchoring the label to the top and the control to the bottom lines every
+     control up regardless of how many lines its label takes. */
+  justify-content: space-between;
 }
 
 .grid .field input,
@@ -373,6 +379,194 @@ strong.on {
    columns leaves them landing in whatever cell the field count happens to end on. */
 .grid.checks {
   margin-top: 10px;
+}
+
+/* Segmented switch (本地模型 | 云端模型). */
+.seg {
+  display: inline-flex;
+  gap: 4px;
+  margin: 12px 0 4px;
+  padding: 3px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.seg button {
+  background: transparent;
+  border: none;
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  cursor: pointer;
+}
+.seg button.active {
+  background: var(--panel);
+  color: var(--fg-strong);
+}
+
+/* Compact variant, for controls inside a card. */
+.seg.small {
+  margin-top: 8px;
+}
+.seg.small button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+/* Auto synergy control: a titled box with an on/off switch. */
+.synergy {
+  margin-top: 14px;
+  padding: 12px 12px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+.synergy-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.synergy-title {
+  font-size: 13px;
+  color: var(--fg-strong);
+}
+.synergy-policy {
+  margin-top: 10px;
+}
+/* Hover-only help: the explanation lives in the tooltip, not on the page. */
+.info {
+  margin-left: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: help;
+}
+
+/* On/off switch. */
+.toggle {
+  position: relative;
+  display: inline-block;
+  width: 38px;
+  height: 21px;
+  flex: none;
+}
+.toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+}
+.toggle .track {
+  position: absolute;
+  inset: 0;
+  background: var(--border-strong);
+  border-radius: 999px;
+  transition: background 0.15s ease;
+  cursor: pointer;
+}
+.toggle .track::before {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 3px;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--fg-strong);
+  transition: transform 0.15s ease;
+}
+.toggle input:checked + .track {
+  background: var(--ok);
+}
+.toggle input:checked + .track::before {
+  transform: translateX(17px);
+}
+
+/* The auto-routing switch is about routing, not a "healthy/on" state, so it
+   wears the deep blue of the routing card rather than the green "ok" tone. */
+.toggle.routing input:checked + .track {
+  background: #1e40af;
+}
+
+.row.space {
+  justify-content: space-between;
+  align-items: center;
+}
+.row.space h3 {
+  margin: 0;
+}
+
+a.link {
+  text-decoration: none;
+  color: var(--muted);
+  padding: 8px 11px;
+}
+a.link:hover {
+  color: var(--fg-strong);
+}
+
+/* Aligned three-row cloud provider form: label · control · action. */
+.cloud-form {
+  display: grid;
+  grid-template-columns: minmax(64px, auto) 1fr auto;
+  gap: 8px 10px;
+  align-items: center;
+  margin: 12px 0 2px;
+}
+.cloud-form > label {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+.cloud-form input,
+.cloud-form select {
+  width: 100%;
+}
+.cloud-form button {
+  white-space: nowrap;
+}
+
+/* Key present/absent hint on the cloud provider form. */
+.key-status {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--warn);
+}
+.key-status.set {
+  color: var(--ok);
+}
+
+/* Available-models list on the service card. */
+.section-sub {
+  margin: 14px 0 6px;
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.model-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.model-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tag {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: var(--fg-strong);
+}
+.tag.cloud {
+  color: var(--muted);
+  border-color: var(--border);
 }
 
 /* ── Daemon status ─────────────────────────────────────── */

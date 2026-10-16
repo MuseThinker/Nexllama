@@ -47,6 +47,27 @@ pub struct SamplerParams {
     pub ngram_n: u16,
     /// How many tokens a successful match contributes to a draft.
     pub ngram_m: u16,
+    /// Let a reasoning model think before it answers.
+    ///
+    /// `None` keeps the model's own default (`true` for templates that support
+    /// it). `Some(false)` renders the prompt with `enable_thinking` off, so the
+    /// reply starts on the answer instead of a reasoning block. This rides with
+    /// the request rather than the sampler because it changes the prompt, not
+    /// the sampling, and a template that does not understand the flag ignores it.
+    #[serde(default)]
+    pub thinking: Option<bool>,
+    /// OpenAI `tools` array as JSON text, when the request declares tools.
+    ///
+    /// Handed to the chat template so the model is told the tools exist and
+    /// emits calls in the format that template expects. `None` means no tools.
+    #[serde(default)]
+    pub tools_json: Option<String>,
+    /// OpenAI `tool_choice`: `"auto"`, `"required"` or `"none"`.
+    #[serde(default)]
+    pub tool_choice: Option<String>,
+    /// Allow several tool calls in one turn.
+    #[serde(default)]
+    pub parallel_tool_calls: bool,
 }
 
 impl Default for SamplerParams {
@@ -72,6 +93,10 @@ impl Default for SamplerParams {
             speculative: false,
             ngram_n: 4,
             ngram_m: 8,
+            thinking: None,
+            tools_json: None,
+            tool_choice: None,
+            parallel_tool_calls: false,
         }
     }
 }

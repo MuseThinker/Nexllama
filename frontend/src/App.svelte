@@ -16,6 +16,12 @@ const tabs = [
 let tab = $state('chat');
 let online = $state(false);
 
+// The daemon answered and then refused the calls behind the token. `/health` is
+// deliberately open so a client can bootstrap before it has one, which means
+// this cannot come from the probe: it comes from any panel's first real call,
+// and it is raised as one event by `api.js` rather than caught in each page.
+let needsToken = $state(false);
+
 // One probe at a time. Without the guard, a daemon that takes longer than the
 // interval to answer stacks requests until the browser runs out of connections
 // for this host and nothing else can get through either.
@@ -27,12 +33,29 @@ async function probe() {
   try {
     await daemon.health();
     online = true;
+    if (needsToken) {
+      // The banner says "paste your token". The first call that gets through
+      // with it is the proof, so the banner takes itself down rather than
+      // waiting to be dismissed — and it only disappears once it is true.
+      try {
+        await daemon.status();
+        needsToken = false;
+      } catch {
+        /* still the wrong token, or the daemon went away: leave it up */
+      }
+    }
   } catch {
     online = false;
   } finally {
     probing = false;
   }
 }
+
+$effect(() => {
+  const unauthorized = () => (needsToken = true);
+  window.addEventListener('nexllama:unauthorized', unauthorized);
+  return () => window.removeEventListener('nexllama:unauthorized', unauthorized);
+});
 
 probe();
 const poll = setInterval(probe, 5000);
@@ -49,6 +72,19 @@ onDestroy(() => clearInterval(poll));
   }
   .pane.hidden {
     display: none;
+  }
+
+  /* The one thing the app cannot work around on its own: the daemon is up, so
+     the status dot is green, and every call behind the token is refused. */
+  .banner {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.6rem 1rem;
+    background: color-mix(in srgb, var(--warn, #b45309) 18%, transparent);
+    border-bottom: 1px solid var(--line);
+    font-size: 0.85rem;
   }
 </style>
 
@@ -70,6 +106,12 @@ onDestroy(() => clearInterval(poll));
   </aside>
 
   <main>
+    {#if needsToken}
+      <div class="banner">
+        <span>{$t('auth.tokenNeeded')}</span>
+        <button onclick={() => (tab = 'settings')}>{$t('nav.settings')}</button>
+      </div>
+    {/if}
     <div class="pane" class:hidden={tab !== 'chat'}>
       <Chat />
     </div>

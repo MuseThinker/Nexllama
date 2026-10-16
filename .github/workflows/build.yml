@@ -39,11 +39,11 @@ jobs:
           ./scripts/build.ps1 clippy -p infer-core -p infer-daemon -p infer-hub -p gguf-probe --all-targets
           ./scripts/build.ps1 fmt --all -- --check
 
-      - name: Build installer (cpu + cuda backends)
+      - name: Build installers (standard + lite)
         shell: pwsh
-        run: ./scripts/package.ps1 -Backends cpu,cuda
+        run: ./scripts/package.ps1 -Edition both -Backends cpu,cuda
 
-      - name: Upload installer
+      - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
           name: nexllama-nsis
@@ -165,6 +165,7 @@ jobs:
           name: nexllama-linux
           path: |
             crates/app/target/release/bundle/deb/*.deb
+            crates/app/target/release/bundle/rpm/*.rpm
             crates/app/target/release/bundle/appimage/*.AppImage
 
   # macOS runners bill at ten times the rate of Linux ones, so this one waits

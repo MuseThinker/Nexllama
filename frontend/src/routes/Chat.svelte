@@ -344,7 +344,6 @@ onMount(() => {
     {/if}
     {#each messages as m, i (i)}
     <div class="bubble" class:user={m.role === 'user'}>
-      <div class="role">{m.role}</div>
       {#if m.images?.length}
         <div class="thumbs">
           {#each m.images as img}
@@ -447,7 +446,11 @@ onMount(() => {
         {/if}
         {#each models as m}
           <option value={m.id}
-            >{m.id}{m.info?.vision ? ' · vision' : ''}{m.draft_model ? ` · ${kindOf(m.draft_model)}` : m.load_mtp ? ' · MTP' : ''}</option
+            >{m.alias
+              ? `auto${m.routes_to ? ` · ${m.routes_to}` : ''}`
+              : m.cloud
+                ? `☁ ${m.id}${m.provider ? ` · ${m.provider}` : ''}`
+                : `\u{1F4BB}\u{FE0E} ${m.id}${m.info?.vision ? ' · vision' : ''}${m.draft_model ? ` · ${kindOf(m.draft_model)}` : m.load_mtp ? ' · MTP' : ''}`}</option
           >
         {/each}
       </select>

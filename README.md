@@ -1,208 +1,531 @@
 # Nexllama
 
-A lean, self-contained local LLM desktop app: download a GGUF model, it loads
-automatically, and it runs at llama.cpp speed because it *is* llama.cpp.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platforms: Windows | macOS | Linux](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]
+[![Engine: llama.cpp](https://img.shields.io/badge/engine-llama.cpp-blue.svg)]
+[![Docs: OpenAPI 3.1](https://img.shields.io/badge/docs-OpenAPI%203.1-green.svg)]
+[![中文](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-red.svg)](README.zh.md)
 
-- **No manual compile for users.** You ship prebuilt binaries; users just install.
-- **Auto-loading.** A resident daemon keeps the model in RAM/VRAM for instant opens.
-- **Downloader built in.** HuggingFace search + resumable download.
-- **Fast.** The native build uses host CPU features (AVX2/AVX-512); GPU via CUDA/Vulkan.
+**Nexllama: all-in-one desktop app & inference API wrapping llama.cpp — auto
+hardware fitting, speculative decoding, prefix cache, one local/cloud endpoint.**
 
-## Architecture
+## ✨ Nexllama
 
-```
-frontend/  Svelte 5 + Vite UI (chat, models, download, settings)
-crates/
-  infer-core/   safe wrapper over llama.cpp (llama-cpp-4): load / chat / streaming
-  infer-daemon/ axum HTTP daemon: /health, /admin/*, /v1/chat/completions (SSE)
-  infer-hub/    HuggingFace client: search, list GGUF, resumable download
-  app/          Tauri 2 desktop shell (own workspace)
-                - probes the machine, picks the right backend automatically
-                - bundles multiple backends under backends/<name>/
-```
+Nexllama is a hardware-aware all-in-one desktop inference and API gateway,
+losslessly wrapping llama.cpp. It supports auto-download and one-click import for
+GGUF models with a built-in model repository and OpenAI-compatible API. No manual
+compilation or GPU layer tuning; hardware resources are auto-detected and
+optimized. Native support for MTP, DFlash2, EAGLE-3, n-gram speculative decoding
+and prefix caching, with an evaluator to toggle acceleration. Optimized for Agents,
+it supports stream cancellation, native tool calling and model name parsing. Unify
+local GGUF and cloud LLMs under one API endpoint. Optional routing falls back to
+cloud when local hardware hits limits, disabled by default, vendor-agnostic while
+preserving full llama.cpp performance.
 
-The UI talks to the daemon over local HTTP (default `http://127.0.0.1:15656`).
-`infer-core` runs llama.cpp on a dedicated worker thread and streams decoded UTF-8.
+## 🚀 Core highlights
 
-## One-click installer with GPU auto-detection
+| Feature | What it is |
+|---|---|
+| **All-in-One** | llama.cpp used as it is, behind a desktop interface instead of a command line, with the model library, the downloader and the API included. There is nothing else to install and no flags to learn. |
+| **Adaptive hardware fitting** | Layer counts, context length and offload come from llama.cpp's own fitting helpers rather than from an estimate; the backend is chosen from the hardware actually present; a backend the machine needs but the package does not carry is downloaded, verified and installed from a signed manifest on demand. |
+| **Blazing-fast inference** | Native MTP, DFlash2, EAGLE-3 and n-gram speculative decoding, behind an adaptive gate that switches drafting off the moment it stops paying. A prefix cache removes the repeated prefill that dominates time-to-first-token in a long conversation — the two take effect per model, never stacked. Measured at **+38% decode** on Qwen3.8-27B. |
+| **Built for agents** | An OpenAI-compatible endpoint that OpenClaw, Hermes and SDK clients drive unchanged, native tool calling, streaming that can be cancelled, model names that still resolve when slightly stale, and failures reported with the facts needed to act on them. |
+| **Local and cloud, unified** | Local models and direct cloud vendors are served from the same port, and an optional `auto` policy keeps work on the machine and moves only what the machine cannot do well — a lower bill at the same quality, with no provider lock-in. |
 
-A single installer can ship several backends (`cpu`, `cuda`, `vulkan`, `metal`). At
-launch the app probes the machine and starts the matching daemon, so users don't choose
-anything:
+> Repository description (for GitHub): *Nexllama is a hardware-aware all-in-one
+> desktop inference and API gateway, losslessly wrapping llama.cpp. It supports
+> auto-download and one-click import for GGUF models with a built-in model repository
+> and OpenAI-compatible API. No manual compilation or GPU layer tuning; hardware
+> resources are auto-detected and optimized. Native support for MTP, DFlash2,
+> EAGLE-3, n-gram speculative decoding and prefix caching, with an evaluator to
+> toggle acceleration. Optimized for Agents, it supports stream cancellation, native
+> tool calling and model name parsing. Unify local GGUF and cloud LLMs under one API
+> endpoint. Optional routing falls back to cloud when local hardware hits limits,
+> disabled by default, vendor-agnostic while preserving full llama.cpp performance.*
 
-1. NVIDIA GPU (`nvidia-smi`, WMI) → `cuda`
-2. Apple GPU (`system_profiler`) → `metal` — Metal reaches Apple's GPUs directly,
-   where Vulkan would be MoltenVK translating on top of it
-3. other GPU (AMD/Intel, from `lspci`) → `vulkan`
-4. otherwise → `cpu`
+---
 
-Each backend is a self-contained folder `backends/<name>/{infer-daemon.exe, *.dll}`, so
-different backends never clash over DLL names. Users can override the choice in Settings
-(Auto / CUDA / Vulkan / CPU); the resolved backend is shown there.
+## Installation
 
-Build the installer with the backends you can compile:
+### Windows
 
-```powershell
-.\scripts\package.ps1 -Backends cpu,cuda
-# -> crates\app\target\release\bundle\nsis\Nexllama_0.1.0_x64-setup.exe
-```
+Two installers, and the difference is one thing: whether NVIDIA's runtime comes with it.
 
-Building a backend requires its toolchain: `cuda` needs the CUDA Toolkit, `vulkan` needs
-the LunarG Vulkan SDK (`glslc`); `cpu` needs nothing extra.
-
-
-## Prerequisites (Windows)
-
-- Rust (stable) via [rustup](https://rustup.rs)
-- LLVM (`clang`, `libclang` for bindgen)
-- CMake + Ninja
-- Visual Studio Build Tools with "Desktop development with C++"
-- Node.js 22+ (frontend / Tauri CLI)
-- CUDA Toolkit (only for the `cuda` build)
-
-`scripts/build.ps1` locates all of the above and sets up the environment
-(`LIBCLANG_PATH`, `CFLAGS=/utf-8`, `CMAKE_GENERATOR=Ninja`, vcvars) automatically.
-
-## Build & run
-
-Builds go through `scripts/build.ps1`, which wraps `cargo` with the right env.
-Features: `native` (host CPU), `vulkan`, `cuda`.
-
-```powershell
-# daemon
-.\scripts\build.ps1 build -p infer-daemon --features native
-.\scripts\build.ps1 run   -p infer-daemon -- --model models\model.gguf --port 15656 --n-gpu-layers 0
-
-# frontend (dev server on http://127.0.0.1:5173)
-npm --prefix frontend install
-npm --prefix frontend run dev
-
-# benchmark (load time, TTFT, tok/s)
-.\scripts\build.ps1 run -p infer-core --features native --example bench -- models\model.gguf 0
-```
-
-### Desktop installer
-
-```powershell
-npm --prefix frontend install                     # once, provides the Tauri CLI
-.\scripts\package.ps1 -Backend vulkan             # builds daemon (release+native) + NSIS installer
-# -> crates\app\target\release\bundle\nsis\Nexllama_0.1.0_x64-setup.exe
-```
-
-| Platform | What you get | How to build |
+| Installer | Size | Which machine |
 |---|---|---|
-| Windows | NSIS `.exe` | `.\scripts\package.ps1 -Backends cpu,cuda` |
-| macOS | `.app` and `.dmg` | `./scripts/package.sh metal cpu` |
-| Linux | `.deb` and `.AppImage` | `./scripts/package.sh cpu vulkan` |
+| **Standard** `Nexllama_*_x64-setup.exe` | ~483 MB | **The one to download.** It carries a portable CPU build and NVIDIA's CUDA runtime (`cudart64`, `cublas64`, `cublasLt64`), so it needs nothing installed beforehand. A new machine, a laptop, or one you are not sure about belongs here: an NVIDIA card runs on the GPU and anything else falls back to the CPU. |
+| **Lite** `Nexllama_*_x64-lite-setup.exe` | ~130 MB | Only for a machine that **already has the CUDA runtime** — usually a development box. It leaves out those three NVIDIA libraries, one of which (`cublasLt64_13.dll`) is 428 MB on its own. **A new computer, or one where CUDA was never installed, should use the standard installer**: without the runtime the CUDA backend cannot load, and the app falls back to the CPU — it works, but far more slowly. |
 
-`scripts/build-daemon.ps1 -Backend <cpu|vulkan|cuda> [-Native] [-Release]` stages the
-sidecar plus its runtime libraries into `crates/app/backends/<name>/` for the
-desktop bundle; `scripts/build-daemon.sh` is the same thing for macOS and Linux,
-where the runtime libraries are `.dylib` and `.so` instead of `.dll`.
+Both installers share a product name, install location and startup entry, so
+installing one over the other replaces it instead of leaving two copies behind.
 
-The macOS and Linux scripts need `cmake`, `ninja` and a C++ toolchain. Linux
-additionally needs `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev` and
-`libayatana-appindicator3-dev`.
+Run the installer and open Nexllama. The app picks a backend for the machine at first
+launch and starts the daemon on `http://127.0.0.1:15656`.
 
-**Nothing is signed by default.** Windows shows a SmartScreen prompt; macOS
-refuses to open an unsigned app until the user right-clicks it once. Signing and
-notarising a macOS build needs an Apple Developer account and these secrets,
-which the packaging step picks up when they are present:
+The installer asks what it should leave behind on its options page — a desktop
+shortcut and starting at login, both checked by default. Both are changeable later
+in Settings, which reads the real state rather than its own memory of it.
+
+Models are read from `C:\models` by default — change the location in Settings, or drop
+a GGUF there before the first launch.
+
+### Linux
+
+Three installers come out of the same tree: `.deb` (Debian/Ubuntu), `.rpm`
+(Fedora/openSUSE) and `.AppImage` (any distribution, nothing installed):
 
 ```bash
-APPLE_SIGNING_IDENTITY   # e.g. "Developer ID Application: …"
-APPLE_CERTIFICATE        # base64 .p12
-APPLE_CERTIFICATE_PASSWORD
-APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID   # for notarisation
+chmod +x Nexllama-*.AppImage && ./Nexllama-*.AppImage      # no root needed
+sudo apt install ./Nexllama_*.deb                          # Debian/Ubuntu
+sudo dnf install ./Nexllama-*.rpm                          # Fedora/openSUSE
 ```
 
-## HTTP API (daemon)
+They are built against Ubuntu 22.04 / Debian 12 libraries (glibc and
+webkit2gtk 4.1), so anything from that generation or newer runs them.
 
-The daemon listens on **`http://127.0.0.1:15656`**. `GET /` answers with a banner
-and an endpoint index; `GET /v1` and `GET /api/tags` list the loaded models, so
-pointing a client at the base URL is enough to see what is there. Both an
-OpenAI-compatible and an Ollama-compatible surface are served, so an example
-written for either works after changing only the port.
+Building them yourself:
+
+```bash
+./scripts/package.sh cpu vulkan    # Linux: .deb + .rpm + .AppImage
+```
+
+which needs the toolchain plus the packages the bundler stages and links
+against:
+
+```bash
+sudo apt install build-essential cmake ninja-build pkg-config \
+    libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+    libayatana-appindicator3-dev patchelf rpm zip
+```
+
+macOS is still buildable — `./scripts/package.sh metal cpu` produces a `.dmg` —
+but it is not a shipped target.
+
+The daemon can also be run on its own, which is the usual shape for a server:
+
+```bash
+./infer-daemon --model /srv/models/model.gguf --port 15656 --n-gpu-layers 999
+```
+
+### Docker
+
+The app itself, on one port — the UI and the engine behind the same address, no proxy
+in between:
+
+```bash
+docker compose -f docker-compose.web.yml up web        # CPU, http://localhost:8090
+docker compose -f docker-compose.web.yml --profile cuda up web-cuda   # CUDA
+```
+
+Open `http://localhost:8090` and the app is there: the daemon serves the built UI and
+answers the API on the same port, and the models folder you mounted is the library it
+lists. `docker build -f Dockerfile.web -t nexllama:web .` builds it without compose.
+
+By default that port has no token, which is right on a laptop. Anywhere else, set one —
+the daemon reads `NEXLLAMA_API_KEY` itself, and the app asks for the token on its
+Settings page:
+
+```bash
+API_KEY=$(openssl rand -hex 16) docker compose -f docker-compose.web.yml up web
+```
+
+The API-only images, for a server that has its own front end or no UI at all:
+
+```bash
+docker compose build
+MODEL=/models/qwen2.5-0.5b-instruct-q4_k_m.gguf docker compose up           # CPU
+docker compose -f docker-compose.cuda.yml up                                 # CUDA
+```
+
+Models are mounted read-only from `./models`. Environment overrides: `PORT`, `MODEL`,
+`N_GPU_LAYERS`, `N_CTX`, `KEEP_ALIVE_SECS`, `MODELS_DIR`, `API_KEY`, and the build
+argument `CRATES_MIRROR` for a crates.io mirror.
+
+### From source
+
+```powershell
+npm --prefix frontend install
+.\scripts\package.ps1                 # standard: cpu + cuda + NVIDIA runtime
+.\scripts\package.ps1 -Edition lite   # lite: leaves the runtime out
+.\scripts\package.ps1 -Edition both   # both, from one daemon build
+# -> crates\app\target\release\bundle\nsis\Nexllama_0.1.0_x64-setup.exe
+# -> crates\app\target\release\bundle\nsis\Nexllama_0.1.0_x64-lite-setup.exe
+```
+
+`-Native` bakes the build machine's instruction set in — faster CPU inference, but
+the result only runs on that machine or one of the same generation. Fine for a
+personal build, not for one you hand to someone else.
+
+<details>
+<summary>Build prerequisites</summary>
+
+| Requirement | Needed for |
+|---|---|
+| Rust (stable), Node.js 22+ | everything |
+| Visual Studio Build Tools (C++), LLVM (`clang`, `libclang`), CMake, Ninja | `llama-cpp-4` bindgen and the native build |
+| CUDA Toolkit | the `cuda` backend |
+| LunarG Vulkan SDK (`glslc`) | the `vulkan` backend |
+
+`scripts/build.ps1` locates these components and configures `LIBCLANG_PATH`,
+`CFLAGS=/utf-8`, `CMAKE_GENERATOR=Ninja` and the MSVC environment automatically.
+</details>
+
+---
+
+## Quick start
+
+1. **Select a models folder** — Settings → *Models folder* (`C:\models` by default).
+2. **Load a model** — press **Load** in the library. A model loaded before a restart or
+   an update is restored automatically; one whose file has moved is skipped rather
+   than treated as a failure.
+3. **Use it** — from the Chat panel, or from any client:
+
+```bash
+curl http://127.0.0.1:15656/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"alias","messages":[{"role":"user","content":"hello"}],"stream":true}'
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:15656/v1", api_key="unused-on-loopback")
+client.chat.completions.create(
+    model="alias",
+    messages=[{"role": "user", "content": "hello"}],
+)
+```
+
+```bash
+# Ollama-compatible clients work against the same port:
+#   /api/tags   /api/chat   /api/generate   /api/embed
+```
+
+`http://127.0.0.1:15656/docs` serves an interactive API page that runs entirely
+offline.
+
+---
+
+## Features
+
+### One endpoint for local and cloud models
+
+A provider is added from a built-in catalogue on *Models → Cloud models*: choose the
+vendor, paste the key, fetch the model list, save. Its models then appear in
+`/v1/models` beside the local ones as `<provider>/<model>`, and a request naming one is
+proxied to that vendor.
+
+- **Direct vendors only.** DeepSeek, OpenAI, Anthropic, Google, xAI, Mistral, Cohere,
+  智谱 GLM, Kimi, 通义 Qwen and MiniMax, each with the China and international
+  endpoint where the two differ. Token-plan variants (xAI CLI, MiniMax, 智谱 Coding)
+  accept a token in place of an API key.
+- **Streaming is forwarded unchanged**, terminator included; nothing is re-chunked in
+  transit. HTTP/2 and a warm connection pool keep time-to-first-token close to the
+  provider's own.
+- **Cloud traffic is isolated from local inference.** The provider registry has its
+  own lock, proxying is asynchronous, and a cloud request never touches the model
+  worker thread or the GPU — a slow provider can only delay its own request.
+- **Cloud requests leave the machine.** The configuration page states this, and cloud
+  entries are marked in the model list so a client can tell them apart.
+
+### The `auto` routing policy
+
+Disabled by default. When enabled, `auto` appears in `/v1/models` and clients may send
+`model: "auto"`:
+
+| Situation | Result |
+|---|---|
+| Local-first (default), local model resident | The local model answers |
+| Local-first, local model absent or fails to start | The request goes to the cloud |
+| Cloud-first | The cloud model answers |
+| Cloud-first, cloud unreachable | Falls back to the local model |
+| The selected side failed **after** output began | The error is returned; no second answer is substituted |
+
+Set it from the application or headlessly with
+`POST /admin/routing {"enabled":true,"prefer":"local"}`.
+
+### Speculative decoding
+
+*Chat → Parameters → Speculative* lets a model draft its own continuation and verify
+the entire draft in one batched forward pass. Three families of proposals are supported,
+and the library shows a **drafter chooser** per bundle — `auto` prefers a side-mounted
+DFlash/EAGLE checkpoint over the bundled MTP head, because a published draft file is
+the drafter made for that exact model:
+
+- **N-gram drafting** — proposes what followed the most recent repeat of the last
+  `ngram_n` tokens. The learned table persists across requests and restarts.
+- **MTP (NextN head)** — the multi-token-prediction head some models ship inside the
+  same GGUF (`qwen35.nextn_predict_layers`), or published separately as
+  `mtp-<model>-<quant>.gguf` and placed beside the model.
+- **DFlash and EAGLE-3** — a second, smaller checkpoint trained to predict the target,
+  configured with `draft_model` and `draft_n_max`.
+
+An adaptive gate (`adaptive_draft`, enabled by default, acceptance floor 0.3) disables
+drafting once it stops paying and re-enables it when the acceptance rate recovers. It
+can only ever turn drafting *off*, which makes leaving it enabled the safe direction.
+Accepted tokens are tokens the model would itself have sampled, so the optimisation is
+exact rather than approximate.
+
+<details>
+<summary>Benchmark: five drafting configurations on one model</summary>
+
+Qwen3.8-27B-UD-IQ4_XS (13.3 GB) on a 24 GB Quadro RTX 6000, `n_ctx=4096`,
+`n_gpu_layers=999`, `max_tokens=256`, temperature 1.0 / top_p 0.95 / top_k 20, seed 42,
+one fixed prompt. Rows 1–4 and 6 are three sessions of one warm-up reply followed by
+seven timed replies; row 5 is one session of five. *Decode* is generated tokens over
+all generation time.
+
+| # | Drafter | `draft_n_max` | decode tok/s | speed-up | TTFT | prefill tok/s | accept | accepted/round |
+|---|---|---|---|---|---|---|---|---|
+| 1 | none (baseline) | – | **24.3** (24.0–24.7) | — | 126–128 ms | 414–433 | – | – |
+| 2 | DFlash `Q4_0` via `draft_model` | 2 | 27.9 (25.9–30.9) | +15 % | 178–206 ms | 197–223 | 62.7 % | 1.25 |
+| 3 | DFlash2 `Q4_K_M` via `draft_model` | 3 | 27.6 (26.2–30.1) | +14 % | 204–242 ms | 174–199 | 56.5 % | 1.69 |
+| 4 | MTP side file `Q4_0` via `draft_model` | 2 | 32.6 (32.1–33.7) | +34 % | 178–215 ms | 187–224 | 64.7 % | 1.29 |
+| 5 | MTP bundled head, `--mtp-n-max` | 2 | **33.9** | **+38 %** | 172 ms | 231 | 64.9 % | 1.30 |
+| 6 | control: DFlash2 resident, `speculative: false` | – | 24.1 (24.0–24.1) | 0 % | 131–134 ms | 398–403 | – | – |
+
+- **Row 6 is the control.** A resident drafter costs nothing while idle: identical
+  decode and prefill. The time-to-first-token and prefill regression in rows 2–5 is
+  drafting being *active* — the prompt is prefilled through the drafter as well, which
+  roughly halves prefill throughput.
+- **MTP is the stronger of the two families here, and consistently so.** Both MTP rows
+  hold 32–34 tok/s across every session while the DFlash rows range from 26 to 31. MTP
+  drafts from the target's own hidden state through a head adjacent to the final
+  block, so its proposals track the target more closely and it costs one block of
+  forward pass rather than a whole second model.
+- **Draft length has a small optimum.** DFlash `Q4_0` is fastest at 2, DFlash2 at 3,
+  MTP at 2. Raising DFlash2 to 4 lowers acceptance from 56.5 % to 45.6 % and returns to
+  the throughput of `n_max=2`.
+- **Text is not bit-identical to an undrafted run.** Verifying a draft computes a batch
+  instead of a single token; floating-point sums are ordered differently, so a near-tie
+  can resolve the other way. Each path is individually deterministic.
+</details>
+
+### Measured configuration
+
+`POST /admin/fit` accepts a GGUF path — or only a `size_bytes` for a file not yet
+downloaded — and answers with `fits`, memory required against memory free, the
+`n_gpu_layers` and `n_ctx` llama.cpp would select, a smaller quantisation when the
+weights themselves are the problem, and a `reason` in plain language. The application
+exposes **Check fit** and **Adopt** per model. The verdict is advice by default;
+`strict_fit: true` refuses a load outright on request.
+
+### Prefix cache and runtime figures
+
+Because each turn contains the previous one as a prefix, re-encoding that prefix is
+most of the latency before the first token. With `prefix_cache` enabled — the default —
+the KV state is reused and only the new suffix is encoded. It is disabled automatically
+when a draft model or MTP head is loaded, because those track position separately from
+the target.
+
+```bash
+cargo run -p infer-core --example prefix_check -- models/your-model.gguf 0
+```
+
+`/admin/status` reports per-model `perf` — requests, tokens, smoothed
+`tokens_per_second`, `first_token_ms` and `draft_acceptance` — so every claim above can
+be verified rather than trusted.
+
+### Models folder and multi-file models
+
+Models are discovered by scanning the configured folder recursively for `*.gguf`
+(`C:\models` by default). Downloads are written to the same location. The GGUF header is
+read without loading the model, so the class, an MTP head and a size hint are known
+before anything is loaded.
+
+A model shipped as several files lives in its own subdirectory:
+
+```
+models/Qwen2.5-VL-7B/
+  Qwen2.5-VL-7B-Q4_K_M.gguf        # main weights
+  Qwen2.5-VL-7B.mmproj-f16.gguf    # vision projector
+  Qwen2.5-VL-7B.draft.gguf         # draft model (speculative decoding)
+```
+
+Roles are identified from the file name (`mmproj`/`projector`,
+`draft`/`eagle`/`mtp`/`dflash`, `lora`/`adapter`) and a bundle is loaded as a unit, so
+a model is never left without its projector or its drafter. A directory containing
+several unrelated models is listed file by file, since ownership cannot be inferred.
+
+**Model classes** are read from the GGUF header rather than guessed from names:
+
+| Class | Recognised by | Behaviour |
+|---|---|---|
+| `llm` | everything else | offered in the chat panel; vision bundles are included here |
+| `embedding` | a known encoder architecture (`bert`, `nomic-bert`, `jina-bert-v2`, …) | API only — never offered for chat, refused by `/v1/chat/completions` |
+| `rerank` | a `rerank.head_count` key with heads | API only |
+
+A chat model is something one converses with to evaluate it; an encoder is something a
+program points at. Neither is offered where the other belongs.
+
+### Embeddings, reranking and vision
+
+- **`/v1/embeddings`** — OpenAI response shape with unit-length vectors; raw pooled
+  output would make a dot product depend on text length. The context is configured from
+  the model's class, not from a flag. Input longer than the context is an error naming
+  the limit, never a silent truncation.
+- **`/v1/rerank`** — Cohere/Jina response shape. The input is built as
+  `BOS query SEP document EOS`, the sentence pair the classification head was trained
+  on; a NaN score sorts last, so a broken head cannot be reported as the best match.
+- **Vision** — a bundle containing a projector accepts OpenAI-style `image_url` parts on
+  `/v1/chat/completions`. Only `data:` URLs are accepted: an `http(s)` URL would turn
+  every request into an SSRF primitive and a bare path would name files on the host.
+  The projector runs on the GPU when the model is offloaded — roughly 200 ms against
+  50 s on CPU for a 336×252 image on a 40 GB card.
+
+### Reasoning control and tool calling
+
+**Thinking** is set per model in the advanced panel and may be overridden per request
+with `"thinking": true|false`. The switch reaches the chat template as
+`enable_thinking`, so the template that understands it is the one that applies it.
+
+**Tool calling** accepts an OpenAI-shaped `tools` array with optional `tool_choice` and
+`parallel_tool_calls`, and answers as an ordinary OpenAI message:
+
+```bash
+curl http://127.0.0.1:15656/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "Qwen3.8-27B",
+  "messages": [{"role":"user","content":"What is the weather in Paris?"}],
+  "tools": [{"type":"function","function":{
+    "name":"get_weather","description":"Get the current weather for a city",
+    "parameters":{"type":"object","properties":{"city":{"type":"string"}},
+                  "required":["city"]}}}]
+}'
+```
+
+```json
+{"choices":[{"index":0,"finish_reason":"tool_calls","message":{
+  "role":"assistant","content":"",
+  "reasoning_content":"The user is asking about Paris…",
+  "tool_calls":[{"type":"function",
+    "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]}}]}
+```
+
+The template formats the call and the same template's parser reads it back, so whatever
+call syntax a model family uses is understood without imposing a grammar on its
+output. `content` contains only the answer, the chain of thought is separated into
+`reasoning_content`, and raw call markup never reaches the caller. Streaming carries
+the same structure: the final chunk before `[DONE]` carries `tool_calls`, each tagged
+with its `index`, and `finish_reason: "tool_calls"`.
+
+### Streaming and cancellation
+
+`"stream": true` produces Server-Sent Events in the OpenAI shape — `id`, `object`,
+`created` and `model` on every chunk, `data: [DONE]` at the end — so the official SDKs
+work unchanged. Cancellation is honoured from both ends: closing the response body
+stops generation at the next token, as does the application's stop button. An
+abandoned reader would otherwise leave the model decoding the remainder of
+`max_tokens` into a socket nobody is reading, and because each model owns one worker
+thread, every queued request waits for it.
+
+### Model name resolution
+
+One machine can hold a chat model, an embedder and a reranker simultaneously, and each
+route resolves against the kind of model it requires. A request naming a resident model
+of that kind uses it; when the name matches nothing and exactly one model of that kind
+is resident, that model answers, so a stale identifier does not break a client. Only
+genuine ambiguity is refused, and the error names the candidates:
+
+```json
+{"error": "model \"typo\" not found and more than one llm model is loaded: llama3, qwen2.5"}
+```
+
+### The desktop application
+
+- **Tray-resident.** Closing the window hides it; models stay loaded and connected
+  clients stay attached. Quit from the tray menu.
+- **Models return after a restart or an update.** The set loaded previously is restored
+  automatically; a file that has moved is skipped.
+- **Idle unload with transparent reload.** With `keep_alive_secs` set, a model is
+  released after that many idle seconds and reloaded by the next request.
+- **A per-model advanced panel.** GPU layers, context, batching, KV offload, RoPE
+  scaling, load mode, memory locking, thinking, MTP budget and prefix cache, in one
+  place.
+- **GPU configuration without guesswork.** Settings reports the detected adapter, the
+  backend that would be selected and the backend in use, and installs a missing backend
+  on request.
+
+---
+
+## HTTP API
+
+The daemon listens on `http://127.0.0.1:15656` and serves both an OpenAI-compatible and
+an Ollama-compatible surface, so an integration written for either works after changing
+only the port.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/` | banner + endpoint index (open, no model names) |
-| GET | `/openapi.json`, `/docs` | OpenAPI 3.1 spec and a browsable page (open) |
-| GET | `/v1`, `/v1/models` | OpenAI-style model list |
-| GET | `/api/tags` | Ollama-style model list |
-| GET | `/api/version` | Ollama-style version |
-| GET | `/health` | liveness + loaded model (open) |
-| GET | `/admin/status` | model info, idle time |
-| POST | `/admin/load` | `{ "model": "path.gguf", "name": "alias", "n_gpu_layers": 999, "n_ctx": 4096, ... }` |
-| POST | `/admin/unload` | `{ "model": "alias" }` or `{}` to unload all |
-| POST | `/v1/chat/completions` | OpenAI chat; `"stream": true` for SSE |
-| POST | `/api/chat`, `/api/generate` | Ollama chat / single prompt; `"stream": true` for NDJSON |
-| POST | `/v1/embeddings` | `{ "model": "bge-small", "input": "text" }` or `"input": ["a", "b"]` |
-| POST | `/api/embed`, `/api/embeddings` | Ollama embeddings (list / legacy single) |
-| POST | `/v1/rerank` (`/rerank`) | `{ "model": "bge-reranker", "query": "…", "documents": ["…"], "top_n": 3 }` |
+| GET | `/` | Banner and endpoint index (public; no model names) |
+| GET | `/openapi.json`, `/docs` | OpenAPI 3.1 specification and an offline interactive page (public) |
+| GET | `/v1`, `/v1/models` | OpenAI-style model list — local, cloud, and `auto` when enabled |
+| GET | `/api/tags`, `/api/version` | Ollama-style model list and version |
+| GET | `/health` | Liveness and the loaded model (public) |
+| GET | `/admin/status` | Model information, classes, runtime `perf`, idle time |
+| POST | `/admin/load` | `{ "model": "path.gguf", "name": "alias", "n_gpu_layers": 999, "n_ctx": 4096, … }` |
+| POST | `/admin/unload` | `{ "model": "alias" }`, or `{}` for every model |
+| POST | `/admin/fit` | Fit a checkpoint, or a `size_bytes`, before downloading |
+| GET, POST | `/admin/providers` | List and configure cloud providers; keys are never returned |
+| POST | `/admin/providers/test` | Retrieve a provider's model list to validate a key |
+| GET, POST | `/admin/routing` | The `auto` policy: `{ "enabled": true, "prefer": "local" }` |
+| POST | `/v1/chat/completions` | OpenAI chat; `"stream": true` for Server-Sent Events |
+| POST | `/api/chat`, `/api/generate` | Ollama chat and single prompt; NDJSON when streaming |
+| POST | `/v1/embeddings`, `/api/embed`, `/api/embeddings` | Embeddings in OpenAI and Ollama shapes |
+| POST | `/v1/rerank`, `/rerank`, `/v1/reranking`, `/reranking` | `{ "model": "…", "query": "…", "documents": ["…"], "top_n": 3 }` |
 
-Ollama's `options` map onto the sampler: `temperature`, `top_k`, `top_p`,
-`min_p`, `repeat_penalty`, `repeat_last_n`, `num_predict` (generated-token cap;
-`<= 0` means "until it stops"), and `seed`. Replies carry the usual
-`prompt_eval_count` / `eval_count`, and each streamed line a `created_at`.
+Ollama's `options` object maps onto the sampler: `temperature`, `top_k`, `top_p`,
+`min_p`, `repeat_penalty`, `repeat_last_n`, `num_predict` (generated-token ceiling;
+values `<= 0` mean "until the model stops") and `seed`. Responses carry the customary
+`prompt_eval_count` and `eval_count`, and each streamed line a `created_at`.
 
-### OpenAPI
+`GET /docs` renders the specification as an interactive page with no external scripts
+or styles: a token field retained in that browser, a **Send** control per operation
+seeded from the specification's example, streaming routes consumed chunk by chunk, and
+examples that name a model which is actually loaded. Tests walk the specification and
+fail if a documented route is absent, if a schema reference is undefined, or if the
+`/docs` flow regresses in a real browser.
 
-`GET /openapi.json` serves an OpenAPI 3.1 specification covering every route on
-both surfaces, so editors, Postman and client generators can read the API
-directly. Request bodies carry `example` payloads, which those tools pick up too.
+### Configuration
 
-`GET /docs` renders that specification as a browsable, **interactive** page with
-no external scripts or styles — it works on a machine with no internet access:
+Defaults are the recommended values; every option is also available in Settings and in
+the per-model **Advanced** panel. `POST /admin/load` accepts:
 
-- a token field (kept in that browser) so protected routes can be called once a
-  key is set;
-- a **Send** button per operation, an editable body seeded from the spec's
-  example, and a response pane showing status and payload;
-- streaming routes (SSE and NDJSON) are read chunk by chunk, so you watch tokens
-  arrive rather than waiting for the reply to finish;
-- **examples name a model that is actually loaded**, picked per route class
-  (chat → llm, embeddings → embedding, rerank → rerank). The spec's placeholders
-  would otherwise answer 400 out of the box.
+| Group | Parameters |
+|---|---|
+| Model | `n_gpu_layers` (999 = all), `main_gpu`, `load_mode` (`auto｜none｜mmap｜mlock｜mmap_mlock｜dio`), `use_mlock` |
+| Context | `n_ctx` (0 = automatic, sized to the machine), `n_batch` (2048), `n_ubatch` (512), `flash_attn` (`auto｜on｜off`), `offload_kqv`, `rope_freq_base`, `rope_freq_scale` |
+| CPU | `threads`, `threads_batch` (0 = automatic) |
+| Adapters | `load_mtp` (bundled MTP head), `lora` (list of adapter paths) |
+| Sampling (per request) | `temperature`, `top_k`, `top_p`, `min_p`, `repeat_penalty`, `repeat_last_n`, `repeat_freq`, `repeat_present`, `seed`, `max_tokens` |
+| Speculative (per request) | `speculative`, `ngram_n`, `ngram_m` |
 
-Both pages are open, like the banner, so a client can bootstrap before it has the
-API key. A test walks the specification and fails if any documented route does not
-actually exist, another fails on a `$ref` to a schema that is not defined, and the
-`/docs` flow — open the page, send an operation, read the reply — is exercised in
-a real browser over the DevTools protocol.
+The daemon exposes the same options as command-line flags (`--load-mode`,
+`--flash-attn`, `--n-batch`, `--no-offload-kqv`, …) for headless and container use.
 
-`keep_alive_secs = 0` keeps models resident (instant opens); a positive value
-unloads them after that many idle seconds.
+Two flags exist to serve the app itself rather than an API in front of something
+else, which is what the web container does:
 
-**Every API route requires `model` explicitly.** One machine can hold a chat
-model, an embedder and a reranker at once, and guessing which one a request meant
-turns a typo into the wrong model answering. Omit it and the error lists what is
-loaded:
+| Flag | Effect |
+|---|---|
+| `--ui-dir <dir>` | Serve the built UI from `<dir>`: `/` answers the app, its assets are served from the paths they were built at, and the API is merged on the same port. Without it, `/` is the banner that says what the server is. |
+| `--models-dir <dir>` | The folder `GET /admin/models` lists, read with the same rules the desktop library uses (`model-index`), so a library opened in a browser and one opened in the app cannot disagree about what a model is. Unset answers `{"dir": null, "models": []}` rather than a 404. |
 
-```json
-{"error": "\"model\" is required; loaded: bge-reranker, bge-small, qwen2.5"}
-```
+`--ui-dir` and `--models-dir` are why the web image needs no nginx: one process, one
+port, and the browser talks to the same origin that serves the app.
 
-The chat panel is the exception: it defaults to the model you last used there,
-falling back to the first-loaded generation model, and remembers your choice.
+### Network exposure and security
 
-### Network access
-
-The daemon binds `127.0.0.1` by default, so nothing but this machine can reach
-it. Settings → **Network** can widen that to `0.0.0.0`, which accepts
-connections from every interface:
+The daemon binds `127.0.0.1` by default, so nothing beyond the machine can reach it.
+Settings → *Network* can widen the binding to `0.0.0.0`, which requires a bearer token:
 
 ```powershell
 infer-daemon.exe --host 0.0.0.0 --port 15656 --api-key <token> --model model.gguf
 ```
 
-**You have to set an access token when you do.** The server has no accounts, no
-rate limit and no quota — anyone who can reach the port can load models onto
-your GPU and burn your electricity. The token is a bearer value, compared in
-constant time, and required on every route except `/health` (left open for
-readiness probes; it reveals loaded model names and nothing else).
-
-Binding to a routable address without one is **refused**, not warned about:
+The server has no accounts, no rate limiting and no quota; anyone who can reach the
+port can load models onto the machine's GPU and consume the electricity. The token is
+compared in constant time and required on every route except `/health`, which remains
+public for readiness probes and reveals only the loaded model name. Binding to a
+routable address **without** a token is refused:
 
 ```
 refusing to listen on 0.0.0.0 without --api-key: anyone who can reach this port
@@ -210,620 +533,148 @@ can load models and spend GPU time on them. Pass --api-key <token>, bind to
 127.0.0.1, or pass --allow-unauthenticated if something else guards the port
 ```
 
-`--allow-unauthenticated` is the escape hatch for a container or a reverse
-proxy that authenticates callers itself. An empty `--api-key ""` is an error
-rather than a silent way to switch authentication off.
-
-The desktop app keeps the token in the OS credential store — Credential
-Manager, the keychain, the Secret Service — and passes it to the daemon through
-`NEXLLAMA_API_KEY`, so it is neither written next to the settings file nor
-visible in the process's command line. The same variable works for a daemon you
-start yourself.
-
-Cross-origin requests are answered only for this app's own origins (the WebView
-it serves and the Vite dev server); add others with `--cors-origin <origin>`.
-The point is that opening a web page should not hand that page a way to drive
-the daemon.
-
-From another machine:
-
-```bash
-curl http://192.168.1.20:15656/v1/chat/completions \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"alias","messages":[{"role":"user","content":"hi"}]}'
-```
-
-The desktop app fills in the token from Settings automatically, so it keeps
-working after you set one.
-
-## Parameters
-
-Defaults are the recommended values; everything can be tuned in Settings and in the
-per-model **Advanced** panel on the Models page. Loading accepts:
-
-- Model: `n_gpu_layers` (999 = all), `main_gpu`, `load_mode` (`auto|none|mmap|mlock|mmap_mlock|dio`), `use_mlock`
-- Context: `n_ctx` (0 = model default), `n_batch` (2048), `n_ubatch` (512), `flash_attn` (`auto|on|off`), `offload_kqv`, `rope_freq_base`, `rope_freq_scale`
-- CPU: `threads`, `threads_batch` (0 = auto)
-- Adapters: `load_mtp` (bundled MTP head), `lora` (list of adapter paths)
-- Sampling (per request): `temperature`, `top_k`, `top_p`, `min_p`, `repeat_penalty`, `repeat_last_n`, `repeat_freq`, `repeat_present`, `seed`, `max_tokens`
-- Speculative (per request): `speculative`, `ngram_n`, `ngram_m`
-
-The daemon exposes the same options as CLI flags (`--load-mode`, `--flash-attn`,
-`--n-batch`, `--no-offload-kqv`, ...) for headless/Docker use.
-
-## Smart Fit
-
-Nexllama measures the machine and the checkpoint rather than asking you to guess
-at parameters. Every number comes from llama.cpp's own fitting helpers — the same
-ones `llama-cli` uses — not from an estimate about layer sizes, because a
-confident wrong estimate ends in an out-of-memory kill part-way through a load.
-
-**`POST /admin/fit`** measures one checkpoint. Give either:
-
-- `model`: a path to a GGUF already on disk, plus optional `n_ctx`; or
-- `size_bytes`: the size of a file that has not been downloaded yet.
-
-It answers with `fits`, how much is needed against how much is free, the
-`n_gpu_layers` and `n_ctx` llama.cpp would pick, a smaller quantisation when the
-weights themselves are the problem, and a `reason` in plain words.
-
-In the app, the Models page has a **Check fit** button beside each model in the
-library, and **Adopt** applies the suggested layer count and context to the form.
-Downloads are checked against free memory before the transfer starts.
-
-All of it is advice. `/admin/load` accepts `strict_fit: true` if you want a load
-refused outright, but nothing is blocked by default: being wrong about memory
-costs a kill, while a wrong warning costs nothing.
-
-### Prefix cache
-
-A conversation grows a turn at a time, so every prompt after the first contains
-the one before it as a prefix — and re-encoding that prefix is most of the wait
-before the first token. With `prefix_cache` on, the KV state is reused and only
-the new suffix is encoded.
-
-It is off by default. This one is stateful, and being wrong would not raise an
-error: it would quietly produce the wrong reply. Verify before enabling it on a
-model you care about:
-
-```bash
-cargo run -p infer-core --example prefix_check -- models/your-model.gguf 0
-```
-
-That runs the same conversation twice, once with the cache on and once off, and
-compares the replies. On a 0.5B model the second turn took 95% less time to
-encode, with identical output. It switches itself off whenever a draft model or
-MTP head is loaded, because those track position separately from the target.
-
-### Adaptive speculative decoding
-
-Drafting only pays while the model confirms what is proposed; a rejected proposal
-is a forward pass that produced nothing. With `adaptive_draft` (on by default,
-floor `accept_floor` = 0.3) drafting is switched off once measurement says it is
-not paying for itself, and allowed back if the rate recovers. It only ever turns
-drafting *off*, so leaving it enabled is the safe direction.
-
-### Runtime figures
-
-`/admin/status` reports per-model `perf`: requests, tokens, and smoothed
-`tokens_per_second`, `first_token_ms` and `draft_acceptance` — so each of the
-above can be checked rather than taken on faith.
-
-## Models folder
-
-Models live in a folder scanned recursively for `*.gguf`. The path defaults to
-`%APPDATA%/com.nexllama.desktop/models` (app data dir) and is chosen in Settings with a
-native folder picker (**Select folder** / **Open folder**). The library lists every GGUF
-it finds; click **Load** to bring one up, or tick one or more under **Auto-load at start**
-to keep them resident from launch. Downloads land in the same folder.
-
-Point the app at a folder that *is* one model's folder — weights with a projector and
-a draft beside them — and the library shows that as a single row whose **Load** takes
-all the files. A folder holding several models stays listed file by file, since there
-is no way to tell whose projector is whose.
-
-### Multi-file models
-
-A model that ships several files lives in its own subfolder:
-
-```
-models/Qwen2.5-VL-7B/
-  Qwen2.5-VL-7B-Q4_K_M.gguf        # main
-  Qwen2.5-VL-7B.mmproj-f16.gguf    # projector
-  Qwen2.5-VL-7B.draft.gguf         # draft (speculative)
-```
-
-Roles are recognized from the filename (`mmproj`/`projector`, `draft`/`eagle`/`mtp`/`dflash`,
-`lora`/`adapter`) and the bundle is loaded together. Wired today: **LoRA adapters**,
-**vision projectors**, and the **draft file** — the `draft` role becomes `draft_model`,
-which is what drives DFlash / EAGLE-3 / side-mounted MTP drafting once *Speculative*
-is on. The same-file MTP head is a per-model load option (`load_mtp`) rather than a
-bundle role. The load response returns a `notes` field naming what is in play instead
-of silently ignoring anything.
-
-**Auto-load at start takes the same files.** The daemon accepts `--mmproj` and
-`--draft-model` alongside `--model` (one value for every model, or one per model),
-and the app resolves the bundle before spawning, so a model that is resident from
-launch is not missing its projector or its drafter. When the model carries its own
-MTP head, that head is passed instead of the draft file: it needs no second set of
-weights and drafts faster, and the library has an **MTP** checkbox per bundle for
-turning it off.
-
-### Model classes
-
-Every GGUF is classified when it is scanned, from its own header — no name
-guessing, no extension heuristics:
-
-| class | how it is recognised | what the app does with it |
-|---|---|---|
-| `llm` | everything else | the chat panel's dropdown — for testing and tuning; vision models land here too |
-| `embedding` | a known encoder architecture (`bert`, `nomic-bert`, `jina-bert-v2`, …) | **API only** — library badge, never in the chat dropdown, refused by `/v1/chat/completions` |
-| `rerank` | a `rerank.head_count` key with heads | **API only**, same as embedding |
-
-The split is the point: a chat model is something you test and tune by talking to
-it, and an encoder is something you point a program at. Neither appears where the
-other belongs, and the composer says so when the only models loaded are API ones.
-A bundle carrying a projector is still class `llm` — it is the bundle's `kind` that
-becomes `vision`, and once loaded it accepts images.
-
-The class travels in `/admin/status` (`info.model_class`) and is enforced in the
-daemon too, so an API client pointing at an embedding model gets
-
-```json
-{"error": "bge-small-en-v1.5-q8_0 is a embedding model — it cannot generate text; load a chat model (class llm)"}
-```
-
-instead of three hundred tokens of word salad. Classification covers what the
-header can honestly express: an embedding model that reuses a generation
-architecture (gte is `qwen2` under the hood) still classifies as `llm`, which is
-the safe direction here — it only affects what the UI offers, and generation is
-the only thing this app actually runs.
-
-## Embeddings
-
-An encoder model loaded from the library serves `/v1/embeddings` with the
-OpenAI shape, so anything already pointed at that API works:
-
-```bash
-curl http://127.0.0.1:15656/v1/embeddings -H "Content-Type: application/json" \
-  -d '{"model": "bge-small", "input": ["a cat is sleeping", "a kitten naps", "stocks fell"]}'
-```
-
-```json
-{"object":"list","model":"bge-small",
- "data":[{"object":"embedding","index":0,"embedding":[...384 floats...]}, ...],
- "usage":{"prompt_tokens":18,"total_tokens":18}}
-```
-
-- **The context is built from the class**, not from a flag: an encoder gets
-  embeddings enabled, a ranker additionally gets the `rank` pooling type (without
-  it the head never reaches the graph and every score would be identical), and a
-  chat model is left alone. `info.pooling` in `/admin/status` reports what the
-  context ended up with — bge-small comes back `cls`, read from its own metadata
-  rather than overridden, because forcing mean pooling there would quietly
-  degrade the vectors.
-- **Chat and embeddings refuse each other**, each naming what to load instead.
-  An encoder cannot generate, and a chat model loaded here has embeddings
-  disabled.
-- **Texts are embedded one forward pass at a time.** Parallel sequences would
-  need `n_seq_max` and a per-sequence batch layout for no gain at these request
-  sizes.
-- **Vectors are returned at unit length**, as the OpenAI-shaped API and
-  llama.cpp's own server do. Raw pooled output would make a dot product depend
-  on the length of the text, so a client comparing two documents by cosine
-  similarity would get a different answer than it expects.
-- A text longer than the context is an error naming the limit, not a silent
-  truncation — encoder contexts are small (512 for bge-small) and quietly
-  cutting a document in half would give a confidently wrong vector.
-
-Reranking is classified (`rerank` in `/admin/status`) but has no endpoint yet:
-the cross-encoder input format depends on a `rerank` chat template the model may
-or may not carry, and it has not been verified against a real reranker here.
-
-## Reranking
-
-A reranker serves Cohere/Jina-shaped `/v1/rerank` (also `/rerank`,
-`/v1/reranking`, `/reranking`, matching upstream llama.cpp):
-
-```bash
-curl http://127.0.0.1:15656/v1/rerank -H "Content-Type: application/json" \
-  -d '{"model": "bge-reranker", "query": "What is the capital of France?",
-       "documents": ["Berlin is the capital of Germany.",
-                     "Paris is the capital of France.",
-                     "Bananas are a good source of potassium."]}'
-```
-
-```json
-{"model":"bge-reranker",
- "results":[{"index":1,"relevance_score":7.3092,"document":"Paris is the capital of France."},
-            {"index":0,"relevance_score":-5.7594,"document":"Berlin is the capital of Germany."},
-            {"index":2,"relevance_score":-11.0402,"document":"Bananas are a good source of potassium."}],
- "usage":{"total_tokens":64}}
-```
-
-Those are real numbers from bge-reranker-v2-m3: the right document leads by a wide
-margin, and the hard negative — a capital city, wrong country — lands clearly
-below it. `top_n` trims the list; ties keep submission order; a NaN score sorts
-last instead of first, so a broken head cannot be reported as the best match.
-
-- **The context gets `rank` pooling**, without which the head never reaches the
-  graph and every score would be identical. `info.pooling` reports `rank`.
-- **The input is `BOS query SEP document EOS`** — for a BERT reranker that is
-  `[CLS] query [SEP] document [SEP]`, the sentence pair the head was trained on.
-  A model that ships its own `rerank` chat template needs a different format this
-  build does not apply yet, so it is refused rather than scored wrongly.
-- **The rank output is read straight from the context**, not through
-  `LlamaContext::embeddings_seq_ith`, which slices `n_embd` floats: right for a
-  pooled embedding, but a rank head emits `n_cls_out` (one float for
-  bge-reranker), so that call would read hundreds of floats past the buffer.
-
-### Telling a reranker from its embedding sibling
-
-bge-reranker-v2-m3 and bge-m3 share an architecture, a name (`Bge M3`) and every
-KV key — llama.cpp itself needs the caller to declare `--pooling rank` for them.
-The only thing that differs is the classification head, so the classifier reads
-the tensor names and looks for llama.cpp's `cls.*` head. `gguf-probe` ships a
-diagnostic for exactly this:
-
-```powershell
-cargo run -p gguf-probe --example probe -- model.gguf --keys
-```
-
-## Vision
-
-Load a model with `--mmproj <projector.gguf>` (or click **Load** on a bundle
-that contains one) and the same `/v1/chat/completions` endpoint accepts
-OpenAI-style image parts:
-
-```bash
-curl http://127.0.0.1:15656/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{
-    "model": "SmolVLM-256M-Instruct-Q8_0",
-    "messages": [{"role": "user", "content": [
-      {"type": "text", "text": "What color is the bar at the bottom?"},
-      {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
-    ]}]
-  }'
-```
-
-Details worth knowing:
-
-- **Only `data:` URLs are accepted.** An `http(s)` URL would make every request
-  an SSRF primitive against whatever the host can reach, and a bare path would
-  name files on this machine; both are refused. `image_url` and `input_image`
-  are the recognised part types, `text` the rest.
-- **The projector runs on the GPU** when the model is offloaded — a 336×252
-  image takes ~200 ms on a 40 GB card versus ~50 s on CPU, so this is where the
-  difference actually lives.
-- **N-gram drafting is disabled for image prompts.** Image positions have no
-  token ids, so the drafters would work from a history that does not match what
-  is in the KV cache; drafting is a performance optimisation and verification
-  would keep it correct either way, but there is nothing honest to fast-forward.
-- The composer's paperclip accepts images up to 4 MB and previews them inline;
-  a conversation re-sends its images with every turn, which is why the limit
-  exists.
-- `info.vision` in `/admin/status` says whether a model can see.
-
-## Speculative decoding
-
-Chat → **Params** → *Speculative* lets the model draft its own continuation and
-then check the whole guess in one batched forward pass:
-
-1. `ngram_simple_draft` finds the most recent repeat of the last `ngram_n`
-   tokens and proposes the `ngram_m` tokens that followed it last time.
-2. The target model decodes the anchor token and the whole draft in a **single**
-   batch, which yields `draft + 1` logit rows.
-3. Verification walks those rows one at a time, keeps the draft prefix the model
-   agrees with, and samples one replacement token at the first point of
-   disagreement.
-4. The rejected tail is dropped from the KV cache, because llama.cpp requires
-   every batch to begin exactly one position past the cache's last one.
-
-Two drafters feed it, and their proposals are unioned: the stateless one finds
-repeats inside the current conversation, and a small statistical model learned
-from earlier replies proposes what usually followed the same n-grams. The
-learned table lives in `%APPDATA%/com.nexllama.desktop/ngram-cache.json`
-(`--ngram-cache <path>`), so drafts keep working across requests and restarts.
-It stops learning past 65536 distinct contexts, which bounds a long-running
-server; drafts from what it already knows keep working.
-
-Verification is written out by hand rather than calling
-`common_sampler_sample_and_accept_n`, because the Rust binding reaches that
-function through a size-then-fill wrapper that runs the whole check **twice**.
-The first pass feeds every token it verifies back into the sampler, so the
-second pass can disagree and need more output space than the first one sized —
-an opaque failure partway through a reply. Sampling row by row has no buffer to
-size and does not double-count the sampler's history.
-
-Accepted tokens are tokens the model itself would have sampled, so this is an
-exact optimisation — not an approximation. Two practical notes:
-
-- **It only pays off on repetitive text.** Prose usually has no repeat to copy,
-  the drafter returns nothing, and the round degenerates to the normal
-  one-token-per-pass path. Repetitive output (code, logs, JSON, lists) is where
-  it wins — asking the same question twice in a row hits 100% acceptance. A
-  round that gets nothing accepted pauses drafting for one step so a bad guess
-  costs one wasted pass rather than two.
-- **Text is not bit-identical to a non-speculative run.** Verifying a draft
-  means computing a batch instead of a single token, and floating-point sums in
-  a different order, so a near-tie can resolve the other way. Both paths are
-  individually deterministic; with drafting effectively disabled the two produce
-  byte-identical output.
-
-Every reply reports the hit rate, e.g. `draft 6/32 (19%)`.
-
-### MTP (NextN head)
-
-Some models ship a multi-token-prediction head inside the same GGUF —
-`qwen35.nextn_predict_layers`, for instance, which is what Qwen3.8-27B's own file
-carries. llama.cpp will only read that head when asked, and it is what the
-reference command uses to go fast:
-
-```bash
-llama-server -m model.gguf -ngl 99 --spec-type draft-mtp --spec-draft-n-max 3
-```
-
-The app detects the head from the GGUF (`nextn_predict_layers`, or `nextn` tensor
-names) and reports it as `info.mtp` in `/admin/status`, with a badge and an **MTP**
-checkbox in the library. The checkbox is on whenever the file has a head, so
-loading one of these models drafts out of the box; `load_mtp` in the reply says
-whether the head was actually read. `load_mtp` is a request to *draft*, not to keep
-weights resident: with no budget given it falls back to `draft_n_max` (default 2)
-rather than loading a head that never gets used.
-
-Two routes reach the same draft loop:
-
-- **Bundled head** — the default when the model has one: `load_mtp` builds a
-  second context of type `mtp` over the same weights, and the reply goes through
-  the MTP draft loop instead of the ordinary one. `--mtp-n-max N` on the daemon,
-  or `mtp_n_max` on `/admin/load`, sets the budget explicitly; `--load-mtp` on its
-  own takes the default.
-- **Side-mounted head**: the same NextN tensors published as their own GGUF
-  (`mtp-<model>-<quant>.gguf`: `blk.<last>`, `blk.<last>.nextn.*`, embeddings,
-  output, nothing else). Point `draft_model` at that file. The arch and the
-  `nextn` tensors are what identify it as an MTP head rather than a truncated
-  model, and it is loaded with `load_mtp` because llama.cpp otherwise skips
-  every tensor in it. Dropping it into the model's folder is enough — the
-  bundle picks it up as the draft. Only used when the head is turned off, since
-  the engine takes one drafter per load.
-
-Both routes need recurrent-state snapshots sized to the draft length so a
-rejected draft can be rolled back; the engine raises `n_rs_seq` on its own once
-a drafter is configured, which is what lets a hybrid cache like Qwen3.8's take
-part at all.
-
-Note also that the n-gram drafter above is refused on models whose KV cache
-cannot drop rejected draft tokens (a hybrid cache with `n_rs_seq` at 0 is the
-case): the first rejected draft latches drafting off for that engine, rebuilds
-the cache from what was actually committed and finishes the reply one token at a
-time. The daemon reports that instead of returning wrong tokens.
-
-An abandoned stream is abandoned properly: when the reader goes away the engine
-stops at its next emitted token instead of finishing `max_tokens` into a socket
-nobody is reading. Cancelling a 600-token reply used to block the next request
-for the remainder of the generation; now the following request starts within a
-second.
-
-Both routes are measured against the alternatives at the end of this section.
-
-### Draft models: DFlash and EAGLE-3
-
-Self-speculation only pays off on repetitive text, because there has to be a
-repeat to copy. A **draft model** is the other way: a second, smaller checkpoint
-trained to predict the target, so proposals come from learned weights instead of
-from this conversation.
-
-```bash
-curl http://127.0.0.1:15656/admin/load -H "Content-Type: application/json" -d '{
-  "model": "/models/Qwen3.8-27B-UD-IQ4_XS.gguf",
-  "draft_model": "/models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
-  "draft_n_max": 3
-}'
-```
-
-Then ask for it per request with `"speculative": true` (or tick *Speculative* in
-Chat → Params). The two routes are complementary rather than competing:
-
-`draft_n_max` defaults to **2** when it is left out — measured, not cautious: each
-extra proposed token costs another drafter round and widens the verification pass
-while acceptance falls, and 2 was the peak for DFlash and for MTP on Qwen3.8-27B
-(the numbers are below). A model loaded at start-up takes the same pair as daemon
-flags: `--draft-model <path>` and `--draft-n-max <n>`.
-
-| | MTP head | DFlash / EAGLE-3 |
-|---|---|---|
-| Where the weights come from | bundled in the target, or a side-mounted `mtp-*.gguf` | a separate checkpoint |
-| Set with | `load_mtp` / `mtp_n_max`, or `draft_model` | `draft_model` + `draft_n_max` |
-| Which models can use it | only ones that shipped MTP heads | any dense model with a matching drafter |
-| Typical source | Unsloth releases | **z-lab** for DFlash |
-
-Qwen3.8-27B ships both. `z-lab/Qwen3.8-27B-DFlash2-GGUF` is the DFlash drafter for
-it, and its NextN head is available twice over: the four `blk.64.nextn.*` tensors
-sit inside the target file already (that is what `info.mtp` sees), and an MTP-only
-GGUF of the same head — `mtp-Qwen3.8-27B-Q4_0.gguf`, last block plus NextN plus the
-embeddings and output rows — can be pointed at with `draft_model`. Both drafters are
-detected from their own GGUF metadata, so nothing extra has to be declared beyond
-pointing at the file.
-
-Both drafters work from the target's hidden states, so neither is used for image
-prompts; a request with images falls back to ordinary decoding rather than
-drafting from a history that does not match what is in the cache.
-
-### Measured: five ways to draft, one model
-
-Qwen3.8-27B-UD-IQ4_XS (13.3 GB) on a 24 GB Quadro RTX 6000, `n_ctx=4096`,
-`n_gpu_layers=999`, `max_tokens=256`, temperature 1.0 / top_p 0.95 / top_k 20,
-seed 42, one fixed prompt. Rows 1–4 and 6 are three separate sessions of a warm-up
-reply followed by **7 timed replies**; row 5 is one session of 5. `decode` is all
-generated tokens over all generation time, so it does not scale with how many
-replies were timed.
-
-| # | drafter | `draft_n_max` | decode tok/s | speed-up | TTFT | prefill tok/s | accept | accepted/round |
-|---|---|---|---|---|---|---|---|---|
-| 1 | none (baseline) | – | **24.3** (24.0–24.7) | — | 126–128 ms | 414–433 | – | – |
-| 2 | DFlash `Q4_0`, `draft_model` | 2 | 27.9 (25.9–30.9) | +15 % | 178–206 ms | 197–223 | 62.7 % | 1.25 |
-| 3 | DFlash2 `Q4_K_M`, `draft_model` | 3 | 27.6 (26.2–30.1) | +14 % | 204–242 ms | 174–199 | 56.5 % | 1.69 |
-| 4 | MTP side file `Q4_0`, `draft_model` | 2 | 32.6 (32.1–33.7) | +34 % | 178–215 ms | 187–224 | 64.7 % | 1.29 |
-| 5 | MTP bundled head, `--mtp-n-max` | 2 | **33.9** | **+38 %** | 172 ms | 231 | 64.9 % | 1.30 |
-| 6 | control: DFlash2 loaded, `speculative: false` | – | 24.1 (24.0–24.1) | 0 % | 131–134 ms | 398–403 | – | – |
-
-Row 5 is measured against its own session's baseline, which was 24.6 tok/s.
-
-What the rows say:
-
-- **Row 6 is the sanity check.** Having a 1 GB drafter resident costs nothing
-  when it is not used: same decode, same prefill as row 1. The TTFT and prefill
-  loss in rows 2–5 is not the file sitting in VRAM, it is drafting being on —
-  the prompt has to be prefilled through the drafter too, which is why prefill
-  roughly halves. On a long prompt that is the part of the bill that matters;
-  on this 30-token prompt it is 45–115 ms of a ~130 ms TTFT.
-- **MTP wins on this model, and it wins consistently.** Both MTP rows sit at
-  32–34 tok/s in every session while the two DFlash rows wander between 26 and
-  31. MTP drafts from the target's own hidden state through a head that lives
-  next to the last block, so its proposals track the target more closely
-  (64.9 % accepted), and the forward pass that buys them is over one block plus
-  the head — shared with the target, or a 1.6 GB side file — rather than over a
-  whole second model.
-- **The bundled head is the better of the two MTP routes** (33.9 vs 32.6): it
-  shares the target's own `blk.64` and embeddings instead of re-reading a
-  separately quantised copy of them, and it costs no extra VRAM beyond the KV
-  cache. It is also the one the desktop build reaches: the library's **MTP**
-  checkbox is on whenever the file has a head, and unticking it falls back to
-  the side-mounted file (row 4) when the folder has one.
-- **Acceptance is reproducible; the speed-up is not, quite.** Given the same
-  seed, all three sessions produced byte-identical draft counters (rows 2–4 are
-  exact), but decode wanders by ~15 % between sessions. Drafting adds a second
-  model's kernel launches plus CPU-side sampling between every round, and that
-  is the part that competes with everything else on the machine.
-- **Longer drafts are not free.** Each drafter has its own optimum and it is
-  small: DFlash `Q4_0` is fastest at 2, DFlash2 at 3, MTP at 2. Pushing
-  DFlash2 to 4 takes acceptance from 56.5 % to 45.6 % and lands back at the
-  speed of `n_max=2`; pushing it to 7 is barely better than drafting nothing.
-  The model block size caps DFlash at 8, and the daemon clamps anything above
-  it rather than erroring.
-
-Reproduce rows 1–4 and 6 with `POST /admin/load` (`draft_model`, `draft_n_max`)
-and row 5 with the same call (`"load_mtp": true`, or `"mtp_n_max": 2` for an
-explicit budget) or by starting the daemon with `--mtp-n-max 2`; then one warm-up
-reply followed by `max_tokens: 256` replies with `speculative: true` while watching
-`stats.draft_tokens`, `stats.accepted_draft_tokens` and `stats.draft_rounds`;
-`decode = generated_tokens * 1000 / gen_ms` summed over the timed replies rather
-than averaged per reply — averaged per reply and then divided into the total
-token count inflates the result by the number of replies.
-
-## Where models come from
-
-Search is unrestricted, but three authors cover nearly everything worth running
-locally, and the download page offers them as one-click filters:
-
-- **bartowski** — the broadest catalogue, one model at many sizes;
-- **Unsloth** — dynamic quants and the releases carrying the extra heads MTP
-  needs;
-- **z-lab** — the DFlash draft models (UCSD's Z-Lab, who proposed and lead it).
-
-Quantising well is a craft, and a bad quant costs accuracy that no amount of
-context or sampling buys back. Everything on the Hub still works; these are what
-gets offered first.
+`--allow-unauthenticated` exists for a container or reverse proxy that authenticates
+callers itself; an empty `--api-key ""` is an error rather than a quiet way to disable
+authentication. The application stores its token in the operating system's credential
+store and passes it to the daemon through `NEXLLAMA_API_KEY`, so it appears neither
+beside the settings file nor in a process command line. Cross-origin requests are
+answered only for the application's own origins; others are added with
+`--cors-origin <origin>`.
+
+Image inputs are restricted to `data:` URLs, and the application's capability manifest
+grants nothing beyond `opener:default`.
+
+---
+
+## Model downloads
+
+Search is unrestricted; the download page offers the three catalogues that cover nearly
+everything worth running locally as one-click filters:
+
+- **bartowski** — the broadest catalogue, one model across many quantisations
+- **Unsloth** — dynamic quantisations and the releases that carry the heads MTP needs
+- **z-lab** — the DFlash draft models (UCSD's Z-Lab, which proposed and leads the method)
+
+Quantisation is a craft, and a poor one costs accuracy that no amount of context
+recovers; everything else on the Hub remains available. Downloads are resumable and are
+checked against free memory before the transfer begins. The client defaults to
+`https://hf-mirror.com`; override with `HF_ENDPOINT`, and authenticate gated
+repositories with `HF_TOKEN`.
 
 ## Backend updates
 
-The llama.cpp backends are versioned separately from the app, so an engine update does not
-require reinstalling. Point Settings → **Backend updates** at a manifest URL; the app checks
-it, downloads the matching backend zip, verifies its SHA-256, swaps
-`%APPDATA%/com.nexllama.desktop/backends/<name>/`, and restarts the daemon. Updated backends
-take precedence over the ones bundled in the installer.
+Settings → *Backend updates* accepts a manifest URL. The app checks the manifest,
+downloads the matching backend archive, verifies its SHA-256, replaces
+`%APPDATA%/com.nexllama.desktop/backends/<name>/` and restarts the daemon. An updated
+backend takes precedence over the bundled one.
 
-**A manifest has to be signed.** A checksum only proves the archive matches the
-manifest that named it, and both arrive from the same request — so hash alone
-would let anyone who can serve one serve the other. The app therefore:
-
-- requires an **Ed25519 signature** over the manifest's version, llama.cpp build
-  and every backend's URL and hash;
-- reads the public key from Settings → **Backend updates**, or from
-  `NEXLLAMA_UPDATE_KEY` at build time — there is no key compiled in by default,
-  because an updater that trusts any key is an updater that checks none;
-- fetches the manifest and the archive over **HTTPS only**, including after
-  redirects;
-- refuses a version that is **older** than what is installed.
-
-Make a keypair and sign a manifest with:
+A manifest must be **signed**: an Ed25519 signature over its version, llama.cpp build
+and each backend's URL and hash. A checksum alone only proves the archive matches the
+manifest that named it, and both arrive from the same request, so hash verification
+alone would let anyone who can serve one serve the other. The public key is taken from
+Settings or from `NEXLLAMA_UPDATE_KEY`; no key is compiled in, because an updater that
+trusts any key verifies nothing. Fetches are HTTPS-only including after redirects, a
+version older than the installed one is refused, and manifest, archive and unpacked
+totals are size-capped so a malformed release cannot exhaust the disk.
 
 ```powershell
-cargo run -p nexllama-app --example new-update-key     # public + private hex
+cargo run -p nexllama-app --example new-update-key     # public and private key, hex
 cargo run -p nexllama-app --example sign-manifest -- manifest.json <private-hex>
-```
-
-The connection is also capped in size (manifest, archive and unpacked total) so
-a bad release cannot fill the disk.
-
-Produce the artifacts with:
-
-```powershell
 .\scripts\make-backend-release.ps1 -Version 0.2.0 -LlamaCpp b10502 `
   -BaseUrl https://github.com/<owner>/<repo>/releases/download/v0.2.0
 ```
 
-then sign `manifest.json` and upload it with the `*.zip` files to that release.
+---
 
+## Architecture
 
-## Docker
-
-```bash
-docker compose build
-MODEL=/models/qwen2.5-0.5b-instruct-q4_k_m.gguf docker compose up   # CPU
-docker compose -f docker-compose.cuda.yml up                       # CUDA (needs nvidia-container-toolkit)
+```
+frontend/          Svelte 5 + Vite interface (chat, models, downloads, settings)
+crates/
+  infer-core/      safe wrapper over llama.cpp (llama-cpp-4): load, chat, streaming
+  infer-daemon/    axum HTTP service: /health, /admin/*, /v1/* (SSE), cloud proxy
+  infer-hub/       HuggingFace client: search, file listing, resumable download
+  gguf-probe/      GGUF header reader: model class, MTP head detection, size hints
+  app/             Tauri 2 desktop shell
+                   · probes the machine and selects a backend
+                   · bundles each backend under backends/<name>/
+                   · stores cloud keys in the OS credential store
 ```
 
-Models are mounted read-only from `./models`. Env overrides: `PORT`, `MODEL`,
-`N_GPU_LAYERS`, `N_CTX`, `KEEP_ALIVE_SECS`, `MODELS_DIR`, and build arg
-`CRATES_MIRROR` for a crates.io mirror.
+The interface drives the daemon over local HTTP. `infer-core` executes llama.cpp on a
+dedicated worker thread per model and streams decoded UTF-8; cloud traffic is proxied
+asynchronously and never enters that thread.
 
-The image binds `0.0.0.0` so the host can reach it, and passes
-`--allow-unauthenticated` because nothing in front of it authenticates callers.
-That is fine for `docker compose up` on a laptop; put `--api-key <token>` (or a
-reverse proxy) in front before exposing the port to a network. Both images run
-as an unprivileged user and install the llama.cpp shared libraries into
-`/usr/local/lib`.
+---
 
-## Streaming
+## Troubleshooting
 
-`POST /v1/chat/completions` with `"stream": true` answers Server-Sent Events in
-the OpenAI shape — `id`, `object`, `created`, `model` on every chunk, and
-`data: [DONE]` at the end — so the official SDKs work unchanged.
+**The installer is flagged by SmartScreen, or macOS refuses to open the application.**
+Builds are not signed by default. Signing and notarising a macOS build requires an
+Apple Developer account and `APPLE_SIGNING_IDENTITY`, `APPLE_CERTIFICATE`,
+`APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID`, which
+the packaging step uses when they are present.
 
-Cancelling works from either end. Closing the response body stops generation at
-the next token, and the Chat panel's stop button does the same. This matters
-because of what happened otherwise: an abandoned reader left the model decoding
-the rest of `max_tokens` into a socket nobody was reading, and since each model
-has one worker thread, every request queued behind it waited too.
+**The wrong backend was selected.** Settings → GPU reports the detected adapter, the
+backend that would be used and the one in use, and can install a missing backend on
+demand. The selection can be overridden with Auto / CUDA / Vulkan / CPU; a machine with
+no NVIDIA adapter falls back to CPU rather than starting a CUDA build that cannot work.
+
+**A model will not load.** Run **Check fit** on it: it reports memory required against
+memory free and suggests a layer count, a context length or a smaller quantisation.
+`/admin/status` carries the refusal reason.
+
+**A model has disappeared from the library.** It lies outside the configured folder.
+Settings → *Models folder* shows the path in use, and *Open folder* opens it.
+
+**`model not found` after moving files.** Point the folder at the new location. A
+remembered model whose file has moved is skipped at start-up rather than failing it,
+and the library lists whatever is actually present.
+
+**Network restrictions or a slow crates.io.** Configure a mirror in
+`~/.cargo/config.toml`:
+
+```toml
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+```
+
+---
+
+## Current notes
+
+- With a draft model or MTP head active, the prefix cache is disabled because those
+  paths track position independently of the target; such models re-encode the
+  conversation each turn.
+- Hardware acceleration is provided by the backends llama.cpp offers — CUDA, Vulkan and
+  Metal. Vendor-specific runtimes such as CANN or MUSA are not currently supported.
+- Cloud requests transmit their content to the named provider.
+
+## Contributing
+
+Issues and pull requests are welcome. The same scripts used for packaging build and
+test the workspace:
+
+```powershell
+.\scripts\build.ps1 fmt --all
+.\scripts\build.ps1 clippy --all-targets
+.\scripts\build.ps1 test --workspace
+```
+
+Contributions are licensed under the MIT License.
+
+## Community
+
+- 🐛 [Issues](issues) — defects and feature requests
+- 💡 [Discussions](discussions) — questions, design proposals and demonstrations
 
 ## License
 
-Licensed under either of
+Licensed under the MIT License ([LICENSE](LICENSE)).
 
-- the MIT license ([LICENSE-MIT](LICENSE-MIT))
-- the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-
-at your option.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this work shall be dual licensed as above, without any
-additional terms or conditions.
-
-Third-party components — llama.cpp and GGML among them — are listed in
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in this work shall be licensed as above, without any additional terms
+or conditions. Third-party components — llama.cpp and GGML among them — are listed in
 [NOTICE](NOTICE).
-
-## Notes
-
-- The HuggingFace client defaults to `https://hf-mirror.com`; override with
-  `HF_ENDPOINT`, authenticate gated repos with `HF_TOKEN`.
-- `llama-cpp-4` links shared libraries; the desktop app stages them next to the
-  sidecar on first launch, and the Docker image copies the `.so` files.
-- On a restricted network, set the crates.io mirror in `~/.cargo/config.toml`:
-  ```toml
-  [source.crates-io]
-  replace-with = "rsproxy-sparse"
-  [source.rsproxy-sparse]
-  registry = "sparse+https://rsproxy.cn/index/"
-  ```

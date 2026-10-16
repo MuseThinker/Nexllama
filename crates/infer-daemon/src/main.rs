@@ -1,6 +1,8 @@
+mod cloud;
 mod http;
 mod lifecycle;
 mod state;
+mod ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,6 +49,23 @@ struct Args {
     /// allowed.
     #[arg(long = "cors-origin")]
     cors_origin: Vec<String>,
+
+    /// Serve the web UI from this directory on the same port.
+    ///
+    /// Without it this is a plain API server and `GET /` is the banner that says
+    /// so. With it, the built UI is answered from `/` and its assets from the
+    /// paths they were built at, which is what lets a container ship the app as
+    /// a single port instead of a second web server in front of it.
+    #[arg(long = "ui-dir")]
+    ui_dir: Option<PathBuf>,
+
+    /// Folder listed by `GET /admin/models`.
+    ///
+    /// Unset means that endpoint answers "no library", which is the truth for a
+    /// daemon that was handed models by path (`--model`) and never asked to look
+    /// at a folder.
+    #[arg(long = "models-dir")]
+    models_dir: Option<PathBuf>,
 
     /// Layers to offload to the GPU (999 = all).
     #[arg(long, default_value_t = 999)]
@@ -228,7 +247,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let state = AppState::new(Duration::from_secs(args.keep_alive_secs), base.clone());
+    let state = AppState::new(Duration::from_secs(args.keep_alive_secs), base.clone())
+        .with_models_dir(args.models_dir.clone());
 
     let mut first = true;
     for (i, model) in args.model.iter().enumerate() {
@@ -247,6 +267,22 @@ async fn main() -> anyhow::Result<()> {
         cfg.mmproj = one(&args.mmproj);
         cfg.draft_model = one(&args.draft_model);
         cfg.draft_n_max = args.draft_n_max;
+        // An automatic context is sized here exactly as it is on `/admin/load`.
+        // Zero must not reach llama.cpp: it reads 0 as "the model's own default",
+        // which for a long-context checkpoint means the full 256k KV cache —
+        // most of the card, for a context nobody asked for.
+        if cfg.n_ctx == 0 {
+            if let Ok(hardware) = infer_core::hwprofile::probe() {
+                let path = std::path::Path::new(model);
+                cfg.n_ctx = infer_core::fit::auto_ctx(
+                    infer_core::model_class_of(path),
+                    infer_core::fit::train_ctx(path),
+                    infer_core::fit::ModelFootprint::of(path),
+                    &hardware,
+                );
+                tracing::info!(n_ctx = cfg.n_ctx, "context sized automatically");
+            }
+        }
         let path = cfg.model_path.clone();
         let draft_model = cfg
             .draft_model
@@ -261,6 +297,8 @@ async fn main() -> anyhow::Result<()> {
         let n_gpu_layers = cfg.n_gpu_layers;
         let n_ctx = cfg.n_ctx;
         let load_mtp = cfg.load_mtp;
+        // Kept so this model can be reloaded after the idle reaper frees it.
+        let config = cfg.clone();
 
         // The file name reaches the log; the full path does not. A log that
         // lives on disk indefinitely does not need a record of where the user
@@ -302,6 +340,7 @@ async fn main() -> anyhow::Result<()> {
                 path,
                 engine,
                 info,
+                config,
                 loaded_at: now,
                 last_used: now,
                 n_gpu_layers,
@@ -309,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
                 load_mtp,
                 mmproj,
                 draft_model,
+                thinking: None,
                 loras: Vec::new(),
                 in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 stats: std::sync::Arc::new(std::sync::Mutex::new(RuntimeStats::default())),
@@ -352,7 +392,12 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let app = http::router(state, api_key, args.cors_origin.clone());
+    let app = http::router(
+        state,
+        api_key,
+        args.cors_origin.clone(),
+        args.ui_dir.clone(),
+    );
     let addr = format!("{}:{}", args.host, args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("infer-daemon listening on http://{addr}");

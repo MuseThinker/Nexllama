@@ -4,25 +4,27 @@
 name = "nexllama-app"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-dialog = "2"
+# Opens a provider's "get an API key" page in the system browser.
+tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 gguf-probe = { path = "../gguf-probe" }
 infer-hub = { path = "../infer-hub" }
+model-index = { path = "../model-index" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 zip = "2"
 sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
-keyring = "3"
 
 [dev-dependencies]
 rand = "0.8"
@@ -42,6 +44,18 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_JobObjects",
   "Win32_System_Threading",
 ] }
+# `keyring` v3 ships no usable store unless a platform backend is enabled; the
+# default is an inert one, so every write silently failed and secrets never
+# persisted. Enable the real store per platform.
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Secret Service (GNOME keyring / KWallet) persists across logins, unlike the
+# kernel keyutils backend.
+keyring = { version = "3", features = ["sync-secret-service"] }
 
 [features]
 default = []
