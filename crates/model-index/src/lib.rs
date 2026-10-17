@@ -360,7 +360,11 @@ mod tests {
         std::fs::write(other.join("other.gguf"), b"not a gguf").unwrap();
 
         let rows = scan(&root).unwrap();
-        assert_eq!(rows.len(), 2, "the drafter folder is not a model of its own");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the drafter folder is not a model of its own"
+        );
         let names: Vec<&str> = rows.iter().filter_map(|r| r["name"].as_str()).collect();
         assert_eq!(names, ["other-model", "weights"]);
         let weights = &rows[1];

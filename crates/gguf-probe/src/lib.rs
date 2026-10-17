@@ -178,10 +178,7 @@ impl Probe {
     /// its own estimate rather than treating the answer as zero.
     pub fn kv_bytes_per_token(&self) -> Option<u64> {
         let layers = self.block_count.filter(|n| *n > 0)?;
-        let kv_heads = self
-            .head_count_kv
-            .or(self.head_count)
-            .filter(|n| *n > 0)?;
+        let kv_heads = self.head_count_kv.or(self.head_count).filter(|n| *n > 0)?;
         let head_dim = match self.key_length.filter(|n| *n > 0) {
             Some(n) => n,
             None => {

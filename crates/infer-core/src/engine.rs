@@ -1801,7 +1801,9 @@ fn run_generate<'m, 'd>(
         // ids are what the next turn continues from. Only a later diverged turn
         // pays for a serialised copy, and only because this one was mid-thread.
         if save_snapshot {
-            let draft_state = mtp_draft_ctx.as_ref().and_then(|c| unsafe { save_state(c) });
+            let draft_state = mtp_draft_ctx
+                .as_ref()
+                .and_then(|c| unsafe { save_state(c) });
             if let Some(state) = unsafe { save_state(ctx) } {
                 prefix.insert(resident.clone(), state, draft_state);
             }

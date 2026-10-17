@@ -2803,7 +2803,11 @@ mod tests {
 
     /// The same server with a models folder and a UI directory, for the paths
     /// that only exist when they were pointed at one.
-    fn app_with_dirs(key: Option<&str>, models: Option<&std::path::Path>, ui: Option<&std::path::Path>) -> Router {
+    fn app_with_dirs(
+        key: Option<&str>,
+        models: Option<&std::path::Path>,
+        ui: Option<&std::path::Path>,
+    ) -> Router {
         let mut state = AppState::new(Duration::from_secs(0), LoadConfig::new(""));
         state = state.with_models_dir(models.map(|p| p.to_path_buf()));
         router(
@@ -3492,8 +3496,11 @@ mod tests {
     #[tokio::test]
     async fn a_ui_directory_replaces_the_banner_and_keeps_the_api() {
         let dir = scratch("ui");
-        std::fs::write(dir.join("index.html"), "<!doctype html><title>Nexllama</title>")
-            .expect("index");
+        std::fs::write(
+            dir.join("index.html"),
+            "<!doctype html><title>Nexllama</title>",
+        )
+        .expect("index");
         std::fs::create_dir_all(dir.join("assets")).expect("assets");
         std::fs::write(dir.join("assets").join("app.js"), "console.log(1)").expect("asset");
 
@@ -3502,14 +3509,21 @@ mod tests {
         let res = app.clone().oneshot(probe("/", None)).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let html = String::from_utf8(body_of(res).await).expect("utf8");
-        assert!(html.contains("<title>Nexllama</title>"), "`/` should be the app");
+        assert!(
+            html.contains("<title>Nexllama</title>"),
+            "`/` should be the app"
+        );
 
         let res = app
             .clone()
             .oneshot(probe("/assets/app.js", None))
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK, "built assets are served as they are");
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "built assets are served as they are"
+        );
 
         // A path that is not a file still opens the app, so a bookmark survives.
         let res = app.clone().oneshot(probe("/chat", None)).await.unwrap();

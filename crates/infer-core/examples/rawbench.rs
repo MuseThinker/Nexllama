@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 use llama_cpp_4::prelude::*;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1).expect("usage: rawbench <model.gguf> [n_gen] [ctx]");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: rawbench <model.gguf> [n_gen] [ctx]");
     let n: usize = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())
@@ -42,7 +44,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_batch(2048)
         .with_n_ubatch(512);
-    if let Some(t) = std::env::var("RAW_THREADS").ok().and_then(|s| s.parse::<i32>().ok()) {
+    if let Some(t) = std::env::var("RAW_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+    {
         if t > 0 {
             cp = cp.with_n_threads(t).with_n_threads_batch(t);
         }

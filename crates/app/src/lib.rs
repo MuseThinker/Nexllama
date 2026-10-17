@@ -402,7 +402,11 @@ async fn push_routing(app: &tauri::AppHandle, enabled: bool, prefer: &str) -> Re
     }
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
-        return Err(format!("{}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+        return Err(format!(
+            "{}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
     }
     Ok(())
 }
@@ -1488,7 +1492,11 @@ async fn set_routing(
             obj.insert("synergyEnabled".to_string(), serde_json::Value::Bool(e));
         }
         if let Some(p) = &prefer {
-            let p = if p.trim() == "cloud" { "cloud" } else { "local" };
+            let p = if p.trim() == "cloud" {
+                "cloud"
+            } else {
+                "local"
+            };
             obj.insert(
                 "synergyPrefer".to_string(),
                 serde_json::Value::String(p.to_string()),
@@ -1699,19 +1707,19 @@ async fn hub_download(
     // supplied path, which made this command an arbitrary-file-write primitive:
     // aim it at the backend folder and the next daemon start would run a
     // downloaded `infer-daemon.exe`.
-let dir = models_dir(&app)?;
-       let filename = filename.trim().to_string();
-       if !filename.to_ascii_lowercase().ends_with(".gguf") {
-           return Err("only .gguf files can be downloaded".to_string());
-       }
-       // One folder per model, named after the repository. A model is several
-       // files — weights, sometimes a projector and a draft — and dropping them
-       // into the models root mixes them with whatever else is there: the
-       // library can no longer tell whose projector is whose, and the download
-       // list stops being readable. The library treats a folder as a model, so
-       // this is also what makes a freshly downloaded model appear as one entry.
-       let dir = dir.join(repo_folder_name(&repo));
-       std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dir = models_dir(&app)?;
+    let filename = filename.trim().to_string();
+    if !filename.to_ascii_lowercase().ends_with(".gguf") {
+        return Err("only .gguf files can be downloaded".to_string());
+    }
+    // One folder per model, named after the repository. A model is several
+    // files — weights, sometimes a projector and a draft — and dropping them
+    // into the models root mixes them with whatever else is there: the
+    // library can no longer tell whose projector is whose, and the download
+    // list stops being readable. The library treats a folder as a model, so
+    // this is also what makes a freshly downloaded model appear as one entry.
+    let dir = dir.join(repo_folder_name(&repo));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let client = HubClient::new();
     let handle = app.clone();
     let repo_ev = repo.clone();
@@ -2115,7 +2123,8 @@ async fn install_backend(
         .get(backend)
         .ok_or_else(|| format!("backend '{backend}' not present in manifest"))?;
 
-    let bytes = fetch_https_progress(app, &entry.url, MAX_BACKEND_BYTES, "update://progress").await?;
+    let bytes =
+        fetch_https_progress(app, &entry.url, MAX_BACKEND_BYTES, "update://progress").await?;
     let got = sha256_hex(&bytes);
     if !got.eq_ignore_ascii_case(&entry.sha256) {
         return Err(format!(
@@ -2619,7 +2628,10 @@ mod tests {
     fn blank_api_key_means_no_auth() {
         assert_eq!(settings_api_key(&serde_json::json!({})), None);
         assert_eq!(settings_api_key(&serde_json::json!({ "apiKey": "" })), None);
-        assert_eq!(settings_api_key(&serde_json::json!({ "apiKey": "  " })), None);
+        assert_eq!(
+            settings_api_key(&serde_json::json!({ "apiKey": "  " })),
+            None
+        );
         assert_eq!(
             settings_api_key(&serde_json::json!({ "apiKey": " secret " })).as_deref(),
             Some("secret")

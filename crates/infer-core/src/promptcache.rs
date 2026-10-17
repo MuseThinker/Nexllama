@@ -114,9 +114,7 @@ impl PromptCache {
     /// Callers call this right after [`Self::longest_prefix`] and before
     /// encoding anything, so the entry is the one at the back.
     pub fn snapshot_for(&self, len: usize) -> Option<&Cached> {
-        self.entries
-            .last()
-            .filter(|e| e.tokens.len() == len)
+        self.entries.last().filter(|e| e.tokens.len() == len)
     }
 
     /// Remember a prompt, its target KV state, and the draft-side state when a
@@ -238,7 +236,10 @@ mod tests {
         // Restoring this entry without putting the draft side back would leave
         // the head behind the target, so a plain lookup must not see it.
         assert_eq!(c.longest_prefix(&asked, false), None);
-        assert_eq!(c.longest_prefix(&asked, true), Some(seq(&[1, 2, 3, 4]).len()));
+        assert_eq!(
+            c.longest_prefix(&asked, true),
+            Some(seq(&[1, 2, 3, 4]).len())
+        );
     }
 
     #[test]
@@ -248,7 +249,10 @@ mod tests {
         let mut asked = seq(&[1, 2, 3, 4]);
         asked.push(5);
         assert_eq!(c.longest_prefix(&asked, true), None);
-        assert_eq!(c.longest_prefix(&asked, false), Some(seq(&[1, 2, 3, 4]).len()));
+        assert_eq!(
+            c.longest_prefix(&asked, false),
+            Some(seq(&[1, 2, 3, 4]).len())
+        );
     }
 
     #[test]

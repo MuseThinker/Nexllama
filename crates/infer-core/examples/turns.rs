@@ -46,14 +46,8 @@ fn parse() -> Opts {
     let rest: Vec<String> = args.collect();
     let (positional, flags): (Vec<String>, Vec<String>) =
         rest.into_iter().partition(|a| !a.starts_with("--"));
-    let n_gpu_layers = positional
-        .first()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let turns = positional
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4);
+    let n_gpu_layers = positional.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let turns = positional.get(1).and_then(|s| s.parse().ok()).unwrap_or(4);
 
     let mut o = Opts {
         path,
@@ -70,7 +64,9 @@ fn parse() -> Opts {
     };
 
     for a in flags {
-        let Some(body) = a.strip_prefix("--") else { continue };
+        let Some(body) = a.strip_prefix("--") else {
+            continue;
+        };
         let (k, v) = match body.split_once('=') {
             Some((k, v)) => (k, v),
             None => {
