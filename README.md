@@ -1,6 +1,7 @@
 # Nexllama
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Downloads](https://img.shields.io/github/downloads/MuseThinker/Nexllama/total?label=downloads)](https://github.com/MuseThinker/Nexllama/releases)
 [![Platforms: Windows | Linux](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-lightgrey.svg)]
 [![Engine: llama.cpp](https://img.shields.io/badge/engine-llama.cpp-blue.svg)]
 [![Docs: OpenAPI 3.1](https://img.shields.io/badge/docs-OpenAPI%203.1-green.svg)]
@@ -53,11 +54,15 @@ Two installers, and the difference is one thing: whether NVIDIA's runtime comes 
 
 | Installer | Size | Which machine |
 |---|---|---|
-| **Standard** `Nexllama_*_x64-setup.exe` | ~483 MB | **The one to download.** It carries a portable CPU build and NVIDIA's CUDA runtime (`cudart64`, `cublas64`, `cublasLt64`), so it needs nothing installed beforehand. A new machine, a laptop, or one you are not sure about belongs here: an NVIDIA card runs on the GPU and anything else falls back to the CPU. |
-| **Lite** `Nexllama_*_x64-lite-setup.exe` | ~130 MB | Only for a machine that **already has the CUDA runtime** — usually a development box. It leaves out those three NVIDIA libraries, one of which (`cublasLt64_13.dll`) is 428 MB on its own. **A new computer, or one where CUDA was never installed, should use the standard installer**: without the runtime the CUDA backend cannot load, and the app falls back to the CPU — it works, but far more slowly. |
+| **Standard** [`Nexllama_0.1.0_x64-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.1.0/Nexllama_0.1.0_x64-setup.exe) | ~495 MB | **The one to download.** It carries a portable CPU build and NVIDIA's CUDA runtime (`cudart64`, `cublas64`, `cublasLt64`), so it needs nothing installed beforehand. A new machine, a laptop, or one you are not sure about belongs here: an NVIDIA card runs on the GPU and anything else falls back to the CPU. |
+| **Lite** [`Nexllama_0.1.0_x64-lite-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.1.0/Nexllama_0.1.0_x64-lite-setup.exe) | ~143 MB | Only for a machine that **already has the CUDA runtime** — usually a development box. It leaves out those three NVIDIA libraries, one of which (`cublasLt64_13.dll`) is 428 MB on its own. **A new computer, or one where CUDA was never installed, should use the standard installer**: without the runtime the CUDA backend cannot load, and the app falls back to the CPU — it works, but far more slowly. |
 
 Both installers share a product name, install location and startup entry, so
 installing one over the other replaces it instead of leaving two copies behind.
+
+The installers are not code-signed. Windows may show an unknown publisher warning;
+choose **More info → Run anyway**. Verify the download against
+[`SHA256SUMS.txt`](https://github.com/MuseThinker/Nexllama/releases/download/v0.1.0/SHA256SUMS.txt).
 
 Run the installer and open Nexllama. The app picks a backend for the machine at first
 launch and starts the daemon on `http://127.0.0.1:15656`.

@@ -1,6 +1,7 @@
 # Nexllama
 
 [![许可证: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![下载量](https://img.shields.io/github/downloads/MuseThinker/Nexllama/total?label=downloads)](https://github.com/MuseThinker/Nexllama/releases)
 [![平台: Windows | Linux](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-lightgrey.svg)]
 [![引擎: llama.cpp](https://img.shields.io/badge/engine-llama.cpp-blue.svg)]
 [![文档: OpenAPI 3.1](https://img.shields.io/badge/docs-OpenAPI%203.1-green.svg)]
@@ -44,10 +45,12 @@ Nexllama 是一个对硬件有感知能力的一体化本地推理桌面与 API 
 
 | 安装包 | 体积 | 适用机器 |
 |---|---|---|
-| **标准版** `Nexllama_*_x64-setup.exe` | ~483 MB | **推荐首选。** 内置一份可移植的 CPU 构建和英伟达 CUDA 运行库（`cudart64`、`cublas64`、`cublasLt64`），不需要预装任何东西。新电脑、笔记本，或者你不确定装没装过 CUDA 的机器，都选它：有 N 卡就走 GPU，没有就自动用 CPU。 |
-| **精简版** `Nexllama_*_x64-lite-setup.exe` | ~130 MB | 只适合**已经装好 CUDA 运行库**的机器，通常是开发机。它省掉了那三个英伟达 DLL——其中 `cublasLt64_13.dll` 一个就有 428 MB。**新电脑或从没装过 CUDA 的机器请用标准版**：缺运行库时 CUDA 后端起不来，应用会退回 CPU 运行（能用，但慢得多）。 |
+| **标准版** [`Nexllama_0.1.0_x64-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.1.0/Nexllama_0.1.0_x64-setup.exe) | ~495 MB | **推荐首选。** 内置一份可移植的 CPU 构建和英伟达 CUDA 运行库（`cudart64`、`cublas64`、`cublasLt64`），不需要预装任何东西。新电脑、笔记本，或者你不确定装没装过 CUDA 的机器，都选它：有 N 卡就走 GPU，没有就自动用 CPU。 |
+| **精简版** [`Nexllama_0.1.0_x64-lite-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.1.0/Nexllama_0.1.0_x64-lite-setup.exe) | ~143 MB | 只适合**已经装好 CUDA 运行库**的机器，通常是开发机。它省掉了那三个英伟达 DLL——其中 `cublasLt64_13.dll` 一个就有 428 MB。**新电脑或从没装过 CUDA 的机器请用标准版**：缺运行库时 CUDA 后端起不来，应用会退回 CPU 运行（能用，但慢得多）。 |
 
 两个安装包的产品名、安装目录与开机启动项一致，装另一个会直接覆盖，不会留下两份。
+
+安装包未做代码签名，Windows 可能提示“未知发布者”。请选择 **更多信息 → 仍要运行**，并用 [`SHA256SUMS.txt`](https://github.com/MuseThinker/Nexllama/releases/download/v0.1.0/SHA256SUMS.txt) 校验下载文件。
 
 运行安装程序并打开 Nexllama。首次启动时，应用会按本机情况挑一个后端，并在 `http://127.0.0.1:15656` 上拉起守护进程。
 
