@@ -34,6 +34,20 @@ jobs:
       - name: Install LLVM
         run: choco install llvm --no-progress -y
 
+      # vcvars64 puts the Visual Studio LLVM 19 ahead of the standalone install.
+      # bindgen then fails on the MSVC intrinsic headers, so select the choco
+      # LLVM explicitly for libclang and PATH.
+      - name: Select standalone LLVM
+        shell: pwsh
+        run: |
+          $llvm = 'C:\Program Files\LLVM\bin'
+          if (-not (Test-Path "$llvm\libclang.dll")) {
+            throw "libclang.dll not found at $llvm"
+          }
+          "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $llvm | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & "$llvm\clang.exe" --version
+
       - name: Install frontend deps
         run: npm --prefix frontend ci
 
