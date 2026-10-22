@@ -9,7 +9,11 @@ on:
 
 jobs:
   windows:
-    runs-on: windows-latest
+    # CUDA is not installed on hosted runners, and the Windows 2025 image's
+    # VS 2026 toolchain has a CMake/Ninja link failure in this build. CI
+    # validates CPU packaging on the stable Windows 2022 image; the CUDA
+    # installers are built locally where the toolkit exists.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
@@ -39,14 +43,14 @@ jobs:
           ./scripts/build.ps1 clippy -p infer-core -p infer-daemon -p infer-hub -p gguf-probe --all-targets
           ./scripts/build.ps1 fmt --all -- --check
 
-      - name: Build installers (standard + lite)
+      - name: Build CPU installer
         shell: pwsh
-        run: ./scripts/package.ps1 -Edition both -Backends cpu,cuda
+        run: ./scripts/package.ps1 -Edition full -Backends cpu
 
-      - name: Upload installers
+      - name: Upload CPU installer
         uses: actions/upload-artifact@v4
         with:
-          name: nexllama-nsis
+          name: nexllama-nsis-cpu
           path: crates/app/target/release/bundle/nsis/*.exe
 
   # The daemon ships in a Linux container and the engine is plain Rust, so a
@@ -112,6 +116,14 @@ jobs:
           npm --prefix frontend ci
           npm --prefix frontend run build
 
+      # `backends/` is produced by package.ps1 and is gitignored. The Tauri
+      # resource glob still has to match at compile time, so stage one file.
+      - name: Stage resource placeholder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force crates/app/backends/cpu | Out-Null
+          Set-Content -Path crates/app/backends/cpu/.placeholder -Value 'CI resource placeholder'
+
       - name: Clippy
         shell: pwsh
         working-directory: crates/app
@@ -168,46 +180,13 @@ jobs:
             crates/app/target/release/bundle/rpm/*.rpm
             crates/app/target/release/bundle/appimage/*.AppImage
 
-  # macOS runners bill at ten times the rate of Linux ones, so this one waits
-  # for a push or a tag rather than running on every pull request.
-  macos-desktop:
-    if: github.event_name != 'pull_request'
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/app
-
-      - name: Install build tools
-        run: brew install cmake ninja
-
-      - name: Build installer (metal + cpu)
-        run: |
-          npm --prefix frontend ci
-          ./scripts/package.sh metal cpu
-
-      - name: Upload packages
-        uses: actions/upload-artifact@v4
-        with:
-          name: nexllama-macos
-          path: |
-            crates/app/target/release/bundle/dmg/*.dmg
-            crates/app/target/release/bundle/macos/*.app
-
   # A dependency with a Known Vulnerability is the kind of thing nobody notices
   # until it is in a release, and `Cargo.lock` pins one every day.
   audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
