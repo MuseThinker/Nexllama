@@ -40,7 +40,16 @@ $env:VSLANG = "1033"
 
 if (-not $CargoArgs -or $CargoArgs.Count -eq 0) { $CargoArgs = @("build") }
 
-$inner = "call `"$vcvars`" >nul 2>&1 && set `"CMAKE_GENERATOR=Ninja`" && cargo " + ($CargoArgs -join " ")
+# vcvars64 prepends the Visual Studio LLVM directory to PATH. Its clang 19
+# headers break bindgen on the MSVC intrinsic headers, so put the standalone
+# LLVM back in front *after* vcvars has run. Delayed expansion keeps the PATH
+# that vcvars just built.
+$inner = "call `"$vcvars`" >nul 2>&1" +
+    " && set `"CMAKE_GENERATOR=Ninja`"" +
+    " && set `"LIBCLANG_PATH=$llvm`"" +
+    " && set `"CLANG_PATH=$llvm\clang.exe`"" +
+    " && set `"PATH=$llvm;!PATH!`"" +
+    " && cargo " + ($CargoArgs -join " ")
 Write-Host "> $inner"
-cmd.exe /c $inner
+cmd.exe /v:on /c $inner
 exit $LASTEXITCODE
