@@ -27,7 +27,7 @@ $llvm = "C:\Program Files\LLVM\bin"
 $cmake = "C:\Program Files\CMake\bin"
 $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
 
-foreach ($d in @($llvm, $cmake, $ninja, $cargoBin)) {
+foreach ($d in @($cmake, $ninja, $cargoBin)) {
     if ((Test-Path -LiteralPath $d) -and ($env:Path -notlike "*$d*")) {
         $env:Path = "$d;$env:Path"
     }
@@ -40,16 +40,17 @@ $env:VSLANG = "1033"
 
 if (-not $CargoArgs -or $CargoArgs.Count -eq 0) { $CargoArgs = @("build") }
 
-# vcvars64 prepends the Visual Studio LLVM directory to PATH. Its clang 19
-# headers break bindgen on the MSVC intrinsic headers, so put the standalone
-# LLVM back in front *after* vcvars has run. Delayed expansion keeps the PATH
-# that vcvars just built.
+# vcvars64 puts Visual Studio's old LLVM in PATH, whose clang 19 headers break
+# bindgen. Select the standalone libclang explicitly after vcvars has run, but
+# keep its clang out of PATH: CMake subprojects otherwise pick it up and pass
+# MSVC-style flags such as /utf-8 to it.
 $inner = "call `"$vcvars`" >nul 2>&1" +
     " && set `"CMAKE_GENERATOR=Ninja`"" +
     " && set `"LIBCLANG_PATH=$llvm`"" +
     " && set `"CLANG_PATH=$llvm\clang.exe`"" +
-    " && set `"PATH=$llvm;!PATH!`"" +
+    " && set `"CC=cl`"" +
+    " && set `"CXX=cl`"" +
     " && cargo " + ($CargoArgs -join " ")
 Write-Host "> $inner"
-cmd.exe /v:on /c $inner
+cmd.exe /c $inner
 exit $LASTEXITCODE
