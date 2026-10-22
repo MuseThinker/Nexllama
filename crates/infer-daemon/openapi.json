@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Nexllama daemon",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "summary": "Local llama.cpp inference over HTTP",
     "description": "Serves chat, embeddings and reranking for GGUF models loaded on this machine.\n\nTwo request surfaces are available and both are first-class:\n\n* **OpenAI** (`/v1/...`) — the shape most tools and SDKs already speak.\n* **Ollama** (`/api/...`) — the short paths and NDJSON streaming Ollama uses.\n\n`GET /` returns a banner, `GET /v1` and `GET /api/tags` list the loaded models, so pointing a client at the base URL is enough to see what is there.\n\n**`model` selects among the models of the route's kind.** One machine can hold a chat model, an embedder and a reranker at once. A `model` that matches nothing falls back to the only model of that kind, so swapping the loaded model in the desktop app does not break a client still holding the old name; when more than one model of the kind is loaded, the name is required and the error lists what is there. The desktop chat panel is the only place with a remembered default.\n\nIf the daemon was started with `--api-key`, every route below except `/`, `/health`, `/api/version`, `/openapi.json` and `/docs` requires `Authorization: Bearer <key>`."
   },
