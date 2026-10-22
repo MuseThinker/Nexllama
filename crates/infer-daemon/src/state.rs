@@ -311,6 +311,8 @@ pub struct AppState {
     /// it is optional — a daemon that was handed models by path has no folder to
     /// list and says so instead of inventing one.
     pub models_dir: Option<Arc<PathBuf>>,
+    /// HuggingFace transfers started over HTTP, and their progress reports.
+    pub hub: Arc<crate::hub::HubState>,
 }
 
 impl AppState {
@@ -330,6 +332,7 @@ impl AppState {
                 .build()
                 .unwrap_or_default(),
             models_dir: None,
+            hub: Arc::new(crate::hub::HubState::new()),
             inner: Arc::new(Mutex::new(DaemonState {
                 models: HashMap::new(),
                 dormant: HashMap::new(),

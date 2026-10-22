@@ -24,3 +24,6 @@ crates/app/backends/
 *.local
 .vscode/
 .idea/
+
+# Local planning drafts.
+.codebuddy/

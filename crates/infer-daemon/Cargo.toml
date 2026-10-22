@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 infer-core = { path = "../infer-core" }
+infer-hub = { path = "../infer-hub" }
 model-index = { path = "../model-index" }
 anyhow.workspace = true
 serde.workspace = true

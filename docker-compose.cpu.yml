@@ -1,0 +1,23 @@
+# CPU-only alternative to the default GPU compose file:
+#
+#   docker compose -f docker-compose.cpu.yml up -d   # http://localhost:8090
+#
+# Put a `.gguf` in `./models` (or set `MODELS_DIR`); the app lists it, and
+# downloads from the Hub are written back there. On a network anyone can reach,
+# set `API_KEY`.
+services:
+  nexllama:
+    build:
+      context: .
+      dockerfile: Dockerfile.web.cpu
+      args:
+        CRATES_MIRROR: ${CRATES_MIRROR:-}
+    image: nexllama/nexllama:web-cpu
+    ports:
+      - "${PORT:-8090}:8090"
+    volumes:
+      - "${MODELS_DIR:-./models}:/models"
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      NEXLLAMA_API_KEY: ${API_KEY:-}
+    restart: unless-stopped

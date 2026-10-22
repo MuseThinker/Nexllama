@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use infer_hub::HubClient;
+use infer_hub::{DownloadControl, DownloadOutcome, HubClient};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,8 +36,8 @@ async fn main() -> anyhow::Result<()> {
                 .expect("usage: hf download <repo> <filename> [dir]");
             let dir = args.get(3).map(|s| s.as_str()).unwrap_or("models");
             let mut last_bucket = u64::MAX;
-            let path = client
-                .download(repo, file, dir, |p| {
+            let outcome = client
+                .download(repo, file, dir, DownloadControl::new(), |p| {
                     let bucket = p.downloaded / 10_000_000;
                     if bucket != last_bucket {
                         last_bucket = bucket;
@@ -52,7 +52,11 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?;
             eprintln!();
-            println!("{}", path.display());
+            match outcome {
+                DownloadOutcome::Completed(path) => println!("{}", path.display()),
+                DownloadOutcome::Paused => eprintln!("paused"),
+                DownloadOutcome::Cancelled => eprintln!("cancelled"),
+            }
         }
         other => {
             eprintln!("unknown command: {other}");

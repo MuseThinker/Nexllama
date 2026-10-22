@@ -101,7 +101,15 @@ let activeRepo = $state('');
 let files = $state([]);
 let loadingFiles = $state(false);
 let downloading = $state('');
+// The repository the running download belongs to. The pause and cancel
+// commands address a transfer by repository *and* filename, so this has to be
+// remembered: `activeRepo` may have moved on to another search by the time the
+// button is clicked.
+let downloadingRepo = $state('');
 let progress = $state({ downloaded: 0, total: 0 });
+// Bytes already on disk that this transfer resumed from, or null when it began
+// from zero. Read off the first progress event, and used to say so in the UI.
+let resumedFrom = $state(null);
 let lastDownloaded = $state('');
 let localModels = $state([]);
 // The inference service the models run on. It used to live on the Settings
@@ -464,10 +472,6 @@ async function unloadAll() {
 }
 
 async function search() {
-  if (!hasTauri) {
-    error = $t('models.tDesktop');
-    return;
-  }
   if (!query.trim()) return;
   searching = true;
   error = '';
@@ -476,11 +480,13 @@ async function search() {
   activeRepo = '';
   resultsOpen = true;
   try {
-    results = await invoke('hub_search', {
-      query: query.trim(),
-      author: author || null,
-      limit: 20,
-    });
+    results = hasTauri
+      ? await invoke('hub_search', {
+          query: query.trim(),
+          author: author || null,
+          limit: 20,
+        })
+      : await daemon.hubSearch(query.trim(), author || null, 20);
   } catch (e) {
     error = String(e);
   } finally {
@@ -498,7 +504,9 @@ async function pickRepo(id) {
   loadingFiles = true;
   error = '';
   try {
-    const got = await invoke('hub_list_gguf', { repo: id });
+    const got = hasTauri
+      ? await invoke('hub_list_gguf', { repo: id })
+      : await daemon.hubFiles(id);
     // Another repo may have been picked while this one was in flight; a late
     // answer belongs to a request nobody is waiting for any more.
     if (activeRepo !== id) return;
@@ -511,12 +519,11 @@ async function pickRepo(id) {
 }
 
 async function download(file) {
-  if (!hasTauri) {
-    error = $t('models.tDesktop');
-    return;
-  }
+  const repo = activeRepo;
   downloading = file.filename;
+  downloadingRepo = repo;
   progress = { downloaded: 0, total: file.size };
+  resumedFrom = null;
   error = '';
   notice = '';
   try {
@@ -532,14 +539,79 @@ async function download(file) {
         // whoever is clicking may know this machine better than the probe does.
       }
     }
-    const path = await invoke('hub_download', { repo: activeRepo, filename: file.filename });
-    lastDownloaded = path;
-    await loadLocal();
+    if (hasTauri) {
+      const r = await invoke('hub_download', { repo, filename: file.filename });
+      if (r?.status === 'completed') {
+        lastDownloaded = r.path;
+        await loadLocal();
+      } else if (r?.status === 'cancelled') {
+        notice = $t('models.cancelled');
+      } else {
+        // Paused: the partial file is kept, so pressing download on the same
+        // file again picks up where this left off rather than starting over.
+        notice = $t('models.paused');
+      }
+      return;
+    }
+
+    // A browser has no Tauri event channel to receive progress on, so the
+    // transfer runs in the daemon and this page polls the same state the
+    // desktop command reports. The download itself is not tied to the tab.
+    await daemon.hubDownload(repo, file.filename);
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      const s = await daemon.hubDownloadStatus(repo, file.filename);
+      progress = { downloaded: s.downloaded ?? 0, total: s.total ?? file.size };
+      if (s.status === 'completed') {
+        lastDownloaded = s.path;
+        await loadLocal();
+        break;
+      }
+      if (s.status === 'cancelled') {
+        notice = $t('models.cancelled');
+        break;
+      }
+      if (s.status === 'paused') {
+        notice = $t('models.paused');
+        break;
+      }
+      if (s.status === 'error') throw new Error(s.error || 'download failed');
+    }
   } catch (e) {
     error = String(e);
   } finally {
     downloading = '';
+    downloadingRepo = '';
     progress = { downloaded: 0, total: 0 };
+    resumedFrom = null;
+  }
+}
+
+// Ask the running transfer to stop and keep what it has, so it can be resumed.
+async function pauseDownload() {
+  if (!downloadingRepo || !downloading) return;
+  try {
+    if (hasTauri) {
+      await invoke('hub_download_pause', { repo: downloadingRepo, filename: downloading });
+    } else {
+      await daemon.hubPause(downloadingRepo, downloading);
+    }
+  } catch (e) {
+    error = String(e);
+  }
+}
+
+// Ask the running transfer to stop and throw away what it has.
+async function cancelDownload() {
+  if (!downloadingRepo || !downloading) return;
+  try {
+    if (hasTauri) {
+      await invoke('hub_download_cancel', { repo: downloadingRepo, filename: downloading });
+    } else {
+      await daemon.hubCancel(downloadingRepo, downloading);
+    }
+  } catch (e) {
+    error = String(e);
   }
 }
 
@@ -558,8 +630,12 @@ onMount(() => {
   let un2;
   listen('download://progress', (e) => {
     // Progress events carry the file they belong to; adopting whichever event
-    // arrived last would show one download's numbers on another's bar.
-    if (e.payload.filename !== downloading) return;
+    // arrived last would show one download's numbers on another's bar. Both
+    // repository and filename are matched: two repos can hold a same-named file.
+    if (e.payload.filename !== downloading || e.payload.repo !== downloadingRepo) return;
+    // The first event reports the bytes already on disk — non-zero only when a
+    // previous attempt left a partial file — which is where this one resumes.
+    if (resumedFrom === null && e.payload.downloaded > 0) resumedFrom = e.payload.downloaded;
     progress = { downloaded: e.payload.downloaded, total: e.payload.total ?? progress.total };
   }).then((f) => (un1 = f));
   listen('download://done', (e) => {
@@ -576,6 +652,11 @@ onMount(() => {
   // does not mean editing the UI twice.
   if (hasTauri) {
     invoke('hub_trusted_authors')
+      .then((list) => (authors = list ?? []))
+      .catch(() => (authors = []));
+  } else {
+    daemon
+      .hubAuthors()
       .then((list) => (authors = list ?? []))
       .catch(() => (authors = []));
   }
@@ -779,6 +860,7 @@ async function saveCloud(silent) {
   <!-- 推理服务：模型跑在它上面，先有服务才有下面的一切 -->
   <section class="card">
     <h3>{$t('settings.daemon')}</h3>
+    {#if hasTauri}
     <div class="daemon-status">
       <span class="daemon-dot" class:on={daemonInfo.running}></span>
       <div class="daemon-status-text">
@@ -822,6 +904,17 @@ async function saveCloud(silent) {
     {#if daemonInfo.gpu_backend && daemonInfo.backend !== daemonInfo.gpu_backend}
       <p class="muted">{$t('models.gpuNotUsed', { gpu: daemonInfo.gpu_backend })}</p>
     {/if}
+    {#if daemonInfo.active_backend && daemonInfo.active_backend !== daemonInfo.backend}
+      <p class="muted">
+        {$t('models.gpuFallback', {
+          backend: daemonInfo.backend,
+          active: daemonInfo.active_backend,
+        })}
+      </p>
+    {/if}
+    {:else}
+      <p class="muted">{$t('models.daemonWeb')}</p>
+    {/if}
     <h4 class="section-sub">{$t('models.available')}</h4>
     {#if (status.models ?? []).length === 0}
       <p class="muted">{$t('models.none')}</p>
@@ -839,6 +932,7 @@ async function saveCloud(silent) {
         {/each}
       </ul>
     {/if}
+    {#if hasTauri}
     <div class="synergy">
       <div class="synergy-head">
         <span class="synergy-title">
@@ -866,7 +960,7 @@ async function saveCloud(silent) {
         </label>
       {/if}
     </div>
-    {#if !hasTauri}<p class="muted">{$t('settings.tDesktop')}</p>{/if}
+    {/if}
   </section>
 
   <div class="seg">
@@ -911,10 +1005,6 @@ async function saveCloud(silent) {
       </div>
     {/if}
 
-    {#if !hasTauri}
-      <p class="muted">{$t('models.tDesktop')}</p>
-    {/if}
-
     {#if results.length > 0 && resultsOpen}
       <div class="results-head">
         <span class="muted">{$t('models.results', { n: results.length })}</span>
@@ -949,7 +1039,11 @@ async function saveCloud(silent) {
 
     {#if downloading}
       <div class="progress"><div class="bar" style="width:{pct()}%"></div></div>
-      <p class="muted">{downloading} — {pct().toFixed(1)}% ({fmt(progress.downloaded)})</p>
+      <p class="muted">{downloading} — {pct().toFixed(1)}% ({fmt(progress.downloaded)}){#if resumedFrom}&nbsp;· {$t('models.resumed', { size: fmt(resumedFrom) })}{/if}</p>
+      <p class="dl-actions">
+        <button onclick={pauseDownload}>{$t('models.pause')}</button>
+        <button onclick={cancelDownload}>{$t('models.cancel')}</button>
+      </p>
     {/if}
 
     {#if lastDownloaded}
@@ -961,10 +1055,8 @@ async function saveCloud(silent) {
   <section class="card">
     <h3>{$t('models.library')}</h3>
     <p class="muted">{$t('models.libraryHint')}</p>
-    {#if !hasTauri}
-      <p class="muted">{$t('models.tDesktop')}</p>
-    {:else if localModels.length === 0}
-      <p class="muted">{$t('models.libraryEmpty')}</p>
+    {#if localModels.length === 0}
+      <p class="muted">{hasTauri ? $t('models.libraryEmpty') : $t('models.libraryEmptyWeb')}</p>
     {:else}
       <ul class="file-list">
         {#each orderedModels as b}

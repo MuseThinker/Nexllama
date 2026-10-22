@@ -3,7 +3,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use infer_hub::{GgufFile, HubClient, RepoSummary};
+use infer_hub::{DownloadControl, DownloadOutcome, GgufFile, HubClient, RepoSummary};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
@@ -455,6 +455,41 @@ struct DaemonProc {
     /// address is exposed and no access token is set, say — reached a log line
     /// nobody sees, and every later call failed as an unreachable port.
     last_error: Mutex<Option<String>>,
+    /// The backend the running daemon was actually started with.
+    ///
+    /// `resolve_backend` says what *should* run; a GPU build whose driver is
+    /// missing fails at spawn and the start falls back to CPU. Without this the
+    /// status went on claiming the GPU backend while the daemon ran on the CPU,
+    /// and the one machine where that matters — an AMD/Intel box with no Vulkan
+    /// runtime — was told nothing was wrong.
+    active_backend: Mutex<Option<String>>,
+}
+
+/// Live HuggingFace downloads, keyed by what they are fetching.
+///
+/// A download is a minutes-long await, and pause and cancel have to reach the
+/// transfer that is already running — so its control handle is kept where
+/// another command can find it. An entry lives only as long as its transfer.
+#[derive(Default)]
+struct Downloads {
+    live: Mutex<std::collections::HashMap<String, DownloadControl>>,
+}
+
+/// Name a download by repository and filename. The separator is a byte that
+/// cannot appear in either, so no two pairs collide.
+fn download_key(repo: &str, filename: &str) -> String {
+    format!("{repo}\u{1}{filename}")
+}
+
+/// The outcome of a `hub_download` call, for the UI to tell a finished file
+/// from a paused one — the difference between a library entry and no entry.
+#[derive(serde::Serialize)]
+struct DownloadResult {
+    /// `"completed"` or `"paused"`.
+    status: &'static str,
+    /// Where the file landed, present only when the transfer completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 
 /// Lock helper that reports poisoning instead of panicking.
@@ -861,10 +896,13 @@ fn spawn_daemon(
         n_gpu_layers,
         n_ctx,
     ) {
-        Ok(port) => Ok(port),
+        Ok(port) => {
+            set_active_backend(app, &backend);
+            Ok(port)
+        }
         Err(e) if backend != "cpu" && backend_exe(app, "cpu").is_some() => {
             eprintln!("Nexllama: {backend} backend failed to start ({e}); falling back to cpu");
-            try_spawn_backend(
+            let port = try_spawn_backend(
                 app,
                 &settings,
                 "cpu",
@@ -872,9 +910,21 @@ fn spawn_daemon(
                 keep_alive_secs,
                 n_gpu_layers,
                 n_ctx,
-            )
+            )?;
+            set_active_backend(app, "cpu");
+            Ok(port)
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Record the backend the daemon came up on, so the status can tell the GPU
+/// backend that was asked for from the CPU one that answered.
+fn set_active_backend(app: &tauri::AppHandle, backend: &str) {
+    if let Some(state) = app.try_state::<DaemonProc>() {
+        if let Ok(mut slot) = lock(&state.active_backend) {
+            *slot = Some(backend.to_string());
+        }
     }
 }
 
@@ -1304,6 +1354,9 @@ fn daemon_status(app: tauri::AppHandle, state: tauri::State<DaemonProc>) -> serd
         "port": configured_port(&settings),
         "backend": backend,
         "gpu_backend": desired_gpu_backend(),
+        // What the daemon actually came up on, when it differs from `backend`:
+        // the GPU backend was selected but failed at spawn and CPU answered.
+        "active_backend": lock(&state.active_backend).ok().and_then(|slot| slot.clone()),
         "host": bind_host(&settings),
         "binary": daemon_binary(&app, &backend).ok().map(|p| p.to_string_lossy().to_string()),
         // A start refused at launch has nowhere else to surface itself, so the
@@ -1700,9 +1753,10 @@ async fn hub_list_gguf(repo: String) -> Result<Vec<GgufFile>, String> {
 #[tauri::command]
 async fn hub_download(
     app: tauri::AppHandle,
+    state: tauri::State<'_, Downloads>,
     repo: String,
     filename: String,
-) -> Result<String, String> {
+) -> Result<DownloadResult, String> {
     // The destination is always the models directory. It used to be a caller
     // supplied path, which made this command an arbitrary-file-write primitive:
     // aim it at the backend folder and the next daemon start would run a
@@ -1720,12 +1774,31 @@ async fn hub_download(
     // this is also what makes a freshly downloaded model appear as one entry.
     let dir = dir.join(repo_folder_name(&repo));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    // Registered before the transfer starts so a pause or cancel that arrives
+    // mid-download finds it; removed when it ends, however it ends. Refused
+    // outright when one is already running for the same file: a second entry
+    // would overwrite the first's control, leaving that transfer unpausable
+    // and uncancellable, and two writers appending to one `.part`.
+    let control = DownloadControl::new();
+    let key = download_key(&repo, &filename);
+    {
+        let mut live = state
+            .live
+            .lock()
+            .map_err(|_| "the download state lock is poisoned; restart the app".to_string())?;
+        if live.contains_key(&key) {
+            return Err("this file is already downloading".to_string());
+        }
+        live.insert(key.clone(), control.clone());
+    }
+
     let client = HubClient::new();
     let handle = app.clone();
     let repo_ev = repo.clone();
     let file_ev = filename.clone();
-    let path = client
-        .download(&repo, &filename, &dir, move |p| {
+    let result = client
+        .download(&repo, &filename, &dir, control, move |p| {
             let _ = handle.emit(
                 "download://progress",
                 serde_json::json!({
@@ -1736,12 +1809,75 @@ async fn hub_download(
                 }),
             );
         })
-        .await
-        .map_err(|e| e.to_string())?;
+        .await;
 
-    let out = path.to_string_lossy().to_string();
-    let _ = app.emit("download://done", serde_json::json!({ "path": out }));
-    Ok(out)
+    if let Ok(mut live) = state.live.lock() {
+        live.remove(&key);
+    }
+
+    match result {
+        Ok(DownloadOutcome::Completed(path)) => {
+            let out = path.to_string_lossy().to_string();
+            let _ = app.emit("download://done", serde_json::json!({ "path": out }));
+            Ok(DownloadResult {
+                status: "completed",
+                path: Some(out),
+            })
+        }
+        Ok(DownloadOutcome::Paused) => Ok(DownloadResult {
+            status: "paused",
+            path: None,
+        }),
+        Ok(DownloadOutcome::Cancelled) => Ok(DownloadResult {
+            status: "cancelled",
+            path: None,
+        }),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Ask the running download for `repo`/`filename` to stop, keeping the partial
+/// file so a later download resumes it.
+#[tauri::command]
+fn hub_download_pause(
+    state: tauri::State<'_, Downloads>,
+    repo: String,
+    filename: String,
+) -> Result<(), String> {
+    let key = download_key(&repo, filename.trim());
+    let live = state
+        .live
+        .lock()
+        .map_err(|_| "the download state lock is poisoned; restart the app".to_string())?;
+    match live.get(&key) {
+        Some(control) => {
+            control.pause();
+            Ok(())
+        }
+        None => Err("no download is running for that file".to_string()),
+    }
+}
+
+/// Ask the running download for `repo`/`filename` to stop and discard its
+/// partial file.
+#[tauri::command]
+fn hub_download_cancel(
+    state: tauri::State<'_, Downloads>,
+    repo: String,
+    filename: String,
+) -> Result<(), String> {
+    let key = download_key(&repo, filename.trim());
+    let live = state
+        .live
+        .lock()
+        .map_err(|_| "the download state lock is poisoned; restart the app".to_string())?;
+    match live.get(&key) {
+        Some(control) => {
+            control.cancel();
+            Ok(())
+        }
+        None => Err("no download is running for that file".to_string()),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -2194,6 +2330,7 @@ pub fn run() {
             Some(vec!["--autostart"]),
         ))
         .manage(DaemonProc::default())
+        .manage(Downloads::default())
         .setup(|app| {
             let handle = app.handle().clone();
 
@@ -2295,6 +2432,8 @@ pub fn run() {
             hub_search,
             hub_list_gguf,
             hub_download,
+            hub_download_pause,
+            hub_download_cancel,
             hub_trusted_authors,
         ])
         .build(tauri::generate_context!())

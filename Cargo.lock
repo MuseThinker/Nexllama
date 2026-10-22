@@ -837,6 +837,7 @@ dependencies = [
  "clap",
  "http-body-util",
  "infer-core",
+ "infer-hub",
  "libc",
  "model-index",
  "reqwest",

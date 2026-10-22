@@ -219,12 +219,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build CPU image
-        run: docker build -t nexllama/infer-daemon:latest .
+      - name: Check GPU image
+        run: docker build --check -f Dockerfile.web.cuda .
 
-      - name: Smoke test image
+      - name: Build CPU image
+        run: docker build -f Dockerfile.web.cpu -t nexllama/nexllama:web-cpu .
+
+      - name: Smoke test CPU image
         run: |
-          docker run --rm -d --name nexllama-smoke -p 8090:8090 nexllama/infer-daemon:latest
+          docker run --rm -d --name nexllama-smoke -p 8090:8090 nexllama/nexllama:web-cpu
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8090/health >/dev/null; then break; fi
             sleep 1

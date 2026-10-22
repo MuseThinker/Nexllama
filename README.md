@@ -1,7 +1,7 @@
 # Nexllama
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platforms: Windows | macOS | Linux](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]
+[![Platforms: Windows | Linux](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-lightgrey.svg)]
 [![Engine: llama.cpp](https://img.shields.io/badge/engine-llama.cpp-blue.svg)]
 [![Docs: OpenAPI 3.1](https://img.shields.io/badge/docs-OpenAPI%203.1-green.svg)]
 [![中文](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-red.svg)](README.zh.md)
@@ -28,7 +28,7 @@ preserving full llama.cpp performance.
 |---|---|
 | **All-in-One** | llama.cpp used as it is, behind a desktop interface instead of a command line, with the model library, the downloader and the API included. There is nothing else to install and no flags to learn. |
 | **Adaptive hardware fitting** | Layer counts, context length and offload come from llama.cpp's own fitting helpers rather than from an estimate; the backend is chosen from the hardware actually present; a backend the machine needs but the package does not carry is downloaded, verified and installed from a signed manifest on demand. |
-| **Blazing-fast inference** | Native MTP, DFlash2, EAGLE-3 and n-gram speculative decoding, behind an adaptive gate that switches drafting off the moment it stops paying. A prefix cache removes the repeated prefill that dominates time-to-first-token in a long conversation — the two take effect per model, never stacked. Measured at **+38% decode** on Qwen3.8-27B. |
+| **Blazing-fast inference** | Native MTP, DFlash2, EAGLE-3 and n-gram speculative decoding, behind an adaptive gate that switches drafting off the moment it stops paying. A prefix cache removes the repeated prefill that dominates time-to-first-token in a long conversation — the two take effect per model, never stacked. |
 | **Built for agents** | An OpenAI-compatible endpoint that OpenClaw, Hermes and SDK clients drive unchanged, native tool calling, streaming that can be cancelled, model names that still resolve when slightly stale, and failures reported with the facts needed to act on them. |
 | **Local and cloud, unified** | Local models and direct cloud vendors are served from the same port, and an optional `auto` policy keeps work on the machine and moves only what the machine cannot do well — a lower bill at the same quality, with no provider lock-in. |
 
@@ -98,9 +98,6 @@ sudo apt install build-essential cmake ninja-build pkg-config \
     libayatana-appindicator3-dev patchelf rpm zip
 ```
 
-macOS is still buildable — `./scripts/package.sh metal cpu` produces a `.dmg` —
-but it is not a shipped target.
-
 The daemon can also be run on its own, which is the usual shape for a server:
 
 ```bash
@@ -109,37 +106,40 @@ The daemon can also be run on its own, which is the usual shape for a server:
 
 ### Docker
 
-The app itself, on one port — the UI and the engine behind the same address, no proxy
-in between:
+GPU is the default. The image serves the UI, the API, and Hub searches/downloads on
+one port, and `docker compose up -d` offloads all layers to the GPU:
 
 ```bash
-docker compose -f docker-compose.web.yml up web        # CPU, http://localhost:8090
-docker compose -f docker-compose.web.yml --profile cuda up web-cuda   # CUDA
+docker compose up -d          # http://localhost:8090
 ```
 
-Open `http://localhost:8090` and the app is there: the daemon serves the built UI and
-answers the API on the same port, and the models folder you mounted is the library it
-lists. `docker build -f Dockerfile.web -t nexllama:web .` builds it without compose.
+The host needs the NVIDIA Container Toolkit. `docker-compose.yml` builds
+`Dockerfile.web.cuda`. On a host without an NVIDIA GPU, use the CPU image instead:
 
-By default that port has no token, which is right on a laptop. Anywhere else, set one —
+```bash
+docker compose -f docker-compose.cpu.yml up -d
+```
+
+That builds `Dockerfile.web.cpu`, which keeps every layer on the CPU. The default
+compose file is still the GPU one.
+
+Open `http://localhost:8090`; put a `.gguf` in `./models` (or set `MODELS_DIR`) and it
+shows up in the library. Press **Load** to offload it, then chat. Search and download
+on the Models page also write into `./models`, so the mount is writable. `docker compose down`
+stops it.
+
+By default the port has no token, which is right on a laptop. Anywhere else, set one —
 the daemon reads `NEXLLAMA_API_KEY` itself, and the app asks for the token on its
 Settings page:
 
 ```bash
-API_KEY=$(openssl rand -hex 16) docker compose -f docker-compose.web.yml up web
+API_KEY=$(openssl rand -hex 16) docker compose up -d
 ```
 
-The API-only images, for a server that has its own front end or no UI at all:
-
-```bash
-docker compose build
-MODEL=/models/qwen2.5-0.5b-instruct-q4_k_m.gguf docker compose up           # CPU
-docker compose -f docker-compose.cuda.yml up                                 # CUDA
-```
-
-Models are mounted read-only from `./models`. Environment overrides: `PORT`, `MODEL`,
-`N_GPU_LAYERS`, `N_CTX`, `KEEP_ALIVE_SECS`, `MODELS_DIR`, `API_KEY`, and the build
-argument `CRATES_MIRROR` for a crates.io mirror.
+Models are read from and written to `./models`; on Linux hosts the mounted folder
+must be writable by uid `10001` for Hub downloads. Environment overrides: `PORT`,
+`MODELS_DIR`, `API_KEY`, `RUST_LOG`, `CUDA_VERSION`, and the build argument
+`CRATES_MIRROR` for a crates.io mirror.
 
 ### From source
 
@@ -265,41 +265,6 @@ drafting once it stops paying and re-enables it when the acceptance rate recover
 can only ever turn drafting *off*, which makes leaving it enabled the safe direction.
 Accepted tokens are tokens the model would itself have sampled, so the optimisation is
 exact rather than approximate.
-
-<details>
-<summary>Benchmark: five drafting configurations on one model</summary>
-
-Qwen3.8-27B-UD-IQ4_XS (13.3 GB) on a 24 GB Quadro RTX 6000, `n_ctx=4096`,
-`n_gpu_layers=999`, `max_tokens=256`, temperature 1.0 / top_p 0.95 / top_k 20, seed 42,
-one fixed prompt. Rows 1–4 and 6 are three sessions of one warm-up reply followed by
-seven timed replies; row 5 is one session of five. *Decode* is generated tokens over
-all generation time.
-
-| # | Drafter | `draft_n_max` | decode tok/s | speed-up | TTFT | prefill tok/s | accept | accepted/round |
-|---|---|---|---|---|---|---|---|---|
-| 1 | none (baseline) | – | **24.3** (24.0–24.7) | — | 126–128 ms | 414–433 | – | – |
-| 2 | DFlash `Q4_0` via `draft_model` | 2 | 27.9 (25.9–30.9) | +15 % | 178–206 ms | 197–223 | 62.7 % | 1.25 |
-| 3 | DFlash2 `Q4_K_M` via `draft_model` | 3 | 27.6 (26.2–30.1) | +14 % | 204–242 ms | 174–199 | 56.5 % | 1.69 |
-| 4 | MTP side file `Q4_0` via `draft_model` | 2 | 32.6 (32.1–33.7) | +34 % | 178–215 ms | 187–224 | 64.7 % | 1.29 |
-| 5 | MTP bundled head, `--mtp-n-max` | 2 | **33.9** | **+38 %** | 172 ms | 231 | 64.9 % | 1.30 |
-| 6 | control: DFlash2 resident, `speculative: false` | – | 24.1 (24.0–24.1) | 0 % | 131–134 ms | 398–403 | – | – |
-
-- **Row 6 is the control.** A resident drafter costs nothing while idle: identical
-  decode and prefill. The time-to-first-token and prefill regression in rows 2–5 is
-  drafting being *active* — the prompt is prefilled through the drafter as well, which
-  roughly halves prefill throughput.
-- **MTP is the stronger of the two families here, and consistently so.** Both MTP rows
-  hold 32–34 tok/s across every session while the DFlash rows range from 26 to 31. MTP
-  drafts from the target's own hidden state through a head adjacent to the final
-  block, so its proposals track the target more closely and it costs one block of
-  forward pass rather than a whole second model.
-- **Draft length has a small optimum.** DFlash `Q4_0` is fastest at 2, DFlash2 at 3,
-  MTP at 2. Raising DFlash2 to 4 lowers acceptance from 56.5 % to 45.6 % and returns to
-  the throughput of `n_max=2`.
-- **Text is not bit-identical to an undrafted run.** Verifying a draft computes a batch
-  instead of a single token; floating-point sums are ordered differently, so a near-tie
-  can resolve the other way. Each path is individually deterministic.
-</details>
 
 ### Measured configuration
 
@@ -464,6 +429,13 @@ only the port.
 | POST | `/admin/load` | `{ "model": "path.gguf", "name": "alias", "n_gpu_layers": 999, "n_ctx": 4096, … }` |
 | POST | `/admin/unload` | `{ "model": "alias" }`, or `{}` for every model |
 | POST | `/admin/fit` | Fit a checkpoint, or a `size_bytes`, before downloading |
+| GET | `/admin/models` | The models folder, as `model-index` reads it |
+| GET | `/admin/hub/authors` | Trusted HuggingFace publishers offered as search filters |
+| GET | `/admin/hub/search` | `?q=…&author=…&limit=20`; list GGUF repositories |
+| GET | `/admin/hub/files` | `?repo=owner/name`; list a repository's GGUF files |
+| GET, POST | `/admin/hub/download` | `{ "repo": "owner/name", "filename": "x.gguf" }`; `GET` with the same pair reports progress |
+| POST | `/admin/hub/download/pause`, `/cancel` | Stop a running transfer, keeping or deleting the partial file |
+| GET | `/admin/hub/downloads` | Every transfer this daemon knows about |
 | GET, POST | `/admin/providers` | List and configure cloud providers; keys are never returned |
 | POST | `/admin/providers/test` | Retrieve a provider's model list to validate a key |
 | GET, POST | `/admin/routing` | The `auto` policy: `{ "enabled": true, "prefer": "local" }` |
@@ -549,7 +521,9 @@ grants nothing beyond `opener:default`.
 ## Model downloads
 
 Search is unrestricted; the download page offers the three catalogues that cover nearly
-everything worth running locally as one-click filters:
+everything worth running locally as one-click filters. The desktop app and the Docker
+web UI both use it; in the container the transfer runs in the daemon, so closing the
+browser does not cancel it.
 
 - **bartowski** — the broadest catalogue, one model across many quantisations
 - **Unsloth** — dynamic quantisations and the releases that carry the heads MTP needs
@@ -609,11 +583,7 @@ asynchronously and never enters that thread.
 
 ## Troubleshooting
 
-**The installer is flagged by SmartScreen, or macOS refuses to open the application.**
-Builds are not signed by default. Signing and notarising a macOS build requires an
-Apple Developer account and `APPLE_SIGNING_IDENTITY`, `APPLE_CERTIFICATE`,
-`APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID`, which
-the packaging step uses when they are present.
+**The installer is flagged by SmartScreen.** Builds are not signed by default.
 
 **The wrong backend was selected.** Settings → GPU reports the detected adapter, the
 backend that would be used and the one in use, and can install a missing backend on
@@ -648,8 +618,8 @@ registry = "sparse+https://rsproxy.cn/index/"
 - With a draft model or MTP head active, the prefix cache is disabled because those
   paths track position independently of the target; such models re-encode the
   conversation each turn.
-- Hardware acceleration is provided by the backends llama.cpp offers — CUDA, Vulkan and
-  Metal. Vendor-specific runtimes such as CANN or MUSA are not currently supported.
+- Hardware acceleration is provided by the backends llama.cpp offers — CUDA and
+  Vulkan. Vendor-specific runtimes such as CANN or MUSA are not currently supported.
 - Cloud requests transmit their content to the named provider.
 
 ## Contributing

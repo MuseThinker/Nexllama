@@ -1,5 +1,6 @@
 mod cloud;
 mod http;
+mod hub;
 mod lifecycle;
 mod state;
 mod ui;

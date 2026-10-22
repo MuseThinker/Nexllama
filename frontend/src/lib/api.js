@@ -169,6 +169,36 @@ export const daemon = {
    */
   localModels: () => req('/admin/models'),
 
+  // HuggingFace catalog. Search and listing talk to the Hub, so they get longer
+  // than the default: a cold upstream connection can spend several seconds
+  // before it answers at all.
+  hubAuthors: () => req('/admin/hub/authors'),
+  hubSearch: (query, author = null, limit = 20) => {
+    const params = new URLSearchParams({ q: query, limit: String(limit) });
+    if (author) params.set('author', author);
+    return req(`/admin/hub/search?${params}`, {}, 30_000);
+  },
+  hubFiles: (repo) =>
+    req(`/admin/hub/files?${new URLSearchParams({ repo })}`, {}, 30_000),
+  hubDownload: (repo, filename) =>
+    req(
+      '/admin/hub/download',
+      { method: 'POST', body: JSON.stringify({ repo, filename }) },
+      0,
+    ),
+  hubDownloadStatus: (repo, filename) =>
+    req(`/admin/hub/download?${new URLSearchParams({ repo, filename })}`),
+  hubPause: (repo, filename) =>
+    req('/admin/hub/download/pause', {
+      method: 'POST',
+      body: JSON.stringify({ repo, filename }),
+    }),
+  hubCancel: (repo, filename) =>
+    req('/admin/hub/download/cancel', {
+      method: 'POST',
+      body: JSON.stringify({ repo, filename }),
+    }),
+
   // No timeout: reading a model off disk and filling the KV cache is exactly
   // the work that can take minutes, and aborting it halfway would leave the
   // daemon holding a half-loaded model.

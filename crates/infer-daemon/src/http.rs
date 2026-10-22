@@ -86,6 +86,18 @@ pub fn router(
         // (`model-index`), so a browser opened against this daemon shows the
         // library the app would show. Only when `--models-dir` named one.
         .route("/admin/models", get(list_models_folder))
+        // HuggingFace search and downloads, so the browser UI has the same
+        // catalog the desktop app gets from its Tauri commands.
+        .route("/admin/hub/authors", get(crate::hub::authors))
+        .route("/admin/hub/search", get(crate::hub::search))
+        .route("/admin/hub/files", get(crate::hub::files))
+        .route(
+            "/admin/hub/download",
+            get(crate::hub::status).post(crate::hub::download),
+        )
+        .route("/admin/hub/download/pause", post(crate::hub::pause))
+        .route("/admin/hub/download/cancel", post(crate::hub::cancel))
+        .route("/admin/hub/downloads", get(crate::hub::downloads))
         // Cloud providers: pushed by the desktop app over loopback. The key is
         // write-only — `GET` lists the providers but never their keys.
         .route("/admin/providers", get(list_providers).post(set_providers))
