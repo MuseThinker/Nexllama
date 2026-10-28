@@ -23,7 +23,12 @@ function Find-VsInstall {
 $vs = Find-VsInstall
 $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
 $ninja = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja"
-$llvm = "C:\Program Files\LLVM\bin"
+# Honour a caller-provided LLVM selected for bindgen; fall back to the usual
+# standalone install. Some machines only have a libclang.dll without clang.exe.
+$llvm = $env:LIBCLANG_PATH
+if (-not $llvm -or -not (Test-Path -LiteralPath (Join-Path $llvm "libclang.dll"))) {
+    $llvm = "C:\Program Files\LLVM\bin"
+}
 $cmake = "C:\Program Files\CMake\bin"
 $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
 
@@ -44,10 +49,16 @@ if (-not $CargoArgs -or $CargoArgs.Count -eq 0) { $CargoArgs = @("build") }
 # bindgen. Select the standalone libclang explicitly after vcvars has run, but
 # keep its clang out of PATH: CMake subprojects otherwise pick it up and pass
 # MSVC-style flags such as /utf-8 to it.
+$clangPath = Join-Path $llvm "clang.exe"
+$clangEnv = if (Test-Path -LiteralPath $clangPath) {
+    " && set `"CLANG_PATH=$clangPath`""
+} else {
+    ""
+}
 $inner = "call `"$vcvars`" >nul 2>&1" +
     " && set `"CMAKE_GENERATOR=Ninja`"" +
     " && set `"LIBCLANG_PATH=$llvm`"" +
-    " && set `"CLANG_PATH=$llvm\clang.exe`"" +
+    $clangEnv +
     " && set `"CC=cl`"" +
     " && set `"CXX=cl`"" +
     " && cargo " + ($CargoArgs -join " ")
