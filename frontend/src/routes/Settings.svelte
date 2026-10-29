@@ -4,6 +4,7 @@ import { invoke, hasTauri, listen } from '../lib/tauri.js';
 import { t, locale } from '../lib/i18n.js';
 import { theme } from '../lib/theme.js';
 import { restartDaemon as daemonRestart } from '../lib/daemonctl.js';
+import { appVersion, checkAppUpdate, installAppUpdate } from '../lib/appUpdate.js';
 
 const KEY = 'nexllama.settings';
 
@@ -59,6 +60,12 @@ let checking = $state(false);
 let updating = $state('');
 let updateProgress = $state(null);
 let updateMsg = $state('');
+let appCurrentVersion = $state('');
+let appUpdateInfo = $state(null);
+let appUpdateChecking = $state(false);
+let appUpdateInstalling = $state(false);
+let appUpdateProgress = $state(null);
+let appUpdateMessage = $state('');
 
 function fmtBytes(n) {
   if (n == null) return '';
@@ -229,6 +236,44 @@ async function applyUpdate(backend) {
   }
 }
 
+async function refreshAppVersion() {
+  if (!hasTauri) return;
+  try {
+    appCurrentVersion = await appVersion();
+  } catch {
+    /* the desktop API is unavailable in a plain browser */
+  }
+}
+
+async function checkAppUpdates() {
+  appUpdateChecking = true;
+  appUpdateMessage = '';
+  error = '';
+  try {
+    const found = await checkAppUpdate();
+    appUpdateInfo = found;
+    if (!found) appUpdateMessage = $t('settings.appUpToDate');
+  } catch (e) {
+    error = String(e);
+  } finally {
+    appUpdateChecking = false;
+  }
+}
+
+async function installAppUpdates() {
+  if (!appUpdateInfo || appUpdateInstalling) return;
+  appUpdateInstalling = true;
+  appUpdateProgress = { downloaded: 0, total: 0 };
+  error = '';
+  try {
+    await installAppUpdate(appUpdateInfo, (progress) => (appUpdateProgress = progress));
+  } catch (e) {
+    error = String(e);
+  } finally {
+    appUpdateInstalling = false;
+  }
+}
+
 /// One-click install of the GPU backend this machine wants. Persists the
 /// manifest URL/key first, since the download reads them from the settings file.
 async function downloadGpu(backend) {
@@ -369,6 +414,7 @@ async function restartDaemon() {
 
 onMount(() => {
   load();
+  refreshAppVersion();
   if (!hasTauri) return;
   let un;
   listen('update://progress', (e) => (updateProgress = e.payload)).then((f) => (un = f));
@@ -520,6 +566,41 @@ onMount(() => {
           <p class="muted">{$t('settings.gpuNeedManifest', { gpu })}</p>
         {/if}
       {/if}
+    {/if}
+  </section>
+
+  <section class="card">
+    <h3>{$t('settings.appUpdates')}</h3>
+    <p class="muted">
+      {$t('settings.appVersion')}: <code>{appCurrentVersion || '—'}</code>
+    </p>
+    <div class="row">
+      <button onclick={checkAppUpdates} disabled={appUpdateChecking || !hasTauri}>
+        {appUpdateChecking ? $t('settings.checking') : $t('settings.checkAppUpdate')}
+      </button>
+    </div>
+    {#if appUpdateInfo}
+      <p class="muted">
+        {$t('settings.appUpdateAvailable', { version: appUpdateInfo.version })}
+      </p>
+      {#if appUpdateInfo.body}
+        <p class="muted">{appUpdateInfo.body}</p>
+      {/if}
+      <div class="row">
+        <button onclick={installAppUpdates} disabled={appUpdateInstalling}>
+          {appUpdateInstalling ? $t('update.installing') : $t('settings.appUpdateNow')}
+        </button>
+      </div>
+      {#if appUpdateInstalling && appUpdateProgress?.total}
+        {@const pct = Math.round((appUpdateProgress.downloaded / appUpdateProgress.total) * 100)}
+        <div class="progress"><div class="bar" style={`width:${pct}%`}></div></div>
+        <p class="muted">
+          {$t('update.progress', { percent: pct })}
+          · {fmtBytes(appUpdateProgress.downloaded)} / {fmtBytes(appUpdateProgress.total)}
+        </p>
+      {/if}
+    {:else if appUpdateMessage}
+      <p class="ok">{appUpdateMessage}</p>
     {/if}
   </section>
 

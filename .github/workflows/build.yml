@@ -14,6 +14,8 @@ jobs:
     # validates CPU packaging on the stable Windows 2022 image; the CUDA
     # installers are built locally where the toolkit exists.
     runs-on: windows-2022
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -157,6 +159,8 @@ jobs:
   # green Windows job says nothing about that.
   linux-desktop:
     runs-on: ubuntu-latest
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v4
 

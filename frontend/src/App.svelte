@@ -1,7 +1,9 @@
 <script>
-import { onDestroy } from 'svelte';
+import { onDestroy, onMount } from 'svelte';
 import { daemon } from './lib/api.js';
 import { t } from './lib/i18n.js';
+import { hasTauri } from './lib/tauri.js';
+import { checkAppUpdate, installAppUpdate } from './lib/appUpdate.js';
 import Chat from './routes/Chat.svelte';
 import Models from './routes/Models.svelte';
 import Settings from './routes/Settings.svelte';
@@ -15,6 +17,10 @@ const tabs = [
 
 let tab = $state('chat');
 let online = $state(false);
+let appUpdate = $state(null);
+let appUpdateBusy = $state(false);
+let appUpdateProgress = $state(null);
+let appUpdateError = $state('');
 
 // The daemon answered and then refused the calls behind the token. `/health` is
 // deliberately open so a client can bootstrap before it has one, which means
@@ -51,10 +57,37 @@ async function probe() {
   }
 }
 
+async function installUpdate() {
+  if (!appUpdate || appUpdateBusy) return;
+  appUpdateBusy = true;
+  appUpdateError = '';
+  appUpdateProgress = { downloaded: 0, total: 0 };
+  try {
+    await installAppUpdate(appUpdate, (progress) => (appUpdateProgress = progress));
+  } catch (e) {
+    appUpdateError = String(e);
+  } finally {
+    appUpdateBusy = false;
+  }
+}
+
 $effect(() => {
   const unauthorized = () => (needsToken = true);
   window.addEventListener('nexllama:unauthorized', unauthorized);
   return () => window.removeEventListener('nexllama:unauthorized', unauthorized);
+});
+
+onMount(() => {
+  if (!hasTauri) return;
+  const timer = setTimeout(async () => {
+    try {
+      const found = await checkAppUpdate();
+      if (found) appUpdate = found;
+    } catch {
+      // A missing latest.json or a network failure is not startup-blocking.
+    }
+  }, 3000);
+  return () => clearTimeout(timer);
 });
 
 probe();
@@ -86,6 +119,21 @@ onDestroy(() => clearInterval(poll));
     border-bottom: 1px solid var(--line);
     font-size: 0.85rem;
   }
+  .banner.update {
+    background: color-mix(in srgb, var(--accent, #2563eb) 16%, transparent);
+  }
+  .banner-actions {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-shrink: 0;
+  }
+  .update-error {
+    padding: 0.55rem 1rem;
+    color: var(--danger, #b91c1c);
+    border-bottom: 1px solid var(--line);
+    font-size: 0.82rem;
+  }
 </style>
 
 <div class="app">
@@ -106,6 +154,31 @@ onDestroy(() => clearInterval(poll));
   </aside>
 
   <main>
+    {#if appUpdate}
+      <div class="banner update" role="status">
+        <span title={appUpdate.body || ''}>
+          {$t('update.available', { version: appUpdate.version })}
+          {#if appUpdateProgress?.total}
+            {#if appUpdateBusy}
+              · {$t('update.progress', {
+                percent: Math.round((appUpdateProgress.downloaded / appUpdateProgress.total) * 100),
+              })}
+            {/if}
+          {/if}
+        </span>
+        <span class="banner-actions">
+          <button onclick={installUpdate} disabled={appUpdateBusy}>
+            {appUpdateBusy ? $t('update.installing') : $t('update.install')}
+          </button>
+          <button class="ghost" onclick={() => (appUpdate = null)} disabled={appUpdateBusy}>
+            {$t('update.later')}
+          </button>
+        </span>
+      </div>
+    {/if}
+    {#if appUpdateError}
+      <div class="update-error">{$t('update.failed', { error: appUpdateError })}</div>
+    {/if}
     {#if needsToken}
       <div class="banner">
         <span>{$t('auth.tokenNeeded')}</span>
