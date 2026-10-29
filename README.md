@@ -75,8 +75,9 @@ Models are read from `C:\models` by default — change the location in Settings,
 a GGUF there before the first launch.
 
 Starting with v0.1.3, the desktop app checks GitHub Releases for updates and can
-download and install a newer version. Installations older than v0.1.3 need one
-manual update first.
+download and install a newer version. Lite installations receive lite updates;
+full installations receive full updates. Installations older than v0.1.3 need
+one manual update first.
 
 ### Linux
 

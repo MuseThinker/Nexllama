@@ -3,9 +3,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Tag,
     [string]$Notes = "",
-    [string]$Repository = "MuseThinker/Nexllama",
-    # Defaults to the full installer for the version in tauri.conf.json.
-    [string]$Installer
+    [string]$Repository = "MuseThinker/Nexllama"
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,39 +15,46 @@ $version = [string]$config.version
 if ($Tag.TrimStart("v") -ne $version) {
     throw "release tag $Tag does not match tauri.conf.json version $version"
 }
-if (-not $Installer) {
-    $Installer = Join-Path $root "crates\app\target\release\bundle\nsis\Nexllama_${version}_x64-setup.exe"
-}
-if (-not (Test-Path -LiteralPath $Installer)) {
-    throw "installer not found: $Installer"
+
+$bundleDir = Join-Path $root "crates\app\target\release\bundle\nsis"
+$full = Join-Path $bundleDir "Nexllama_${version}_x64-setup.exe"
+$lite = Join-Path $bundleDir "Nexllama_${version}_x64-lite-setup.exe"
+
+function Get-UpdaterEntry {
+    param([string]$Installer, [string]$FileName)
+    if (-not (Test-Path -LiteralPath $Installer)) {
+        throw "installer not found: $Installer"
+    }
+    $signaturePath = "$Installer.sig"
+    if (-not (Test-Path -LiteralPath $signaturePath)) {
+        throw "updater signature not found: $signaturePath (build with TAURI_SIGNING_PRIVATE_KEY set)"
+    }
+    $signature = (Get-Content -LiteralPath $signaturePath -Raw).Trim()
+    if (-not $signature) {
+        throw "updater signature is empty: $signaturePath"
+    }
+    return [ordered]@{
+        signature = $signature
+        url       = "https://github.com/$Repository/releases/download/$Tag/$FileName"
+    }
 }
 
-$signaturePath = "$Installer.sig"
-if (-not (Test-Path -LiteralPath $signaturePath)) {
-    throw "updater signature not found: $signaturePath (build with TAURI_SIGNING_PRIVATE_KEY set)"
-}
-$signature = (Get-Content -LiteralPath $signaturePath -Raw).Trim()
-if (-not $signature) {
-    throw "updater signature is empty: $signaturePath"
-}
-
-$fileName = Split-Path -Leaf $Installer
-$url = "https://github.com/$Repository/releases/download/$Tag/$fileName"
+$fullName = Split-Path -Leaf $full
+$liteName = Split-Path -Leaf $lite
 $manifest = [ordered]@{
     version   = $version
     notes     = $Notes
     pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     platforms = [ordered]@{
-        "windows-x86_64" = [ordered]@{
-            signature = $signature
-            url       = $url
-        }
+        "windows-x86_64"      = Get-UpdaterEntry -Installer $full -FileName $fullName
+        "windows-x86_64-lite" = Get-UpdaterEntry -Installer $lite -FileName $liteName
     }
 }
 
-$output = Join-Path (Split-Path -Parent $Installer) "latest.json"
+$output = Join-Path $bundleDir "latest.json"
 $json = $manifest | ConvertTo-Json -Depth 6
 [IO.File]::WriteAllText($output, $json, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "wrote $output"
 Write-Host "version: $version"
-Write-Host "url: $url"
+Write-Host "full: $fullName"
+Write-Host "lite: $liteName"

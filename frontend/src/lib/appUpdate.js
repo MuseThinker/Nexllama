@@ -1,10 +1,15 @@
-import { hasTauri } from './tauri.js';
+import { hasTauri, invoke } from './tauri.js';
 
 /// Ask the updater endpoint whether a newer app version exists.
+///
+/// The lite installer omits the CUDA runtime, so it must keep receiving lite
+/// packages. The manifest carries that as a custom updater target; full builds
+/// keep the default OS/architecture target.
 export async function checkAppUpdate() {
   if (!hasTauri) return null;
   const { check } = await import('@tauri-apps/plugin-updater');
-  return check();
+  const edition = await invoke('app_edition').catch(() => 'full');
+  return edition === 'lite' ? check({ target: 'windows-x86_64-lite' }) : check();
 }
 
 /// Current version as embedded in the running executable.

@@ -782,6 +782,12 @@ fn child_alive(child: &mut Child) -> bool {
     matches!(child.try_wait(), Ok(None))
 }
 
+/// Which installer this executable came from. Used to keep lite updates lite.
+#[tauri::command]
+fn app_edition() -> &'static str {
+    option_env!("NEXLLAMA_EDITION").unwrap_or("full")
+}
+
 #[tauri::command]
 fn backend_info(app: tauri::AppHandle) -> serde_json::Value {
     let requested = load_settings(&app)
@@ -2410,6 +2416,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            app_edition,
             backend_info,
             daemon_binary_info,
             daemon_running,

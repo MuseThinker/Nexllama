@@ -107,6 +107,17 @@ function Publish-Installer {
         }
         Move-Item -LiteralPath $built.FullName -Destination (Join-Path $bundleDir $name) -Force
     }
+    # Keep the updater signature attached to the filename it belongs to. The
+    # lite build is renamed here; without this, the full build's signature
+    # would overwrite the lite one.
+    $builtSig = "$($built.FullName).sig"
+    $targetSig = Join-Path $bundleDir "$name.sig"
+    if ((Test-Path -LiteralPath $builtSig) -and ($builtSig -ne $targetSig)) {
+        if (Test-Path -LiteralPath $targetSig) {
+            Remove-Item -LiteralPath $targetSig -Force
+        }
+        Move-Item -LiteralPath $builtSig -Destination $targetSig -Force
+    }
     $final = Get-Item (Join-Path $bundleDir $name)
     Write-Host "installer: $($final.FullName) ($([math]::Round($final.Length/1MB,2)) MiB)"
 }
@@ -156,6 +167,17 @@ foreach ($want in $editions) {
     }
 
     $started = Get-Date
-    Invoke-TauriBuild
+    # Baked into the executable so the updater can choose the matching package.
+    $previousEdition = $env:NEXLLAMA_EDITION
+    $env:NEXLLAMA_EDITION = $want
+    try {
+        Invoke-TauriBuild
+    } finally {
+        if ($null -eq $previousEdition) {
+            Remove-Item Env:\NEXLLAMA_EDITION -ErrorAction SilentlyContinue
+        } else {
+            $env:NEXLLAMA_EDITION = $previousEdition
+        }
+    }
     Publish-Installer -Edition $want -Since $started
 }
