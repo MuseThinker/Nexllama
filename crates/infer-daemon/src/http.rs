@@ -1905,18 +1905,15 @@ async fn speech(
     // concurrent runs would fight over the same GPU.
     let _serial = state.tts_lock.lock().await;
     tracing::info!(%id, lang = language, "speech synthesis started");
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(900),
-        cmd.output(),
-    )
-    .await
-    .map_err(|_| ApiError::Model("llama-tts timed out after 900 seconds".into()))?
-    .map_err(|e| {
-        ApiError::Model(format!(
-            "could not start llama-tts at {}: {e}",
-            bin.display()
-        ))
-    })?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(900), cmd.output())
+        .await
+        .map_err(|_| ApiError::Model("llama-tts timed out after 900 seconds".into()))?
+        .map_err(|e| {
+            ApiError::Model(format!(
+                "could not start llama-tts at {}: {e}",
+                bin.display()
+            ))
+        })?;
     if !output.status.success() {
         let _ = tokio::fs::remove_file(&out).await;
         let stderr = String::from_utf8_lossy(&output.stderr);
