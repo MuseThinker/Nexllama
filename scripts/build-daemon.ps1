@@ -58,6 +58,17 @@ foreach ($name in $runtimeDlls) {
     }
 }
 
+# `llama-tts` is the speech sidecar behind `/v1/audio/speech`. It is a thin
+# frontend over the same llama/ggml DLLs staged above, so the backend grows by
+# about 50 KB rather than a second runtime. The executable is checked in beside
+# the app because llama-cpp-sys builds its backend with tools disabled.
+$tts = Join-Path $root "crates\app\tts\llama-tts.exe"
+if (Test-Path -LiteralPath $tts) {
+    Copy-Item -LiteralPath $tts -Destination (Join-Path $dstDir "llama-tts.exe") -Force
+} else {
+    Write-Warning "llama-tts.exe not found at $tts; speech synthesis will be unavailable"
+}
+
 # The CUDA runtime is not part of the display driver — it ships with the CUDA
 # Toolkit. A machine with only the NVIDIA driver installed has no `cudart64_*` or
 # `cublas*`, so a cuda backend that leans on them dies at load. Bundle the three

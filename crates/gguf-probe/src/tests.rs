@@ -87,6 +87,21 @@ fn generation_architectures_classify_as_llm() {
 }
 
 #[test]
+fn speech_architectures_classify_as_tts() {
+    for arch in ["qwen3tts", "qwen3-tts"] {
+        assert_eq!(
+            class_of(vec![(
+                "general.architecture",
+                STRING_TAG,
+                KvValue::String(arch)
+            )]),
+            ModelClass::Tts,
+            "{arch}"
+        );
+    }
+}
+
+#[test]
 fn bert_family_classifies_as_embedding() {
     for arch in ["bert", "nomic-bert", "jina-bert-v2", "t5encoder"] {
         assert_eq!(

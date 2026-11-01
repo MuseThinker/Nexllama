@@ -4,6 +4,9 @@ const KEY = 'nexllama.locale';
 
 const dict = {
   zh: {
+    'chat.speak': '朗读',
+    'chat.speaking': '生成语音…',
+    'models.speech': '语音合成',
     'nav.chat': '对话',
     'nav.models': '模型',
     'nav.settings': '设置',
@@ -44,7 +47,7 @@ const dict = {
     'chat.draftHit': '草稿命中 {a}/{n}（{pct}%）',
     'chat.attachImage': '添加图片（需要模型带 mmproj）',
     'chat.removeImage': '移除图片',
-    'chat.apiOnly': '已加载 {n} 个 API 模型（embedding / rerank），它们通过 HTTP 接口提供服务，不能对话。请加载一个 LLM 模型。',
+    'chat.apiOnly': '已加载 {n} 个 API 模型（embedding / rerank / TTS），它们通过 HTTP 接口提供服务，不能对话。请加载一个 LLM 模型。',
 
     'models.title': '模型',
     'models.refresh': '刷新',
@@ -244,6 +247,9 @@ const dict = {
     'models.dir': '模型文件夹',
   },
   en: {
+    'chat.speak': 'Read aloud',
+    'chat.speaking': 'Synthesising…',
+    'models.speech': 'Speech synthesis',
     'nav.chat': 'Chat',
     'nav.models': 'Models',
     'nav.settings': 'Settings',
@@ -285,7 +291,7 @@ const dict = {
     'chat.attachImage': 'Attach images (needs a model with an mmproj)',
     'chat.removeImage': 'Remove image',
     'chat.apiOnly':
-      '{n} API model(s) loaded (embedding / rerank). They serve HTTP endpoints and cannot chat — load an LLM model.',
+      '{n} API model(s) loaded (embedding / rerank / TTS). They serve HTTP endpoints and cannot chat — load an LLM model.',
 
     'models.title': 'Models',
     'models.refresh': 'Refresh',

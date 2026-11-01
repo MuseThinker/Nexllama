@@ -120,7 +120,7 @@ let daemonBusy = $state(false);
 // Chat models first, then everything a user might keep for attachments later;
 // the classes that cannot generate sit at the bottom where the Load button is
 // clearly not for talking to.
-const classRank = (b) => ({ vision: 1, llm: 2, speculative: 3, embedding: 4, rerank: 5 }[b.kind] ?? 3);
+const classRank = (b) => ({ vision: 1, llm: 2, speculative: 3, tts: 4, embedding: 5, rerank: 6 }[b.kind] ?? 3);
 const orderedModels = $derived([...localModels].sort((a, b) => classRank(a) - classRank(b)));
 
 // Everything the service knows about, resident or not. A model that was
@@ -1066,6 +1066,7 @@ async function saveCloud(silent) {
               {#if b.kind === 'vision'}<span class="badge">vision</span>{/if}
               {#if b.kind === 'speculative'}<span class="badge" title={b.draft}>spec</span>{/if}
               {#if b.mtp}<span class="badge">MTP</span>{/if}
+              {#if b.class === 'tts'}<span class="badge api">TTS</span>{/if}
               {#if b.class === 'embedding' || b.class === 'rerank'}
                 <span class="badge api">API · {b.class}</span>
               {/if}
@@ -1090,9 +1091,11 @@ async function saveCloud(silent) {
                 </select>
               </label>
             {/if}
+            {#if b.class !== 'tts'}
             <button class="ghost" onclick={() => checkFit(b)} disabled={busy !== '' || fitBusy !== ''}>
               {fitBusy === b.main ? $t('models.fitting') : $t('models.fit')}
             </button>
+            {/if}
             <button onclick={() => loadBundle(b)} disabled={busy !== ''}>
               {loadingPath === b.main ? $t('models.loading') : $t('models.load')}
             </button>
@@ -1217,12 +1220,20 @@ async function saveCloud(silent) {
                 <span class="badge">MTP</span>
               {/if}
               {#if m.mmproj}<span class="badge" title={m.mmproj}>mmproj</span>{/if}
-              {#if m.info?.model_class === 'embedding' || m.info?.model_class === 'rerank'}
+              {#if m.info?.model_class === 'tts'}
+                <span class="badge api">TTS</span>
+              {:else if m.info?.model_class === 'embedding' || m.info?.model_class === 'rerank'}
                 <span class="badge api">API · {m.info.model_class}</span>
               {/if}
               {#if m.id === status.default_model}<span class="badge">{$t('models.default')}</span>{/if}
             </span>
-            <span class="file-size">ctx {m.n_ctx} · GPU {m.n_gpu_layers} · {$t('models.idle')} {m.idle_secs}s</span>
+            <span class="file-size">
+              {#if m.info?.model_class === 'tts'}
+                {$t('models.speech')} · GPU {m.n_gpu_layers}
+              {:else}
+                ctx {m.n_ctx} · GPU {m.n_gpu_layers} · {$t('models.idle')} {m.idle_secs}s
+              {/if}
+            </span>
             <button class="ghost" onclick={() => unload(m.id)} disabled={busy !== ''}>{$t('models.unload')}</button>
           </li>
         {/each}

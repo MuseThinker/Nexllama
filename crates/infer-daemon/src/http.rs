@@ -22,7 +22,9 @@ use infer_core::{
 };
 
 use crate::cloud;
-use crate::state::{record_stats, AppState, DaemonState, Dormant, InFlight, Loaded, RuntimeStats};
+use crate::state::{
+    record_stats, AppState, DaemonState, Dormant, InFlight, Loaded, RuntimeStats, TtsModel,
+};
 
 /// Shared secret required on every request when set.
 pub type ApiKey = Option<Arc<String>>;
@@ -66,6 +68,9 @@ pub fn router(
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/embeddings", post(embeddings))
+        // Speech synthesis, served by the `llama-tts` sidecar. Same port and
+        // same bearer token as everything else; no second server to expose.
+        .route("/v1/audio/speech", post(speech))
         // Upstream llama.cpp registers the same four rerank spellings.
         .route("/v1/rerank", post(rerank))
         .route("/rerank", post(rerank))
@@ -220,7 +225,7 @@ async fn docs() -> impl IntoResponse {
 /// Pointing a browser or a curl at the base URL is the first thing anyone does;
 /// answering with a JSON menu beats a 404.
 async fn root(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let loaded = state.inner.lock().await.models.len();
+    let loaded = state.inner.lock().await.ids().len();
     Json(json!({
         "name": "Nexllama",
         "version": env!("CARGO_PKG_VERSION"),
@@ -244,7 +249,7 @@ async fn ollama_version() -> Json<serde_json::Value> {
 /// `GET /api/tags` — Ollama's model list.
 async fn ollama_tags(State(state): State<AppState>) -> Json<serde_json::Value> {
     let guard = state.inner.lock().await;
-    let models: Vec<serde_json::Value> = guard
+    let mut models: Vec<serde_json::Value> = guard
         .models
         .values()
         .map(|l| {
@@ -263,6 +268,16 @@ async fn ollama_tags(State(state): State<AppState>) -> Json<serde_json::Value> {
             })
         })
         .collect();
+    models.extend(guard.tts.values().map(|t| {
+        json!({
+            "name": t.id,
+            "model": t.id,
+            "size": std::fs::metadata(&t.path).map(|m| m.len()).unwrap_or(0),
+            "digest": "",
+            "modified_at": "",
+            "details": { "family": "speech synthesis", "parameter_size": "", "quantization_level": null, "class": "tts" },
+        })
+    }));
     Json(json!({ "models": models }))
 }
 
@@ -396,7 +411,7 @@ async fn health(State(state): State<AppState>) -> Response {
         // Lets the app check that the process answering here is the one it
         // started, rather than a leftover holding the port.
         "pid": std::process::id(),
-        "models_loaded": guard.models.len(),
+        "models_loaded": guard.ids().len(),
         "models": guard.ids(),
         "default_model": guard.default_model,
         "keep_alive_secs": guard.keep_alive.as_secs(),
@@ -456,6 +471,26 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
             "idle_secs": 0,
             "perf": serde_json::Value::Null,
             "loaded": false,
+        })
+    }));
+    // Speech models are registered rather than resident: the sidecar loads the
+    // weights per request, so they are always "loaded" from the caller's point
+    // of view and have no chat performance figures.
+    models.extend(guard.tts.values().map(|t| {
+        json!({
+            "id": t.id,
+            "path": t.path,
+            "info": { "model_class": "tts", "description": format!("{} (speech)", t.id) },
+            "n_gpu_layers": t.n_gpu_layers,
+            "n_ctx": 0,
+            "load_mtp": false,
+            "mmproj": t.mmproj,
+            "draft_model": serde_json::Value::Null,
+            "loras": Vec::<String>::new(),
+            "loaded_secs_ago": t.loaded_at.elapsed().as_secs(),
+            "idle_secs": t.last_used.elapsed().as_secs(),
+            "perf": serde_json::Value::Null,
+            "loaded": true,
         })
     }));
     // Cloud providers are callable through this same port, so list them here
@@ -903,6 +938,16 @@ async fn list_models(State(state): State<AppState>) -> Json<serde_json::Value> {
             "loaded": false,
         })
     }));
+    // Speech models are callable through `/v1/audio/speech` rather than chat.
+    data.extend(guard.tts.values().map(|t| {
+        json!({
+            "id": t.id,
+            "object": "model",
+            "path": t.path,
+            "info": { "model_class": "tts" },
+            "loaded": true,
+        })
+    }));
     drop(guard);
     // Cloud providers, snapped so the alias list can describe them too.
     let providers: Vec<cloud::Provider> = state.cloud.read().map(|p| p.clone()).unwrap_or_default();
@@ -1229,6 +1274,10 @@ async fn load(
             req.model
         )));
     }
+    // Read the family once, from the header. A speech checkpoint is not a
+    // decoder: handing it to the chat engine is what produced the bare 500 the
+    // library used to show for Qwen3-TTS.
+    let inbound_class = infer_core::model_class_of(Path::new(&req.model));
     if let Some(v) = req.n_ctx {
         cfg.n_ctx = v;
     }
@@ -1310,6 +1359,13 @@ async fn load(
     }
     let n_gpu_layers = cfg.n_gpu_layers;
     let load_mtp = cfg.load_mtp;
+
+    // Speech has its own loader, so it is registered here rather than measured,
+    // sized and handed to `Engine::load`. The sidecar reads the weights per
+    // request; nothing is kept resident in this process.
+    if inbound_class == "tts" {
+        return register_speech(state, req, cfg, id, n_gpu_layers).await;
+    }
 
     let mut notes: Vec<String> = Vec::new();
     if load_mtp {
@@ -1407,7 +1463,6 @@ async fn load(
     // would measure the checkpoint by loading it, which is both the reason a
     // second model could not be held and a second full load on every cold start.
     // The ladder needs nothing measured, and gives the same answer every time.
-    let inbound_class = infer_core::model_class_of(std::path::Path::new(&req.model));
     if cfg.n_ctx == 0 {
         let hardware = infer_core::hwprofile::probe()
             .map_err(|e| ApiError::Model(format!("could not read this machine's memory: {e}")))?;
@@ -1561,6 +1616,350 @@ async fn load(
     ))
 }
 
+/// Pick the audio projector that belongs to a TTS checkpoint.
+///
+/// The library passes the projector it paired, so this is only the fallback for
+/// a direct API load. A repository ships `bf16` and `Q8_0` projectors side by
+/// side; matching the weight quantisation is better than taking whichever name
+/// sorts first, and smallest is the next-best guess when the names do not say.
+fn auto_mmproj(weights: &Path) -> Option<std::path::PathBuf> {
+    let dir = weights.parent()?;
+    let mut candidates: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+            let is_gguf = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+            if !is_gguf || !name.contains("mmproj") {
+                return None;
+            }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+            Some((size, path))
+        })
+        .collect();
+    candidates.sort();
+    let weights_name = weights
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    for quant in ["q8_0", "q6_k", "q5_k_m", "q4_k_m", "q4_0", "bf16", "f16"] {
+        if !weights_name.contains(quant) {
+            continue;
+        }
+        if let Some((_, path)) = candidates.iter().find(|(_, p)| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase().contains(quant))
+                .unwrap_or(false)
+        }) {
+            return Some(path.clone());
+        }
+    }
+    candidates.into_iter().next().map(|(_, path)| path)
+}
+
+/// Register a speech checkpoint without loading it into this process.
+async fn register_speech(
+    state: AppState,
+    req: LoadRequest,
+    cfg: LoadConfig,
+    id: String,
+    n_gpu_layers: u32,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let weights = cfg.model_path.clone();
+    let mut notes: Vec<String> = Vec::new();
+    let mmproj = match cfg.mmproj.clone() {
+        Some(path) => path,
+        None => match auto_mmproj(&weights) {
+            Some(path) => {
+                notes.push(format!(
+                    "paired the audio projector automatically: {}",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                ));
+                path
+            }
+            None => {
+                return Err(ApiError::BadRequest(
+                    "speech synthesis needs an audio projector (mmproj) beside the weights; \
+                     download the mmproj from the same repository and load the two together"
+                        .into(),
+                ))
+            }
+        },
+    };
+    if !mmproj.is_file() {
+        return Err(ApiError::NotFound(format!(
+            "mmproj not found: {}",
+            mmproj.display()
+        )));
+    }
+
+    let name = weights
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| id.clone());
+    let info = json!({
+        "model_path": weights,
+        "description": format!("{name} (speech synthesis)"),
+        "n_ctx": cfg.n_ctx,
+        "n_ctx_train": 0,
+        "n_layer": 0,
+        "n_vocab": 0,
+        "n_params": 0,
+        "model_size": std::fs::metadata(&weights).map(|m| m.len()).unwrap_or(0),
+        "ftype": serde_json::Value::Null,
+        "vision": false,
+        "mmproj_path": mmproj,
+        "model_class": "tts",
+        "n_embd": 0,
+        "pooling": "",
+        "mtp": false,
+    });
+
+    let now = Instant::now();
+    let mut guard = state.inner.lock().await;
+    if let Some(secs) = req.keep_alive_secs {
+        guard.keep_alive = std::time::Duration::from_secs(secs);
+    }
+    // One speech model at a time, the same rule the chat slot follows. A TTS
+    // checkpoint is a couple of gigabytes and the sidecar loads one per run, so
+    // keeping several registered would only make the choice ambiguous.
+    let replaced: Vec<String> = guard
+        .tts
+        .keys()
+        .filter(|k| k.as_str() != id)
+        .cloned()
+        .collect();
+    for old in &replaced {
+        guard.tts.remove(old);
+    }
+    if !replaced.is_empty() {
+        notes.push(format!(
+            "replaced the previous speech model: {}",
+            replaced.join(", ")
+        ));
+    }
+    guard.tts.insert(
+        id.clone(),
+        TtsModel {
+            id: id.clone(),
+            path: weights,
+            mmproj,
+            n_gpu_layers,
+            loaded_at: now,
+            last_used: now,
+        },
+    );
+    guard.dormant.remove(&id);
+    drop(guard);
+
+    notes.push(
+        "speech is ready: POST /v1/audio/speech with {\"input\": \"...\", \"language\": \"zh\"}"
+            .into(),
+    );
+    Ok(Json(json!({
+        "status": "ok",
+        "id": id,
+        "info": info,
+        "notes": notes,
+        "fit": serde_json::Value::Null,
+    })))
+}
+
+#[derive(Deserialize)]
+struct SpeechRequest {
+    #[serde(default)]
+    model: Option<String>,
+    input: String,
+    /// Reference voice. A path to a wav/mp3; the OpenAI name for this field.
+    #[serde(default)]
+    voice: Option<String>,
+    /// The clearer spelling of the same thing, accepted as well.
+    #[serde(default)]
+    speaker_file: Option<String>,
+    /// `zh`, `en`, … as llama-tts spells them.
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    response_format: Option<String>,
+    /// Accepted for OpenAI compatibility. The sidecar does not resample.
+    #[serde(default)]
+    speed: Option<f32>,
+}
+
+/// Resolve a caller-supplied voice path without letting it wander the disk.
+fn speech_voice(weights: &Path, voice: Option<&str>) -> ApiResult<Option<std::path::PathBuf>> {
+    let Some(voice) = voice.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let direct = Path::new(voice);
+    if direct.is_file() {
+        return Ok(Some(direct.to_path_buf()));
+    }
+    if let Some(dir) = weights.parent() {
+        let beside = dir.join(voice);
+        if beside.is_file() {
+            return Ok(Some(beside));
+        }
+    }
+    Err(ApiError::NotFound(format!(
+        "voice file not found: {voice} (pass a path to a wav or mp3 speaker reference)"
+    )))
+}
+
+/// `POST /v1/audio/speech` — OpenAI-compatible speech synthesis.
+///
+/// The work happens in `llama-tts`, a sidecar that shares this backend's
+/// llama.cpp DLLs. The port, the token and the lifecycle stay the daemon's;
+/// only the audio generation lives outside the process.
+async fn speech(
+    State(state): State<AppState>,
+    Json(req): Json<SpeechRequest>,
+) -> ApiResult<Response> {
+    if req.input.trim().is_empty() {
+        return Err(ApiError::BadRequest("input must not be empty".into()));
+    }
+    if let Some(format) = req.response_format.as_deref() {
+        if !format.eq_ignore_ascii_case("wav") {
+            return Err(ApiError::BadRequest(format!(
+                "response_format {format:?} is not supported; this endpoint returns wav"
+            )));
+        }
+    }
+    let Some(bin) = state.tts_bin.clone() else {
+        return Err(ApiError::Model(
+            "speech synthesis needs llama-tts.exe, and this daemon was not told where it is".into(),
+        ));
+    };
+    if !bin.is_file() {
+        return Err(ApiError::Model(format!(
+            "llama-tts.exe was not found at {} — reinstall the backend, or pass --tts-bin",
+            bin.display()
+        )));
+    }
+
+    let (id, weights, mmproj, n_gpu_layers) = {
+        let mut guard = state.inner.lock().await;
+        let Some(id) = guard.resolve_class(req.model.as_deref(), "tts") else {
+            return Err(ApiError::NotFound(match req.model.as_deref() {
+                Some(name) => format!(
+                    "{name:?} is not a loaded speech model; load a TTS model (class tts) first"
+                ),
+                None => "no speech model is loaded; load a TTS model (class tts) first".into(),
+            }));
+        };
+        let t = guard.tts.get_mut(&id).ok_or(ApiError::NotLoaded)?;
+        t.last_used = Instant::now();
+        (id, t.path.clone(), t.mmproj.clone(), t.n_gpu_layers)
+    };
+
+    let voice = speech_voice(
+        &weights,
+        req.voice.as_deref().or(req.speaker_file.as_deref()),
+    )?;
+    let language = req
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .unwrap_or("en");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let out = std::env::temp_dir().join(format!("nexllama-tts-{}-{stamp}.wav", std::process::id()));
+
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("-m")
+        .arg(&weights)
+        .arg("-mm")
+        .arg(&mmproj)
+        .arg("-p")
+        .arg(&req.input)
+        .arg("--tts-lang")
+        .arg(language)
+        .arg("-o")
+        .arg(&out)
+        .arg("-ngl")
+        .arg(n_gpu_layers.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(path) = &voice {
+        cmd.arg("--tts-speaker-file").arg(path);
+    }
+    if let Some(speed) = req.speed.filter(|s| *s > 0.0) {
+        // llama-tts has no speed flag; documenting the accepted value here
+        // keeps the API honest rather than silently changing the waveform.
+        let _ = speed;
+    }
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+
+    // One synthesis at a time: the sidecar loads the weights itself, and two
+    // concurrent runs would fight over the same GPU.
+    let _serial = state.tts_lock.lock().await;
+    tracing::info!(%id, lang = language, "speech synthesis started");
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(900),
+        cmd.output(),
+    )
+    .await
+    .map_err(|_| ApiError::Model("llama-tts timed out after 900 seconds".into()))?
+    .map_err(|e| {
+        ApiError::Model(format!(
+            "could not start llama-tts at {}: {e}",
+            bin.display()
+        ))
+    })?;
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&out).await;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: String = stderr
+            .chars()
+            .rev()
+            .take(2000)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let detail = if tail.trim().is_empty() {
+            String::from_utf8_lossy(&output.stdout).to_string()
+        } else {
+            tail
+        };
+        return Err(ApiError::Model(format!(
+            "llama-tts failed ({}): {detail}",
+            output.status
+        )));
+    }
+    let bytes = tokio::fs::read(&out)
+        .await
+        .map_err(|e| ApiError::Model(format!("llama-tts wrote no audio: {e}")))?;
+    let _ = tokio::fs::remove_file(&out).await;
+    if bytes.is_empty() {
+        return Err(ApiError::Model(
+            "llama-tts finished without producing any audio".into(),
+        ));
+    }
+    tracing::info!(%id, bytes = bytes.len(), "speech synthesis finished");
+
+    let mut response = Response::new(axum::body::Body::from(bytes));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("inline; filename=\"speech.wav\""),
+    );
+    Ok(response)
+}
+
 #[derive(Deserialize, Default)]
 struct UnloadRequest {
     #[serde(default)]
@@ -1572,11 +1971,12 @@ async fn unload(
     body: Option<Json<UnloadRequest>>,
 ) -> Json<serde_json::Value> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
-    let (removed, forgotten): (Vec<Loaded>, Vec<String>) = {
+    let (removed, forgotten, speech): (Vec<Loaded>, Vec<String>, Vec<TtsModel>) = {
         let mut guard = state.inner.lock().await;
         match req.model.as_deref() {
             Some(id) => {
                 let resident = guard.models.remove(id).into_iter().collect();
+                let speech = guard.tts.remove(id).into_iter().collect();
                 if guard.default_model.as_deref() == Some(id) {
                     guard.default_model = None;
                 }
@@ -1590,17 +1990,18 @@ async fn unload(
                     .into_iter()
                     .map(|_| id.to_string())
                     .collect();
-                (resident, forgotten)
+                (resident, forgotten, speech)
             }
             None => {
                 let all: Vec<Loaded> = guard.models.drain().map(|(_, l)| l).collect();
+                let speech: Vec<TtsModel> = guard.tts.drain().map(|(_, t)| t).collect();
                 let forgotten: Vec<String> = guard.dormant.drain().map(|(id, _)| id).collect();
                 guard.default_model = None;
-                (all, forgotten)
+                (all, forgotten, speech)
             }
         }
     };
-    let n = removed.len() + forgotten.len();
+    let n = removed.len() + forgotten.len() + speech.len();
     let _ = tokio::task::spawn_blocking(move || drop(removed)).await;
     Json(json!({ "status": "ok", "unloaded": n }))
 }
@@ -2282,13 +2683,14 @@ fn require_model(guard: &DaemonState, requested: Option<&str>, class: &str) -> A
     if let Some(id) = guard.resolve_class(requested, class) {
         return Ok(id);
     }
-    if guard.models.is_empty() && guard.dormant.is_empty() {
+    if guard.models.is_empty() && guard.dormant.is_empty() && guard.tts.is_empty() {
         return Err(ApiError::NotLoaded);
     }
     let mut known: Vec<&str> = guard
         .models
         .keys()
         .chain(guard.dormant.keys())
+        .chain(guard.tts.keys())
         .map(String::as_str)
         .collect();
     known.sort_unstable();

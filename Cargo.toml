@@ -24,7 +24,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "process"] }
 
 [profile.release]
 codegen-units = 1

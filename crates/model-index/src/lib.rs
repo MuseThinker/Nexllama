@@ -192,7 +192,12 @@ pub fn bundle(name: &str, dir: &str, files: Vec<serde_json::Value>) -> serde_jso
         "class": class,
         "mtp": mtp,
         "draft_kind": pick("draft").and_then(|d| d.as_str().map(draft_kind_label)),
-        "kind": if pick("projector").is_some() {
+        "kind": if class == "tts" {
+            // A TTS bundle also has a projector, but it is an audio encoder,
+            // not a vision one: calling it "vision" would put it in the wrong
+            // group and invite a chat load.
+            "tts"
+        } else if pick("projector").is_some() {
             "vision"
         } else if pick("draft").is_some() {
             "speculative"

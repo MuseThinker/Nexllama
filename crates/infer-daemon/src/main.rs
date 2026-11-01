@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 use infer_core::{Engine, FlashAttn, LoadConfig, LoadMode};
 
-use crate::state::{AppState, Loaded, RuntimeStats};
+use crate::state::{AppState, Loaded, RuntimeStats, TtsModel};
 
 #[derive(Parser, Debug)]
 #[command(name = "infer-daemon", about = "Local llama.cpp inference daemon")]
@@ -67,6 +67,13 @@ struct Args {
     /// at a folder.
     #[arg(long = "models-dir")]
     models_dir: Option<PathBuf>,
+
+    /// `llama-tts` executable used by `/v1/audio/speech`.
+    ///
+    /// Defaults to `llama-tts.exe` beside this daemon, which is where the
+    /// packaged backends keep it.
+    #[arg(long = "tts-bin")]
+    tts_bin: Option<PathBuf>,
 
     /// Layers to offload to the GPU (999 = all).
     #[arg(long, default_value_t = 999)]
@@ -202,6 +209,25 @@ fn is_loopback(host: &str) -> bool {
     false
 }
 
+/// Where `llama-tts` lives.
+///
+/// The packaged backends put it beside `infer-daemon.exe`, so that is the first
+/// place to look. An explicit flag wins; otherwise the sibling is used even if
+/// it does not exist yet, so the error at request time can name the exact path
+/// that was expected instead of saying "not configured".
+fn resolve_tts_bin(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return Some(path);
+    }
+    let exe = std::env::current_exe().ok()?;
+    let name = if cfg!(windows) {
+        "llama-tts.exe"
+    } else {
+        "llama-tts"
+    };
+    Some(exe.parent()?.join(name))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -249,7 +275,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = AppState::new(Duration::from_secs(args.keep_alive_secs), base.clone())
-        .with_models_dir(args.models_dir.clone());
+        .with_models_dir(args.models_dir.clone())
+        .with_tts_bin(resolve_tts_bin(args.tts_bin.clone()));
 
     let mut first = true;
     for (i, model) in args.model.iter().enumerate() {
@@ -300,6 +327,34 @@ async fn main() -> anyhow::Result<()> {
         let load_mtp = cfg.load_mtp;
         // Kept so this model can be reloaded after the idle reaper frees it.
         let config = cfg.clone();
+
+        // Speech models do not go through `Engine::load`: their output is audio,
+        // and llama.cpp serves them from the `llama-tts` sidecar. Register the
+        // pairing now so `/v1/audio/speech` works from the first request.
+        if infer_core::model_class_of(Path::new(model)) == "tts" {
+            let Some(mmproj) = cfg.mmproj.clone() else {
+                tracing::error!(
+                    %id,
+                    "startup TTS model has no audio projector (--mmproj); serving without it"
+                );
+                continue;
+            };
+            let now = Instant::now();
+            let mut guard = state.inner.lock().await;
+            guard.tts.insert(
+                id.clone(),
+                TtsModel {
+                    id: id.clone(),
+                    path,
+                    mmproj,
+                    n_gpu_layers,
+                    loaded_at: now,
+                    last_used: now,
+                },
+            );
+            tracing::info!(%id, "registered startup speech model");
+            continue;
+        }
 
         // The file name reaches the log; the full path does not. A log that
         // lives on disk indefinitely does not need a record of where the user

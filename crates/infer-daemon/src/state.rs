@@ -89,6 +89,21 @@ impl Dormant {
     }
 }
 
+/// A speech-synthesis model, as registered by `llama-tts`.
+///
+/// It has no `Engine` on purpose: the chat engine cannot decode a TTS
+/// checkpoint, and the sidecar loads its weights for the duration of one
+/// request. What is kept here is the pairing (weights + audio projector) and
+/// the settings the sidecar needs, so `/v1/audio/speech` can run it.
+pub struct TtsModel {
+    pub id: String,
+    pub path: PathBuf,
+    pub mmproj: PathBuf,
+    pub n_gpu_layers: u32,
+    pub loaded_at: Instant,
+    pub last_used: Instant,
+}
+
 /// Keeps a model resident for as long as a request is running.
 ///
 /// Handed out when a request starts and released when the reply is finished,
@@ -206,6 +221,9 @@ pub fn record_stats(slot: Option<&Arc<std::sync::Mutex<RuntimeStats>>>, s: &GenS
 
 pub struct DaemonState {
     pub models: HashMap<String, Loaded>,
+    /// Speech models registered for `llama-tts`. Separate from `models`
+    /// because they have no chat engine to hold.
+    pub tts: HashMap<String, TtsModel>,
     /// Models that were loaded and then freed, remembered so a later request can
     /// load them again rather than fail. Only the config and metadata survive.
     pub dormant: HashMap<String, Dormant>,
@@ -227,7 +245,7 @@ impl DaemonState {
     }
 
     pub fn ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.models.keys().cloned().collect();
+        let mut ids: Vec<String> = self.models.keys().chain(self.tts.keys()).cloned().collect();
         ids.sort();
         ids
     }
@@ -247,6 +265,7 @@ impl DaemonState {
                 .get(id)
                 .map(|l| l.info.model_class == class)
                 .or_else(|| self.dormant.get(id).map(|d| d.info.model_class == class))
+                .or_else(|| self.tts.get(id).map(|_| class == "tts"))
                 .unwrap_or(false)
         };
         if let Some(id) = requested.filter(|m| !m.trim().is_empty()) {
@@ -254,7 +273,7 @@ impl DaemonState {
                 return Some(id.to_string());
             }
         }
-        let mut matches = self
+        let mut matches: Vec<String> = self
             .models
             .iter()
             .filter(|(_, l)| l.info.model_class == class)
@@ -264,7 +283,14 @@ impl DaemonState {
                     .iter()
                     .filter(|(_, d)| d.info.model_class == class)
                     .map(|(k, _)| k.clone()),
-            );
+            )
+            .collect();
+        // TTS models are registered separately and never go dormant: the
+        // sidecar keeps nothing resident, so there is nothing to release.
+        if class == "tts" {
+            matches.extend(self.tts.keys().cloned());
+        }
+        let mut matches = matches.into_iter();
         let first = matches.next()?;
         matches.next().is_none().then_some(first)
     }
@@ -311,6 +337,14 @@ pub struct AppState {
     /// it is optional — a daemon that was handed models by path has no folder to
     /// list and says so instead of inventing one.
     pub models_dir: Option<Arc<PathBuf>>,
+    /// The `llama-tts` executable that serves `/v1/audio/speech`.
+    ///
+    /// `None` when it was not found beside the daemon: speech then answers with
+    /// the path it looked for instead of pretending the model is the problem.
+    pub tts_bin: Option<PathBuf>,
+    /// Serialises speech runs. Each one loads the weights in the sidecar, and
+    /// two at once on one GPU is slower than the queue, not faster.
+    pub tts_lock: Arc<tokio::sync::Mutex<()>>,
     /// HuggingFace transfers started over HTTP, and their progress reports.
     pub hub: Arc<crate::hub::HubState>,
 }
@@ -332,9 +366,12 @@ impl AppState {
                 .build()
                 .unwrap_or_default(),
             models_dir: None,
+            tts_bin: None,
+            tts_lock: Arc::new(tokio::sync::Mutex::new(())),
             hub: Arc::new(crate::hub::HubState::new()),
             inner: Arc::new(Mutex::new(DaemonState {
                 models: HashMap::new(),
+                tts: HashMap::new(),
                 dormant: HashMap::new(),
                 default_model: None,
                 keep_alive,
@@ -347,6 +384,12 @@ impl AppState {
     /// models by path.
     pub fn with_models_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.models_dir = dir.map(Arc::new);
+        self
+    }
+
+    /// Point speech synthesis at a particular `llama-tts` executable.
+    pub fn with_tts_bin(mut self, bin: Option<PathBuf>) -> Self {
+        self.tts_bin = bin;
         self
     }
 

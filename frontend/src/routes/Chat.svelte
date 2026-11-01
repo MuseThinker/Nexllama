@@ -161,10 +161,10 @@ async function refreshModels() {
   refreshing = true;
   try {
     const s = await daemon.status();
-    // Only generation models belong here. Embedding and rerank models serve the
-    // HTTP API; they decode probabilities, not text.
+    // Only generation models belong here. Embedding, rerank and TTS models
+    // serve the HTTP API; none of them decodes a chat continuation.
     const chatty = (s.models ?? []).filter(
-      (m) => !['embedding', 'rerank'].includes(m.info?.model_class),
+      (m) => !['embedding', 'rerank', 'tts'].includes(m.info?.model_class),
     );
     apiOnly = (s.models ?? []).length - chatty.length;
     models = chatty;
@@ -282,6 +282,53 @@ function stop() {
   controller?.abort();
 }
 
+// Speech is a separate request to the daemon's TTS sidecar; it does not need a
+// chat model and does not touch the transcript. One player at a time, so a
+// second "朗读" stops the first rather than layering two voices.
+let speaking = $state(-1);
+let player = null;
+let speechUrl = '';
+
+function stopSpeaking() {
+  player?.pause();
+  player = null;
+  if (speechUrl) URL.revokeObjectURL(speechUrl);
+  speechUrl = '';
+  speaking = -1;
+}
+
+async function speak(text, i) {
+  if (speaking === i) {
+    stopSpeaking();
+    return;
+  }
+  stopSpeaking();
+  speaking = i;
+  error = '';
+  try {
+    const blob = await daemon.speech({
+      input: text,
+      // The sidecar needs the language spelled out; a Han character is a good
+      // enough signal for the two languages this app is used in.
+      language: /[\u3400-\u9fff]/.test(text) ? 'zh' : 'en',
+      response_format: 'wav',
+    });
+    speechUrl = URL.createObjectURL(blob);
+    player = new Audio(speechUrl);
+    player.onended = stopSpeaking;
+    player.onerror = () => {
+      stopSpeaking();
+      error = 'audio playback failed';
+    };
+    await player.play();
+  } catch (e) {
+    stopSpeaking();
+    error = String(e?.message ?? e);
+  }
+}
+
+onDestroy(stopSpeaking);
+
 function onKeydown(e) {
   // Enter confirms a candidate in Chinese and Japanese IMEs. Sending on it
   // posts a half-composed sentence, so the composing state wins.
@@ -369,6 +416,17 @@ onMount(() => {
         <div class="content"
           >{think.answer}{#if busy && i === messages.length - 1}<span class="caret"></span>{/if}</div
         >
+        {#if think.answer.trim()}
+          <div class="bubble-actions">
+            <button
+              class="ghost speak"
+              onclick={() => speak(think.answer, i)}
+              title={$t('chat.speak')}
+            >
+              {speaking === i ? $t('chat.speaking') : $t('chat.speak')}
+            </button>
+          </div>
+        {/if}
       {:else}
         <div class="content">{m.content}</div>
       {/if}

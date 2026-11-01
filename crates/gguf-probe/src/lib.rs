@@ -19,6 +19,11 @@ pub enum ModelClass {
     Embedding,
     /// Encoder models with a ranking head.
     Rerank,
+    /// Speech synthesis models (Qwen3-TTS and friends).
+    ///
+    /// These are loaded by `llama-tts`, not by the chat engine: their output is
+    /// an audio waveform, and they need an audio projector beside the weights.
+    Tts,
 }
 
 impl ModelClass {
@@ -27,6 +32,7 @@ impl ModelClass {
             ModelClass::Llm => "llm",
             ModelClass::Embedding => "embedding",
             ModelClass::Rerank => "rerank",
+            ModelClass::Tts => "tts",
         }
     }
 }
@@ -224,6 +230,13 @@ impl Probe {
         }
         if let Some(arch) = self.architecture.as_deref() {
             let arch = arch.to_ascii_lowercase();
+            // Speech synthesis has its own loader and its own input/output
+            // shape, so it must not be offered to the chat engine. llama.cpp
+            // names the Qwen3-TTS architecture `qwen3tts`; the suffix check
+            // keeps the next audio family from silently landing in chat too.
+            if arch.contains("tts") {
+                return ModelClass::Tts;
+            }
             if matches!(
                 arch.as_str(),
                 "bert" | "nomic-bert" | "jina-bert-v2" | "jina-bert-eot" | "t5encoder"

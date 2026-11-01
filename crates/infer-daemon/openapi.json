@@ -52,10 +52,10 @@
       },
       "ModelInfo": {
         "type": "object",
-        "description": "Facts resolved when the model was loaded. `model_class` is one of llm, embedding or rerank and decides which routes accept the model.",
+        "description": "Facts resolved when the model was loaded. `model_class` is one of llm, embedding, rerank or tts and decides which routes accept the model.",
         "properties": {
           "description": { "type": "string" },
-          "model_class": { "type": "string", "enum": ["llm", "embedding", "rerank"] },
+          "model_class": { "type": "string", "enum": ["llm", "embedding", "rerank", "tts"] },
           "vision": { "type": "boolean" },
           "pooling": { "type": "string" },
           "n_ctx": { "type": "integer" },
@@ -246,6 +246,19 @@
           "prompt_eval_count": { "type": "integer" },
           "eval_count": { "type": "integer" }
         }
+      },
+      "SpeechRequest": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "Names a tts-class model. Optional when only one is loaded." },
+          "input": { "type": "string", "description": "Text to speak." },
+          "voice": { "type": "string", "description": "Path to a wav or mp3 speaker reference. A bare filename is looked up beside the weights." },
+          "speaker_file": { "type": "string", "description": "Alias of voice." },
+          "language": { "type": "string", "description": "zh, en, de, it, pt, es, ja, ko, fr or ru.", "default": "en" },
+          "response_format": { "type": "string", "enum": ["wav"], "default": "wav" },
+          "speed": { "type": "number", "description": "Accepted for OpenAI compatibility; the sidecar does not resample." }
+        },
+        "required": ["input"]
       },
       "EmbeddingsRequest": {
         "type": "object",
@@ -619,6 +632,20 @@
               "application/x-ndjson": { "schema": { "$ref": "#/components/schemas/OllamaGenerateReply" } }
             }
           }
+        }
+      }
+    },
+    "/v1/audio/speech": {
+      "post": {
+        "tags": ["openai"],
+        "summary": "Speech synthesis",
+        "description": "Runs the loaded TTS model through the llama-tts sidecar and returns a wav file. The model has to be registered with POST /admin/load first; a Qwen3-TTS checkpoint needs both the weights and the audio mmproj.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SpeechRequest" }, "example": { "input": "你好，这是 Nexllama 的语音测试。", "language": "zh", "response_format": "wav" } } } },
+        "responses": {
+          "200": { "description": "wav audio", "content": { "audio/wav": { "schema": { "type": "string", "format": "binary" } } } },
+          "400": { "description": "unknown model, unsupported format or missing mmproj", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "500": { "description": "the sidecar failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },

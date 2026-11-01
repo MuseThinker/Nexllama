@@ -261,6 +261,7 @@ models/Qwen2.5-VL-7B/
 - **`/v1/embeddings`**——OpenAI 的响应格式，向量为单位长度；如果直接给出池化后的原始输出，点积就会随文本长短而变。上下文按模型类别配置，而不是靠某个开关。超过上下文的输入会报错并写明上限，绝不悄悄截断。
 - **`/v1/rerank`**——Cohere/Jina 的响应格式。输入按 `BOS query SEP document EOS` 拼好，也就是分类头训练时用的句对；NaN 分数排在最后，坏掉的头不会被评为最佳匹配。
 - **视觉**——含投影器的模型包，在 `/v1/chat/completions` 上接受 OpenAI 风格的 `image_url` 片段。只收 `data:` URL：`http(s)` URL 会把每个请求变成 SSRF 的入口，而裸路径则会指向主机上的文件。模型卸载到 GPU 后，投影器也在 GPU 上跑——一张 336×252 的图在 40 GB 卡上约 200 ms，纯 CPU 则要 50 s 左右。
+- **语音**——在模型库中加载 Qwen3-TTS 模型包（权重加音频 `mmproj`），然后调用 `POST /v1/audio/speech`，请求体如 `{"input": "...", "language": "zh"}`。守护进程会调用随每个后端分发的 `llama-tts`，端口、令牌和生命周期都保持不变，返回 `audio/wav`。可选的 `voice` 是 wav/mp3 参考音频路径。模型不随安装包分发，请自行下载 `ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF`（权重 + `mmproj`）。
 
 ### 思考开关与工具调用
 
@@ -333,6 +334,7 @@ curl http://127.0.0.1:15656/v1/chat/completions -H "Content-Type: application/js
 | POST | `/api/chat`、`/api/generate` | Ollama 对话与单次提示；流式为 NDJSON |
 | POST | `/v1/embeddings`、`/api/embed`、`/api/embeddings` | OpenAI 与 Ollama 两种形态的向量 |
 | POST | `/v1/rerank`、`/rerank`、`/v1/reranking`、`/reranking` | `{ "model": "…", "query": "…", "documents": ["…"], "top_n": 3 }` |
+| POST | `/v1/audio/speech` | `{ "input": "…", "language": "zh", "voice": "speaker.wav" }`；返回 `audio/wav` |
 
 Ollama 的 `options` 会映射到采样器：`temperature`、`top_k`、`top_p`、`min_p`、`repeat_penalty`、`repeat_last_n`、`num_predict`（生成 token 的上限；`<= 0` 表示"直到模型自己停下来"）与 `seed`。响应会带上惯用的 `prompt_eval_count` 与 `eval_count`，每条流式行都带 `created_at`。
 

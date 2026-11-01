@@ -238,6 +238,39 @@ export const daemon = {
     }),
 
   /**
+   * Synthesise speech through the daemon's sidecar.
+   *
+   * Returns a `Blob` rather than JSON: the response is a wav file. No timeout
+   * because the sidecar loads the TTS weights for each run, which takes longer
+   * than the usual request budget.
+   */
+  speech: async (body) => {
+    let res;
+    try {
+      res = await fetch(baseUrl() + '/v1/audio/speech', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      throw readableAbort(e, 0);
+    }
+    if (!res.ok) {
+      const err = httpError(res);
+      try {
+        const detail = (await res.json())?.error;
+        if (typeof detail === 'string' && detail.trim()) {
+          err.message = `${res.status}: ${detail}`;
+        }
+      } catch {
+        /* not JSON; the status line is all we have */
+      }
+      throw err;
+    }
+    return res.blob();
+  },
+
+  /**
    * Stream one completion, yielding a parsed frame per event.
    *
    * `signal` aborts the request, and the reader is released on the way out

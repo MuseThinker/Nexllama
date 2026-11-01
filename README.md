@@ -347,6 +347,12 @@ program points at. Neither is offered where the other belongs.
   every request into an SSRF primitive and a bare path would name files on the host.
   The projector runs on the GPU when the model is offloaded — roughly 200 ms against
   50 s on CPU for a 336×252 image on a 40 GB card.
+- **Speech** — load a Qwen3-TTS bundle (weights plus its audio `mmproj`) from the model
+  library, then call `POST /v1/audio/speech` with `{"input": "...", "language": "zh"}`.
+  The daemon runs the `llama-tts` sidecar that ships with each backend, so the port,
+  token and lifecycle stay the same; the response is `audio/wav`. An optional `voice`
+  is a path to a wav/mp3 reference. The model is not bundled — download
+  `ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF` (weights + `mmproj`) yourself.
 
 ### Reasoning control and tool calling
 
@@ -453,6 +459,7 @@ only the port.
 | POST | `/api/chat`, `/api/generate` | Ollama chat and single prompt; NDJSON when streaming |
 | POST | `/v1/embeddings`, `/api/embed`, `/api/embeddings` | Embeddings in OpenAI and Ollama shapes |
 | POST | `/v1/rerank`, `/rerank`, `/v1/reranking`, `/reranking` | `{ "model": "…", "query": "…", "documents": ["…"], "top_n": 3 }` |
+| POST | `/v1/audio/speech` | `{ "input": "…", "language": "zh", "voice": "speaker.wav" }`; returns `audio/wav` |
 
 Ollama's `options` object maps onto the sampler: `temperature`, `top_k`, `top_p`,
 `min_p`, `repeat_penalty`, `repeat_last_n`, `num_predict` (generated-token ceiling;

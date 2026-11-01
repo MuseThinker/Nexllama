@@ -739,6 +739,16 @@ a.link:hover {
   font-variant-numeric: tabular-nums;
 }
 
+/* "朗读" sits under the answer, quiet enough not to compete with it. */
+.bubble .bubble-actions {
+  margin-top: 6px;
+}
+
+.bubble .speak {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
 .caret {
   display: inline-block;
   width: 6px;
