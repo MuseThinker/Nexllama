@@ -18,24 +18,14 @@ llama.cpp revision as the DLLs; if the backend is bumped, rebuild them from
 `tools/tts` in the matching source tree and update this note.
 
 `llama-tts-worker.exe` is built from `llama-tts-worker.cpp` with the same
-include paths and import libraries as `llama-tts` (see `build.ninja` in the
-llama.cpp build directory). For example, from a VS x64 prompt, with
-`LLAMA_SRC` pointing at the llama.cpp source and `LLAMA_LIB` at the CMake
-install tree:
+include paths and import libraries as `llama-tts`. `scripts/build-tts-worker.ps1`
+takes the llama.cpp source, CMake install tree and CMake build tree:
 
-```text
-cl /nologo /MD /Brepro /W0 /utf-8 /O2 /DNDEBUG /std:c++17 /EHsc ^
-  /DGGML_BACKEND_SHARED /DGGML_SHARED /DGGML_USE_CPU /DLLAMA_SHARED ^
-  /DLLAMA_SUBPROCESS /D_CRT_SECURE_NO_WARNINGS ^
-  /I%LLAMA_SRC%\include /I%LLAMA_SRC%\ggml\include /I%LLAMA_SRC%\common ^
-  /I%LLAMA_SRC%\vendor /I%LLAMA_SRC%\tools\mtmd /I%LLAMA_LIB%\include ^
-  llama-tts-worker.cpp /Fe:llama-tts-worker.exe /link /SUBSYSTEM:CONSOLE ^
-  /INCREMENTAL:NO %LLAMA_LIB%\lib\llama-common.lib ^
-  %LLAMA_LIB%\lib\mtmd.lib %LLAMA_LIB%\lib\llama.lib ^
-  %LLAMA_LIB%\lib\ggml.lib %LLAMA_LIB%\lib\ggml-cpu.lib ^
-  %LLAMA_LIB%\lib\ggml-base.lib kernel32.lib user32.lib gdi32.lib ^
-  winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib ^
-  comdlg32.lib advapi32.lib
+```powershell
+scripts\build-tts-worker.ps1 `
+  -LlamaSource <llama.cpp source> `
+  -LlamaLib <cmake install tree> `
+  -LlamaBuild <cmake build tree>
 ```
 
 At runtime the daemon exposes `POST /v1/audio/speech`; the worker is an internal
