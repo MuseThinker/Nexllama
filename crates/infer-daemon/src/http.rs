@@ -473,16 +473,17 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
             "loaded": false,
         })
     }));
-    // Speech models are registered rather than resident: the sidecar loads the
-    // weights per request, so they are always "loaded" from the caller's point
-    // of view and have no chat performance figures.
-    models.extend(guard.tts.values().map(|t| {
-        json!({
+    // Speech models are registered with a resident worker: the model is
+    // loaded once and stays in memory until it is unloaded, so it has no chat
+    // performance figures.
+    for t in guard.tts.values() {
+        let worker = state.tts_worker.status().await;
+        models.push(json!({
             "id": t.id,
             "path": t.path,
             "info": { "model_class": "tts", "description": format!("{} (speech)", t.id) },
             "n_gpu_layers": t.n_gpu_layers,
-            "n_ctx": 0,
+            "n_ctx": t.config.n_ctx,
             "load_mtp": false,
             "mmproj": t.mmproj,
             "draft_model": serde_json::Value::Null,
@@ -491,8 +492,10 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
             "idle_secs": t.last_used.elapsed().as_secs(),
             "perf": serde_json::Value::Null,
             "loaded": true,
-        })
-    }));
+            "worker": worker.label(),
+            "worker_error": worker.error(),
+        }));
+    }
     // Cloud providers are callable through this same port, so list them here
     // too — with `model_class: llm` so a chat client keeps them, and `cloud`
     // set so the UI can tell them from the local ones. The `auto` alias is
@@ -1722,13 +1725,17 @@ async fn register_speech(
     });
 
     let now = Instant::now();
+    let worker_weights = weights.clone();
+    let worker_mmproj = mmproj.clone();
+    let worker_cfg = cfg.clone();
+    let worker_configured = state.tts_worker.is_configured();
     let mut guard = state.inner.lock().await;
     if let Some(secs) = req.keep_alive_secs {
         guard.keep_alive = std::time::Duration::from_secs(secs);
     }
     // One speech model at a time, the same rule the chat slot follows. A TTS
-    // checkpoint is a couple of gigabytes and the sidecar loads one per run, so
-    // keeping several registered would only make the choice ambiguous.
+    // checkpoint is a couple of gigabytes, and its resident worker holds the
+    // weights until the model is unloaded.
     let replaced: Vec<String> = guard
         .tts
         .keys()
@@ -1750,6 +1757,7 @@ async fn register_speech(
             id: id.clone(),
             path: weights,
             mmproj,
+            config: cfg,
             n_gpu_layers,
             loaded_at: now,
             last_used: now,
@@ -1758,10 +1766,28 @@ async fn register_speech(
     guard.dormant.remove(&id);
     drop(guard);
 
-    notes.push(
-        "speech is ready: POST /v1/audio/speech with {\"input\": \"...\", \"language\": \"zh\"}"
-            .into(),
-    );
+    if worker_configured {
+        match state
+            .tts_worker
+            .start(id.clone(), worker_weights, worker_mmproj, &worker_cfg)
+            .await
+        {
+            Ok(()) => notes.push(
+                "the resident speech worker is loading the model; the first speech request waits \
+                 for it to finish"
+                    .into(),
+            ),
+            Err(e) => notes.push(format!(
+                "the resident speech worker could not start ({e}); speech will use one llama-tts \
+                 process per request"
+            )),
+        }
+    } else {
+        notes.push(
+            "speech is ready: POST /v1/audio/speech with {\"input\": \"...\", \"language\": \"zh\"}"
+                .into(),
+        );
+    }
     Ok(Json(json!({
         "status": "ok",
         "id": id,
@@ -1836,14 +1862,14 @@ async fn speech(
             "speech synthesis needs llama-tts.exe, and this daemon was not told where it is".into(),
         ));
     };
-    if !bin.is_file() {
+    if !bin.is_file() && !state.tts_worker.is_configured() {
         return Err(ApiError::Model(format!(
             "llama-tts.exe was not found at {} — reinstall the backend, or pass --tts-bin",
             bin.display()
         )));
     }
 
-    let (id, weights, mmproj, n_gpu_layers) = {
+    let (id, weights, mmproj, n_gpu_layers, cfg) = {
         let mut guard = state.inner.lock().await;
         let Some(id) = guard.resolve_class(req.model.as_deref(), "tts") else {
             return Err(ApiError::NotFound(match req.model.as_deref() {
@@ -1855,7 +1881,13 @@ async fn speech(
         };
         let t = guard.tts.get_mut(&id).ok_or(ApiError::NotLoaded)?;
         t.last_used = Instant::now();
-        (id, t.path.clone(), t.mmproj.clone(), t.n_gpu_layers)
+        (
+            id,
+            t.path.clone(),
+            t.mmproj.clone(),
+            t.n_gpu_layers,
+            t.config.clone(),
+        )
     };
 
     let voice = speech_voice(
@@ -1874,74 +1906,97 @@ async fn speech(
         .unwrap_or(0);
     let out = std::env::temp_dir().join(format!("nexllama-tts-{}-{stamp}.wav", std::process::id()));
 
-    let mut cmd = tokio::process::Command::new(&bin);
-    cmd.arg("-m")
-        .arg(&weights)
-        .arg("-mm")
-        .arg(&mmproj)
-        .arg("-p")
-        .arg(&req.input)
-        .arg("--tts-lang")
-        .arg(language)
-        .arg("-o")
-        .arg(&out)
-        .arg("-ngl")
-        .arg(n_gpu_layers.to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    if let Some(path) = &voice {
-        cmd.arg("--tts-speaker-file").arg(path);
-    }
-    if let Some(speed) = req.speed.filter(|s| *s > 0.0) {
-        // llama-tts has no speed flag; documenting the accepted value here
-        // keeps the API honest rather than silently changing the waveform.
-        let _ = speed;
-    }
-    #[cfg(windows)]
-    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-
-    // One synthesis at a time: the sidecar loads the weights itself, and two
-    // concurrent runs would fight over the same GPU.
+    // One synthesis at a time. The resident worker serialises itself too, but
+    // this also covers the one-shot fallback and makes the two paths share the
+    // same GPU queue.
     let _serial = state.tts_lock.lock().await;
     tracing::info!(%id, lang = language, "speech synthesis started");
-    let output = tokio::time::timeout(std::time::Duration::from_secs(900), cmd.output())
-        .await
-        .map_err(|_| ApiError::Model("llama-tts timed out after 900 seconds".into()))?
-        .map_err(|e| {
-            ApiError::Model(format!(
-                "could not start llama-tts at {}: {e}",
-                bin.display()
-            ))
-        })?;
-    if !output.status.success() {
-        let _ = tokio::fs::remove_file(&out).await;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: String = stderr
-            .chars()
-            .rev()
-            .take(2000)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        let detail = if tail.trim().is_empty() {
-            String::from_utf8_lossy(&output.stdout).to_string()
-        } else {
-            tail
-        };
-        return Err(ApiError::Model(format!(
-            "llama-tts failed ({}): {detail}",
-            output.status
-        )));
+
+    if state.tts_worker.is_configured() {
+        // `start` is a no-op when this worker is already loading or ready for
+        // this model, and restarts it after a failure. The first request after
+        // Load therefore waits for the 70-second cold load; later ones do not.
+        state
+            .tts_worker
+            .start(id.clone(), weights.clone(), mmproj.clone(), &cfg)
+            .await
+            .map_err(ApiError::Model)?;
+        state
+            .tts_worker
+            .wait_ready(std::time::Duration::from_secs(300))
+            .await
+            .map_err(ApiError::Model)?;
+        state
+            .tts_worker
+            .speak(&req.input, language, voice.as_deref(), &out, 512)
+            .await
+            .map_err(ApiError::Model)?;
+    } else {
+        let mut cmd = tokio::process::Command::new(&bin);
+        cmd.arg("-m")
+            .arg(&weights)
+            .arg("-mm")
+            .arg(&mmproj)
+            .arg("-p")
+            .arg(&req.input)
+            .arg("--tts-lang")
+            .arg(language)
+            .arg("-o")
+            .arg(&out)
+            .arg("-ngl")
+            .arg(n_gpu_layers.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(path) = &voice {
+            cmd.arg("--tts-speaker-file").arg(path);
+        }
+        if let Some(speed) = req.speed.filter(|s| *s > 0.0) {
+            // llama-tts has no speed flag; documenting the accepted value here
+            // keeps the API honest rather than silently changing the waveform.
+            let _ = speed;
+        }
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(900), cmd.output())
+            .await
+            .map_err(|_| ApiError::Model("llama-tts timed out after 900 seconds".into()))?
+            .map_err(|e| {
+                ApiError::Model(format!(
+                    "could not start llama-tts at {}: {e}",
+                    bin.display()
+                ))
+            })?;
+        if !output.status.success() {
+            let _ = tokio::fs::remove_file(&out).await;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let tail: String = stderr
+                .chars()
+                .rev()
+                .take(2000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            let detail = if tail.trim().is_empty() {
+                String::from_utf8_lossy(&output.stdout).to_string()
+            } else {
+                tail
+            };
+            return Err(ApiError::Model(format!(
+                "llama-tts failed ({}): {detail}",
+                output.status
+            )));
+        }
     }
     let bytes = tokio::fs::read(&out)
         .await
-        .map_err(|e| ApiError::Model(format!("llama-tts wrote no audio: {e}")))?;
+        .map_err(|e| ApiError::Model(format!("speech produced no audio: {e}")))?;
     let _ = tokio::fs::remove_file(&out).await;
     if bytes.is_empty() {
         return Err(ApiError::Model(
-            "llama-tts finished without producing any audio".into(),
+            "speech finished without producing any audio".into(),
         ));
     }
     tracing::info!(%id, bytes = bytes.len(), "speech synthesis finished");
@@ -1999,6 +2054,10 @@ async fn unload(
         }
     };
     let n = removed.len() + forgotten.len() + speech.len();
+    // The worker owns the TTS weights; killing it is what frees that VRAM.
+    if !speech.is_empty() {
+        state.tts_worker.stop().await;
+    }
     let _ = tokio::task::spawn_blocking(move || drop(removed)).await;
     Json(json!({ "status": "ok", "unloaded": n }))
 }

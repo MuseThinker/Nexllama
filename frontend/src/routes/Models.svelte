@@ -1222,6 +1222,9 @@ async function saveCloud(silent) {
               {#if m.mmproj}<span class="badge" title={m.mmproj}>mmproj</span>{/if}
               {#if m.info?.model_class === 'tts'}
                 <span class="badge api">TTS</span>
+                {#if m.worker && m.worker !== 'ready'}
+                  <span class="badge" title={m.worker_error ?? ''}>{m.worker}</span>
+                {/if}
               {:else if m.info?.model_class === 'embedding' || m.info?.model_class === 'rerank'}
                 <span class="badge api">API · {m.info.model_class}</span>
               {/if}

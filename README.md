@@ -349,7 +349,8 @@ program points at. Neither is offered where the other belongs.
   50 s on CPU for a 336×252 image on a 40 GB card.
 - **Speech** — load a Qwen3-TTS bundle (weights plus its audio `mmproj`) from the model
   library, then call `POST /v1/audio/speech` with `{"input": "...", "language": "zh"}`.
-  The daemon runs the `llama-tts` sidecar that ships with each backend, so the port,
+  A resident `llama-tts-worker` loads the model once and stays loaded until the TTS
+  model is unloaded, so later requests do not pay the load time again. The port,
   token and lifecycle stay the same; the response is `audio/wav`. An optional `voice`
   is a path to a wav/mp3 reference. The model is not bundled — download
   `ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF` (weights + `mmproj`) yourself.

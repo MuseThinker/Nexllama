@@ -99,6 +99,9 @@ pub struct TtsModel {
     pub id: String,
     pub path: PathBuf,
     pub mmproj: PathBuf,
+    /// How the model was loaded, so the resident worker can be restarted after
+    /// an unload without asking the user to load it again.
+    pub config: LoadConfig,
     pub n_gpu_layers: u32,
     pub loaded_at: Instant,
     pub last_used: Instant,
@@ -342,6 +345,9 @@ pub struct AppState {
     /// `None` when it was not found beside the daemon: speech then answers with
     /// the path it looked for instead of pretending the model is the problem.
     pub tts_bin: Option<PathBuf>,
+    /// The resident speech worker. Unlike `tts_bin`, this process loads the
+    /// model once and keeps it until the TTS model is unloaded.
+    pub tts_worker: Arc<crate::tts::TtsWorker>,
     /// Serialises speech runs. Each one loads the weights in the sidecar, and
     /// two at once on one GPU is slower than the queue, not faster.
     pub tts_lock: Arc<tokio::sync::Mutex<()>>,
@@ -367,6 +373,7 @@ impl AppState {
                 .unwrap_or_default(),
             models_dir: None,
             tts_bin: None,
+            tts_worker: Arc::new(crate::tts::TtsWorker::new(None)),
             tts_lock: Arc::new(tokio::sync::Mutex::new(())),
             hub: Arc::new(crate::hub::HubState::new()),
             inner: Arc::new(Mutex::new(DaemonState {
@@ -390,6 +397,12 @@ impl AppState {
     /// Point speech synthesis at a particular `llama-tts` executable.
     pub fn with_tts_bin(mut self, bin: Option<PathBuf>) -> Self {
         self.tts_bin = bin;
+        self
+    }
+
+    /// Point the resident speech worker at a particular executable.
+    pub fn with_tts_worker_bin(mut self, bin: Option<PathBuf>) -> Self {
+        self.tts_worker = Arc::new(crate::tts::TtsWorker::new(bin));
         self
     }
 

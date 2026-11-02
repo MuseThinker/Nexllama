@@ -68,6 +68,12 @@ if (Test-Path -LiteralPath $tts) {
 } else {
     Write-Warning "llama-tts.exe not found at $tts; speech synthesis will be unavailable"
 }
+$ttsWorker = Join-Path $root "crates\app\tts\llama-tts-worker.exe"
+if (Test-Path -LiteralPath $ttsWorker) {
+    Copy-Item -LiteralPath $ttsWorker -Destination (Join-Path $dstDir "llama-tts-worker.exe") -Force
+} else {
+    Write-Warning "llama-tts-worker.exe not found at $ttsWorker; speech will reload the model per request"
+}
 
 # The CUDA runtime is not part of the display driver — it ships with the CUDA
 # Toolkit. A machine with only the NVIDIA driver installed has no `cudart64_*` or

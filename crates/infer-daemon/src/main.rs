@@ -3,6 +3,7 @@ mod http;
 mod hub;
 mod lifecycle;
 mod state;
+mod tts;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -74,6 +75,13 @@ struct Args {
     /// packaged backends keep it.
     #[arg(long = "tts-bin")]
     tts_bin: Option<PathBuf>,
+
+    /// Resident speech worker used by `/v1/audio/speech`.
+    ///
+    /// Defaults to `llama-tts-worker.exe` beside this daemon. When it is
+    /// missing, speech falls back to one `llama-tts` process per request.
+    #[arg(long = "tts-worker-bin")]
+    tts_worker_bin: Option<PathBuf>,
 
     /// Layers to offload to the GPU (999 = all).
     #[arg(long, default_value_t = 999)]
@@ -228,6 +236,24 @@ fn resolve_tts_bin(explicit: Option<PathBuf>) -> Option<PathBuf> {
     Some(exe.parent()?.join(name))
 }
 
+/// Where the resident speech worker lives.
+///
+/// Same rule as [`resolve_tts_bin`]: an explicit flag wins, otherwise the
+/// sibling next to the daemon. The worker is optional; without it speech falls
+/// back to the one-shot `llama-tts` path.
+fn resolve_tts_worker_bin(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return Some(path);
+    }
+    let exe = std::env::current_exe().ok()?;
+    let name = if cfg!(windows) {
+        "llama-tts-worker.exe"
+    } else {
+        "llama-tts-worker"
+    };
+    Some(exe.parent()?.join(name))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -276,7 +302,8 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(Duration::from_secs(args.keep_alive_secs), base.clone())
         .with_models_dir(args.models_dir.clone())
-        .with_tts_bin(resolve_tts_bin(args.tts_bin.clone()));
+        .with_tts_bin(resolve_tts_bin(args.tts_bin.clone()))
+        .with_tts_worker_bin(resolve_tts_worker_bin(args.tts_worker_bin.clone()));
 
     let mut first = true;
     for (i, model) in args.model.iter().enumerate() {
@@ -340,6 +367,9 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             };
             let now = Instant::now();
+            let worker_weights = path.clone();
+            let worker_mmproj = mmproj.clone();
+            let worker_cfg = config.clone();
             let mut guard = state.inner.lock().await;
             guard.tts.insert(
                 id.clone(),
@@ -347,11 +377,22 @@ async fn main() -> anyhow::Result<()> {
                     id: id.clone(),
                     path,
                     mmproj,
+                    config,
                     n_gpu_layers,
                     loaded_at: now,
                     last_used: now,
                 },
             );
+            drop(guard);
+            // Start loading in the background; the first speech request waits
+            // for the READY handshake.
+            if let Err(e) = state
+                .tts_worker
+                .start(id.clone(), worker_weights, worker_mmproj, &worker_cfg)
+                .await
+            {
+                tracing::warn!(%id, error = %e, "startup speech worker failed to start");
+            }
             tracing::info!(%id, "registered startup speech model");
             continue;
         }

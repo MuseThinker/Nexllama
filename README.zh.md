@@ -261,7 +261,7 @@ models/Qwen2.5-VL-7B/
 - **`/v1/embeddings`**——OpenAI 的响应格式，向量为单位长度；如果直接给出池化后的原始输出，点积就会随文本长短而变。上下文按模型类别配置，而不是靠某个开关。超过上下文的输入会报错并写明上限，绝不悄悄截断。
 - **`/v1/rerank`**——Cohere/Jina 的响应格式。输入按 `BOS query SEP document EOS` 拼好，也就是分类头训练时用的句对；NaN 分数排在最后，坏掉的头不会被评为最佳匹配。
 - **视觉**——含投影器的模型包，在 `/v1/chat/completions` 上接受 OpenAI 风格的 `image_url` 片段。只收 `data:` URL：`http(s)` URL 会把每个请求变成 SSRF 的入口，而裸路径则会指向主机上的文件。模型卸载到 GPU 后，投影器也在 GPU 上跑——一张 336×252 的图在 40 GB 卡上约 200 ms，纯 CPU 则要 50 s 左右。
-- **语音**——在模型库中加载 Qwen3-TTS 模型包（权重加音频 `mmproj`），然后调用 `POST /v1/audio/speech`，请求体如 `{"input": "...", "language": "zh"}`。守护进程会调用随每个后端分发的 `llama-tts`，端口、令牌和生命周期都保持不变，返回 `audio/wav`。可选的 `voice` 是 wav/mp3 参考音频路径。模型不随安装包分发，请自行下载 `ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF`（权重 + `mmproj`）。
+- **语音**——在模型库中加载 Qwen3-TTS 模型包（权重加音频 `mmproj`），然后调用 `POST /v1/audio/speech`，请求体如 `{"input": "...", "language": "zh"}`。常驻的 `llama-tts-worker` 只在加载时读取一次模型，之后一直保留到卸载 TTS 模型，因此后续请求不再重复付出加载时间。端口、令牌和生命周期都保持不变，返回 `audio/wav`。可选的 `voice` 是 wav/mp3 参考音频路径。模型不随安装包分发，请自行下载 `ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF`（权重 + `mmproj`）。
 
 ### 思考开关与工具调用
 
