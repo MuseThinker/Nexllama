@@ -12,7 +12,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 license = "MIT"
 authors = ["Nexllama contributors"]
@@ -36,3 +36,6 @@ lto = "thin"
 # copy whose syn requirement is narrowed to 2.x so the two can coexist.
 [patch.crates-io]
 bindgen = { path = "vendor/bindgen" }
+# Added `with_tensor_buft_overrides` so the MoE fallback can route the first N
+# layers' expert tensors to the CPU (`-ncmoe` in llama.cpp).
+llama-cpp-4 = { path = "vendor/llama-cpp-4" }

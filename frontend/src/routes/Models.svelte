@@ -1220,6 +1220,11 @@ async function saveCloud(silent) {
                 <span class="badge">MTP</span>
               {/if}
               {#if m.mmproj}<span class="badge" title={m.mmproj}>mmproj</span>{/if}
+              {#if m.n_cpu_moe > 0}
+                <span class="badge" title={$t('models.cpuExperts', { n: m.n_cpu_moe })}>
+                  CPU {m.n_cpu_moe}L
+                </span>
+              {/if}
               {#if m.info?.model_class === 'tts'}
                 <span class="badge api">TTS</span>
                 {#if m.worker && m.worker !== 'ready'}

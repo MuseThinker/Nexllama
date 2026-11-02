@@ -24,6 +24,26 @@ use crate::promptcache::PromptCache;
 use crate::sampler::SamplerParams;
 use crate::types::{ChatMsg, GenStats};
 
+/// The tensor-name patterns that route MoE experts to the CPU.
+///
+/// `n` is the number of leading layers. llama.cpp's `--n-cpu-moe` builds the
+/// same `blk.<i>.ffn_*_exps` regexes; `999` means every layer, which is the
+/// shorter pattern without the block prefix.
+fn cpu_expert_patterns(n: u32) -> Vec<String> {
+    const ALL: &str = r"\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+    if n == 0 {
+        return Vec::new();
+    }
+    // The override array is NULL-terminated and capped by llama.cpp.
+    let max = unsafe { llama_cpp_sys_4::llama_max_tensor_buft_overrides() };
+    if n >= 999 || n as usize >= max.saturating_sub(1) {
+        return vec![ALL.to_string()];
+    }
+    (0..n)
+        .map(|i| format!(r"blk\.{i}\.ffn_(up|down|gate|gate_up)_(ch|)exps"))
+        .collect()
+}
+
 /// How model weights are read from disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +98,20 @@ pub struct LoadConfig {
     pub model_path: PathBuf,
     /// Layers offloaded to GPU. 999 (or more) means "all layers".
     pub n_gpu_layers: u32,
+    /// Keep the routed-expert tensors of the first N layers in host memory.
+    ///
+    /// This is llama.cpp's `-ncmoe` / `--n-cpu-moe`. It is a MoE-only setting:
+    /// dense models have no `ffn_*_exps` tensors, so it does nothing there.
+    /// `0` keeps every expert on the GPU.
+    #[serde(default)]
+    pub n_cpu_moe: u32,
+    /// GPU cache in MiB for host-resident MoE experts (`--moe-cache-mib`).
+    ///
+    /// Only meaningful with `n_cpu_moe > 0`: llama.cpp caches the hottest
+    /// experts of the CPU-resident layers and uploads a missing one on demand.
+    /// `0` disables the cache.
+    #[serde(default)]
+    pub moe_cache_mib: u32,
     /// GPU used for the first layers.
     pub main_gpu: i32,
     /// Context size. 0 = the model's training context.
@@ -197,6 +231,8 @@ impl LoadConfig {
         Self {
             model_path: model_path.into(),
             n_gpu_layers: 999,
+            n_cpu_moe: 0,
+            moe_cache_mib: 0,
             main_gpu: 0,
             n_ctx: 4096,
             n_batch: 2048,
@@ -981,6 +1017,16 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
         .with_load_mode(cfg.load_mode.into())
         .with_use_mlock(cfg.use_mlock)
         .with_load_mtp(cfg.load_mtp || cfg.mtp_n_max > 0);
+    // `-ncmoe`: keep the routed experts of the first N layers in host memory.
+    // Dense models have no `ffn_*_exps` tensors, so the override matches
+    // nothing and the flag is harmless.
+    let model_params = if cfg.n_cpu_moe > 0 {
+        let patterns = cpu_expert_patterns(cfg.n_cpu_moe);
+        let buft = unsafe { llama_cpp_sys_4::ggml_backend_cpu_buffer_type() };
+        model_params.with_tensor_buft_overrides(&patterns, buft)
+    } else {
+        model_params
+    };
     let model = match LlamaModel::load_from_file(backend, &cfg.model_path, &model_params) {
         Ok(m) => m,
         Err(e) => {
@@ -1046,6 +1092,9 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
             .with_flash_attn_type(flash)
             .with_offload_kqv(cfg.offload_kqv)
             .with_n_rs_seq(rs_seq);
+        if cfg.moe_cache_mib > 0 && cfg.n_cpu_moe > 0 {
+            ctx_params = ctx_params.with_moe_cache_size(cfg.moe_cache_mib as usize * 1024 * 1024);
+        }
         if class != gguf_probe::ModelClass::Llm {
             ctx_params = ctx_params.with_embeddings(true);
             // An encoder is fed a whole sequence at once, and llama.cpp

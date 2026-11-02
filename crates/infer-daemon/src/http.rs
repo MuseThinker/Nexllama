@@ -46,6 +46,10 @@ mod limits {
     pub const N_UBATCH: u32 = 1 << 16;
     /// Most layers that can be offloaded.
     pub const N_GPU_LAYERS: u32 = 4096;
+    /// Most layers whose experts may be kept on the CPU.
+    pub const N_CPU_MOE: u32 = 4096;
+    /// Largest GPU expert cache a load may ask for, in MiB.
+    pub const MOE_CACHE_MIB: u32 = 1 << 20;
     /// Most threads that can be requested.
     pub const THREADS: i32 = 1024;
     /// Largest request body accepted.
@@ -443,6 +447,8 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
                 "info": l.info,
                 "n_gpu_layers": l.n_gpu_layers,
                 "n_ctx": l.n_ctx,
+                "n_cpu_moe": l.config.n_cpu_moe,
+                "moe_cache_mib": l.config.moe_cache_mib,
                 "load_mtp": l.load_mtp,
                 "mmproj": l.mmproj,
                 "draft_model": l.draft_model,
@@ -463,6 +469,8 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
             "info": d.info,
             "n_gpu_layers": d.n_gpu_layers,
             "n_ctx": d.n_ctx,
+            "n_cpu_moe": d.config.n_cpu_moe,
+            "moe_cache_mib": d.config.moe_cache_mib,
             "load_mtp": d.load_mtp,
             "mmproj": d.mmproj,
             "draft_model": d.draft_model,
@@ -1121,6 +1129,15 @@ struct LoadRequest {
     prefix_cache_max_mb: Option<u32>,
     #[serde(default)]
     n_gpu_layers: Option<u32>,
+    /// Keep the routed experts of the first N layers in host memory.
+    ///
+    /// `None` lets the daemon choose: all experts stay on the GPU when the
+    /// model fits, and the first 8 layers fall back to the CPU when it does not.
+    #[serde(default)]
+    n_cpu_moe: Option<u32>,
+    /// GPU cache for host-resident experts, in MiB. 0 disables it.
+    #[serde(default)]
+    moe_cache_mib: Option<u32>,
     #[serde(default)]
     main_gpu: Option<i32>,
     #[serde(default)]
@@ -1262,6 +1279,26 @@ async fn load(
         }
         cfg.n_gpu_layers = v;
     }
+    if let Some(v) = req.n_cpu_moe {
+        if v > limits::N_CPU_MOE {
+            return Err(ApiError::BadRequest(format!(
+                "n_cpu_moe must be <= {}, got {v}",
+                limits::N_CPU_MOE
+            )));
+        }
+        cfg.n_cpu_moe = v;
+    }
+    if let Some(v) = req.moe_cache_mib {
+        if v > limits::MOE_CACHE_MIB {
+            return Err(ApiError::BadRequest(format!(
+                "moe_cache_mib must be <= {}, got {v}",
+                limits::MOE_CACHE_MIB
+            )));
+        }
+        cfg.moe_cache_mib = v;
+    }
+    // Expert placement is a MoE-only knob. A dense checkpoint has no
+    // `ffn_*_exps` tensors, so accepting the request would only mislabel it.
     if let Some(v) = req.main_gpu {
         if !(0..=64).contains(&v) {
             return Err(ApiError::BadRequest(format!(
@@ -1281,6 +1318,13 @@ async fn load(
     // decoder: handing it to the chat engine is what produced the bare 500 the
     // library used to show for Qwen3-TTS.
     let inbound_class = infer_core::model_class_of(Path::new(&req.model));
+    let is_moe = inbound_class == "llm" && infer_core::is_moe(Path::new(&req.model));
+    // Expert placement is a MoE-only knob. A dense checkpoint has no
+    // `ffn_*_exps` tensors, so accepting the request would only mislabel it.
+    if !is_moe {
+        cfg.n_cpu_moe = 0;
+        cfg.moe_cache_mib = 0;
+    }
     if let Some(v) = req.n_ctx {
         cfg.n_ctx = v;
     }
@@ -1489,6 +1533,67 @@ async fn load(
         ));
     }
     let n_ctx = cfg.n_ctx;
+
+    // MoE fallback: keep every expert on the GPU when the model fits, and move
+    // the first 8 layers' experts to the CPU when it does not. Dense models
+    // have no expert tensors, so this is skipped for them.
+    if req.n_cpu_moe.is_none()
+        && cfg.n_cpu_moe == 0
+        && cfg.n_gpu_layers > 0
+        && inbound_class == "llm"
+        && is_moe
+    {
+        let weights_mb = std::fs::metadata(&req.model)
+            .map(|m| m.len() / (1024 * 1024))
+            .unwrap_or(0);
+        let kv_mb = infer_core::kv_bytes_per_token(Path::new(&req.model))
+            .unwrap_or(0)
+            .saturating_mul(u64::from(n_ctx))
+            / (1024 * 1024);
+        // Weights + KV + a rough compute-buffer allowance. A little slack is
+        // intentional: the fallback is for a model that would otherwise fail
+        // mid-load, not for one that fits with a few hundred MiB to spare.
+        let need_mb = weights_mb + kv_mb + 768;
+        if let Ok(hardware) = infer_core::hwprofile::probe() {
+            if let Some(gpu) = hardware.best_gpu() {
+                // The 8-layer fallback covers a model that *just* misses. It
+                // cannot make a 94 GB model fit on a 24 GB card plus the free
+                // RAM: refusing here is better than thrashing the SSD and
+                // failing midway through the load.
+                let free_total_mb = gpu.vram_free_mb + hardware.ram_free_mb;
+                if free_total_mb + 1024 < weights_mb {
+                    return Err(ApiError::BadRequest(format!(
+                        "model is {weights_mb} MiB, but only {free_total_mb} MiB of VRAM and RAM \
+                         is free; the 8-layer expert fallback cannot cover that. Use a smaller \
+                         quantisation, free memory, or load it with a Strata-style SSD expert \
+                         cache instead."
+                    )));
+                }
+                if gpu.vram_free_mb > 0 && gpu.vram_free_mb + 256 < need_mb {
+                    cfg.n_cpu_moe = 8;
+                    notes.push(format!(
+                        "video memory is short ({} MiB free, about {} MiB needed): the first 8 \
+                         layers' experts are kept on the CPU so the load does not run out of memory",
+                        gpu.vram_free_mb, need_mb
+                    ));
+                }
+            }
+        }
+    }
+
+    // CPU experts are the point of the fallback, and llama.cpp's default of
+    // four threads leaves most of the host idle. Only fill in an unspecified
+    // count; an explicit `threads` from the user still wins.
+    if cfg.n_cpu_moe > 0 && cfg.n_threads.is_none() {
+        if let Ok(hardware) = infer_core::hwprofile::probe() {
+            let threads = i32::try_from(hardware.cpu_cores.max(1)).unwrap_or(i32::MAX);
+            cfg.n_threads = Some(threads);
+            if cfg.n_threads_batch.is_none() {
+                cfg.n_threads_batch = Some(threads);
+            }
+            notes.push(format!("the CPU expert fallback uses {threads} threads"));
+        }
+    }
 
     // Drop any existing model with the same id before loading the new one.
     let old = {

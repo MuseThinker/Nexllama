@@ -166,6 +166,14 @@ pub struct Probe {
     pub key_length: Option<u64>,
     /// `<arch>.embedding_length`, the model's width.
     pub embedding_length: Option<u64>,
+    /// `<arch>.full_attention_interval`, for hybrid attention models.
+    ///
+    /// Qwen3.6 keeps full attention only every N layers; the rest are linear
+    /// attention and hold recurrent state instead of a growing KV cache. A KV
+    /// estimate that counts every layer would be far too large.
+    pub full_attention_interval: Option<u64>,
+    /// `<arch>.expert_count`, present on mixture-of-experts models.
+    pub expert_count: Option<u64>,
 }
 
 impl Probe {
@@ -183,7 +191,17 @@ impl Probe {
     /// model whose keys this reader does not know — and the caller falls back to
     /// its own estimate rather than treating the answer as zero.
     pub fn kv_bytes_per_token(&self) -> Option<u64> {
-        let layers = self.block_count.filter(|n| *n > 0)?;
+        let block_count = self.block_count.filter(|n| *n > 0)?;
+        // Hybrid models keep a KV cache only on their full-attention layers.
+        // `full_attention_interval = 4` means one full-attention layer every
+        // four blocks; a missing key means every block is full attention.
+        let interval = self.full_attention_interval.unwrap_or(1).max(1);
+        let layers = if interval > 1 {
+            block_count / interval + self.nextn_layers.unwrap_or(0)
+        } else {
+            block_count
+        }
+        .max(1);
         let kv_heads = self.head_count_kv.or(self.head_count).filter(|n| *n > 0)?;
         let head_dim = match self.key_length.filter(|n| *n > 0) {
             Some(n) => n,
@@ -208,6 +226,14 @@ impl Probe {
     /// so without this the head sits in the file unused.
     pub fn has_mtp(&self) -> bool {
         self.nextn_layers.unwrap_or(0) > 0 || self.nextn_tensors
+    }
+
+    /// Whether this is a mixture-of-experts model.
+    ///
+    /// The expert count is in the header; a dense FFN has no such key. Used to
+    /// decide whether moving expert tensors to the CPU is meaningful at all.
+    pub fn is_moe(&self) -> bool {
+        self.expert_count.unwrap_or(0) > 0
     }
     /// Pick the family, with the rules written down:
     ///
@@ -338,6 +364,8 @@ fn read_header<R: BufRead + Seek>(mut reader: R) -> Result<Probe, ProbeError> {
         head_count_kv: None,
         key_length: None,
         embedding_length: None,
+        full_attention_interval: None,
+        expert_count: None,
     };
 
     for _ in 0..kv_count {
@@ -407,6 +435,18 @@ fn read_header<R: BufRead + Seek>(mut reader: R) -> Result<Probe, ProbeError> {
             }
             (key, GgufType::U64) if key.ends_with(".embedding_length") => {
                 found.embedding_length = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));
+            }
+            (key, GgufType::U32) if key.ends_with(".expert_count") => {
+                found.expert_count = Some(u64::from(read_u32(&mut reader)?));
+            }
+            (key, GgufType::U64) if key.ends_with(".expert_count") => {
+                found.expert_count = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));
+            }
+            (key, GgufType::U32) if key.ends_with(".full_attention_interval") => {
+                found.full_attention_interval = Some(u64::from(read_u32(&mut reader)?));
+            }
+            (key, GgufType::U64) if key.ends_with(".full_attention_interval") => {
+                found.full_attention_interval = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));
             }
             (_, value_type) => skip_value(&mut reader, value_type)?,
         }

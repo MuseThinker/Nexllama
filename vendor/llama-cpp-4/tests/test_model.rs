@@ -1,0 +1,993 @@
+//! Tests for model, vocab, and context APIs.
+//!
+//! These tests require a GGUF model. Set `LLAMA_TEST_MODEL` to the path of a GGUF model file,
+//! or run [`scripts/fetch-test-model.sh`](../../scripts/fetch-test-model.sh) for the default tiny
+//! checkpoint. If neither is available, a vocab-only GGUF from the build directory is used.
+
+// llama.cpp indexes batch positions with `i32` while Rust collections use
+// `usize`; the checkpoints under test are tiny, so these casts cannot overflow.
+#![allow(clippy::cast_sign_loss)]
+
+mod support;
+
+use llama_cpp_4::llama_backend::LlamaBackend;
+use llama_cpp_4::model::{AddBos, LlamaModel, Special};
+use llama_cpp_4::token::LlamaToken;
+use llama_cpp_4::TokenToStringError;
+
+use support::model::{backend, load_model};
+
+fn load_test_model() -> Option<(&'static LlamaBackend, LlamaModel, bool)> {
+    let (model, vocab_only) = load_model()?;
+    Some((backend(), model, vocab_only))
+}
+
+// ============================================================
+// Model property tests
+// ============================================================
+
+#[test]
+fn test_model_desc() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let desc = model.desc(256).unwrap();
+    assert!(!desc.is_empty());
+}
+
+#[test]
+fn test_model_display() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let display = format!("{model}");
+    assert!(!display.is_empty());
+    // Should contain pipe separators
+    assert!(
+        display.contains('|'),
+        "Display should have sections: {display}"
+    );
+}
+
+#[test]
+fn test_model_numeric_properties() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    assert!(model.n_ctx_train() > 0);
+    assert!(model.n_embd() > 0);
+    assert!(model.n_layer() > 0);
+    assert!(model.n_layer_nextn() >= 0);
+    assert!(model.n_head() > 0);
+    assert!(model.n_head_kv() > 0);
+    assert!(model.n_vocab() > 0);
+    assert!(model.n_embd_inp() > 0);
+    assert!(model.n_embd_out() > 0);
+}
+
+#[test]
+fn test_model_boolean_properties() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    // These should not panic
+    let _ = model.has_encoder();
+    let _ = model.has_decoder();
+    let _ = model.is_recurrent();
+    let _ = model.is_hybrid();
+    let _ = model.is_diffusion();
+    let _ = model.n_expert();
+    let _ = model.n_devices();
+    let _ = model.target_layer_ids();
+    let _ = model.add_bos_token();
+    let _ = model.add_eos_token();
+}
+
+#[test]
+fn test_model_rope_properties() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let _ = model.rope_type();
+    let freq_scale = model.rope_freq_scale_train();
+    assert!(freq_scale > 0.0);
+}
+
+// ============================================================
+// Token tests
+// ============================================================
+
+#[test]
+fn test_special_tokens() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    // BOS and EOS should be valid tokens (>= 0)
+    assert!(model.token_bos().0 >= 0);
+    assert!(model.token_eos().0 >= 0);
+    assert!(model.token_nl().0 >= 0);
+
+    // These may return -1 if not supported, that's ok
+    let _ = model.token_cls();
+    let _ = model.token_eot();
+    let _ = model.token_pad();
+    let _ = model.token_sep();
+}
+
+#[test]
+fn test_fim_tokens() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    // FIM tokens may or may not be supported
+    let _ = model.token_fim_pre();
+    let _ = model.token_fim_suf();
+    let _ = model.token_fim_mid();
+    let _ = model.token_fim_pad();
+    let _ = model.token_fim_rep();
+    let _ = model.token_fim_sep();
+}
+
+#[test]
+fn test_token_info() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let bos = model.token_bos();
+    let _ = model.token_is_control(bos);
+    let _ = model.is_eog_token(bos);
+    let _ = model.token_get_score(bos);
+    let text = model.token_get_text(bos);
+    assert!(text.is_ok(), "BOS token should have text");
+}
+
+#[test]
+fn test_token_attr() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let bos = model.token_bos();
+    let _ = model.token_attr(bos);
+}
+
+#[test]
+fn test_raw_token_bytes_preserve_filtered_special_piece() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let Some((token, raw)) = find_token_filtered_by_wrapper_with_raw_piece(&model) else {
+        panic!("expected at least one filtered token with a raw llama.cpp piece");
+    };
+
+    let filtered = model
+        .token_to_bytes(token, Special::Tokenize)
+        .expect("filtered token conversion should not error");
+    assert!(
+        filtered.is_empty(),
+        "selected token should be filtered by token_to_bytes"
+    );
+    assert!(
+        raw.len() > 1,
+        "selected token should exercise insufficient-buffer behavior"
+    );
+
+    let too_small =
+        model.token_to_raw_bytes_with_size(token, raw.len() - 1, Special::Tokenize, None);
+    assert!(
+        matches!(
+            too_small,
+            Err(TokenToStringError::InsufficientBufferSpace(size))
+                if size < 0 && usize::try_from(-size).ok() == Some(raw.len())
+        ),
+        "raw helper should surface llama.cpp's required buffer size"
+    );
+    let exact = model
+        .token_to_raw_bytes_with_size(token, raw.len(), Special::Tokenize, None)
+        .expect("exact raw token buffer should be sufficient");
+    assert_eq!(exact, raw);
+}
+
+fn find_token_filtered_by_wrapper_with_raw_piece(
+    model: &LlamaModel,
+) -> Option<(LlamaToken, Vec<u8>)> {
+    for id in 0..model.n_vocab() {
+        let token = LlamaToken::new(id);
+        let Ok(filtered) = model.token_to_bytes(token, Special::Tokenize) else {
+            continue;
+        };
+        if !filtered.is_empty() {
+            continue;
+        }
+        let raw = raw_token_bytes(model, token)?;
+        if raw.len() > 1 {
+            return Some((token, raw));
+        }
+    }
+    None
+}
+
+fn raw_token_bytes(model: &LlamaModel, token: LlamaToken) -> Option<Vec<u8>> {
+    match model.token_to_raw_bytes(token, Special::Tokenize) {
+        Ok(bytes) => Some(bytes),
+        Err(TokenToStringError::InsufficientBufferSpace(size)) if size < 0 => model
+            .token_to_raw_bytes_with_size(
+                token,
+                usize::try_from(-size).ok()?,
+                Special::Tokenize,
+                None,
+            )
+            .ok(),
+        Err(_) => None,
+    }
+}
+
+#[test]
+fn test_token_to_raw_bytes_autosizes_over_whole_vocab() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    // The convenience helper must never surface InsufficientBufferSpace: it
+    // grows the buffer to whatever llama.cpp requires. Cross-check every token
+    // against an explicitly oversized buffer.
+    for id in 0..model.n_vocab() {
+        let token = LlamaToken::new(id);
+        let auto = model.token_to_raw_bytes(token, Special::Tokenize);
+        assert!(
+            !matches!(auto, Err(TokenToStringError::InsufficientBufferSpace(_))),
+            "token {id} should have auto-sized instead of reporting insufficient buffer"
+        );
+        if let Ok(auto) = auto {
+            let explicit = model
+                .token_to_raw_bytes_with_size(token, 4096, Special::Tokenize, None)
+                .expect("oversized buffer should always succeed");
+            assert_eq!(
+                auto, explicit,
+                "auto-sized bytes must match explicit buffer"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_tokens_to_raw_bytes_matches_per_token_concatenation() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let tokens = model
+        .str_to_token("The quick brown fox", AddBos::Never)
+        .expect("tokenizing ascii should succeed");
+
+    let batch = model
+        .tokens_to_raw_bytes(&tokens, Special::Plaintext)
+        .expect("batch raw conversion should succeed");
+
+    let mut expected = Vec::new();
+    for &token in &tokens {
+        expected.extend_from_slice(
+            &model
+                .token_to_raw_bytes(token, Special::Plaintext)
+                .expect("per-token raw conversion should succeed"),
+        );
+    }
+    assert_eq!(batch, expected);
+}
+
+#[test]
+fn test_stream_detokenizer_matches_bulk_raw_bytes() {
+    use llama_cpp_4::token::detokenizer::StreamDetokenizer;
+
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let tokens = model
+        .str_to_token("The quick brown fox", AddBos::Never)
+        .expect("tokenizing ascii should succeed");
+
+    let mut detok = StreamDetokenizer::new(&model, Special::Plaintext);
+    let mut streamed = detok
+        .push_all(tokens.iter().copied())
+        .expect("streaming push should succeed");
+    streamed.push_str(&detok.finish().expect("finish should succeed"));
+
+    let bulk = String::from_utf8(
+        model
+            .tokens_to_raw_bytes(&tokens, Special::Plaintext)
+            .expect("bulk raw conversion should succeed"),
+    )
+    .expect("ascii round-trip is valid utf-8");
+
+    assert_eq!(streamed, bulk);
+}
+
+// ============================================================
+// Vocab tests
+// ============================================================
+
+#[test]
+fn test_vocab_basic() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let vocab = model.get_vocab();
+    assert!(vocab.n_tokens() > 0);
+    assert!(vocab.vocab_type() > 0); // BPE=2 or SPM=1
+
+    // Special tokens via vocab
+    assert!(vocab.bos().0 >= 0);
+    assert!(vocab.eos().0 >= 0);
+    assert!(vocab.nl().0 >= 0);
+}
+
+#[test]
+fn test_vocab_token_info() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let vocab = model.get_vocab();
+    let bos = vocab.bos();
+
+    let _ = vocab.is_control(bos);
+    let _ = vocab.is_eog(bos);
+    let _ = vocab.get_score(bos);
+    let _ = vocab.get_attr(bos);
+    let text = vocab.get_text(bos);
+    assert!(text.is_ok());
+}
+
+#[test]
+fn test_vocab_special_flags() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let vocab = model.get_vocab();
+    let _ = vocab.get_add_bos();
+    let _ = vocab.get_add_eos();
+    let _ = vocab.get_add_sep();
+    let _ = vocab.mask();
+}
+
+#[test]
+fn test_vocab_fim_tokens() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let vocab = model.get_vocab();
+    let _ = vocab.fim_pre();
+    let _ = vocab.fim_suf();
+    let _ = vocab.fim_mid();
+    let _ = vocab.fim_pad();
+    let _ = vocab.fim_rep();
+    let _ = vocab.fim_sep();
+}
+
+// ============================================================
+// Tokenize / detokenize
+// ============================================================
+
+#[test]
+fn test_tokenize_roundtrip() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let text = "Hello, world!";
+    let tokens = model.str_to_token(text, AddBos::Never).unwrap();
+    assert!(!tokens.is_empty());
+
+    let roundtrip = model.detokenize(&tokens, true, false).unwrap();
+    assert_eq!(roundtrip, text);
+}
+
+#[test]
+fn test_tokenize_with_bos() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let tokens_no_bos = model.str_to_token("hi", AddBos::Never).unwrap();
+    let tokens_with_bos = model.str_to_token("hi", AddBos::Always).unwrap();
+    assert!(
+        tokens_with_bos.len() >= tokens_no_bos.len(),
+        "with BOS should have at least as many tokens"
+    );
+}
+
+// ============================================================
+// Metadata
+// ============================================================
+
+#[test]
+fn test_metadata_count() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    assert!(model.meta_count() > 0);
+}
+
+#[test]
+fn test_metadata_by_index() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let key = model.meta_key_by_index(0, 256).unwrap();
+    assert!(!key.is_empty());
+    let val = model.meta_val_str_by_index(0, 4096).unwrap();
+    assert!(!val.is_empty());
+}
+
+#[test]
+fn test_metadata_by_key() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let arch = model.meta_val_str("general.architecture", 256);
+    assert!(arch.is_ok(), "general.architecture should exist");
+    assert!(!arch.unwrap().is_empty());
+}
+
+#[test]
+fn test_metadata_convenience() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let entries = model.metadata().unwrap();
+    assert!(!entries.is_empty());
+    // All keys should be non-empty
+    for (key, _val) in &entries {
+        assert!(!key.is_empty());
+    }
+}
+
+#[test]
+fn test_metadata_missing_key() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let result = model.meta_val_str("nonexistent.key.that.does.not.exist", 256);
+    assert!(result.is_err());
+}
+
+// ============================================================
+// Chat templates
+// ============================================================
+
+#[test]
+fn test_chat_builtin_templates() {
+    let templates = LlamaModel::chat_builtin_templates();
+    assert!(!templates.is_empty(), "should have built-in templates");
+    // chatml is a common one
+    assert!(
+        templates.iter().any(|t| t == "chatml"),
+        "should have chatml template"
+    );
+}
+
+// ============================================================
+// Context tests (require non-vocab-only model)
+// ============================================================
+
+#[test]
+fn test_context_creation() {
+    let Some((backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        eprintln!("SKIP: context tests need a full model");
+        return;
+    }
+    let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default();
+    let ctx = model.new_context(backend, ctx_params);
+    assert!(ctx.is_ok(), "should create context");
+}
+
+#[test]
+fn test_context_properties() {
+    let Some((backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        eprintln!("SKIP: context tests need a full model");
+        return;
+    }
+    let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default();
+    let ctx = model.new_context(backend, ctx_params).unwrap();
+
+    assert!(ctx.n_ctx() > 0);
+    assert!(ctx.n_ctx_seq() > 0);
+    assert!(ctx.n_seq_max() > 0);
+    assert!(ctx.n_batch() > 0);
+    assert!(ctx.n_ubatch() > 0);
+    assert!(ctx.n_threads() > 0);
+    assert!(ctx.n_threads_batch() > 0);
+}
+
+#[test]
+fn test_context_thread_control() {
+    let Some((backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        eprintln!("SKIP: context tests need a full model");
+        return;
+    }
+    let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default();
+    let mut ctx = model.new_context(backend, ctx_params).unwrap();
+
+    ctx.set_n_threads(2, 2);
+    assert_eq!(ctx.n_threads(), 2);
+    assert_eq!(ctx.n_threads_batch(), 2);
+}
+
+#[test]
+fn test_context_memory_breakdown() {
+    let Some((backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        eprintln!("SKIP: memory breakdown needs a full model");
+        return;
+    }
+    let ctx = model
+        .new_context(
+            backend,
+            llama_cpp_4::context::params::LlamaContextParams::default(),
+        )
+        .unwrap();
+    let breakdown = ctx.memory_breakdown();
+    assert!(
+        breakdown
+            .iter()
+            .all(|e| e.buft_name.is_empty() || e.total() > 0 || e.total() == 0),
+        "entries should be well-formed"
+    );
+}
+
+#[test]
+fn test_model_devices_iterator() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let count = model.devices().count();
+    assert_eq!(count, model.n_devices().max(0) as usize);
+    for dev in model.devices() {
+        let _ = dev.name();
+        let _ = dev.description();
+        let _ = dev.device_type();
+        let _ = dev.memory();
+    }
+}
+
+#[test]
+fn test_context_set_causal_attn() {
+    let Some((backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        return;
+    }
+    let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default();
+    let mut ctx = model.new_context(backend, ctx_params).unwrap();
+    ctx.set_causal_attn(true);
+    ctx.set_causal_attn(false);
+}
+
+#[test]
+fn test_context_set_embeddings() {
+    let Some((backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        return;
+    }
+    let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default();
+    let mut ctx = model.new_context(backend, ctx_params).unwrap();
+    ctx.set_embeddings(true);
+    ctx.set_embeddings(false);
+}
+
+#[test]
+fn test_context_synchronize() {
+    let Some((backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        return;
+    }
+    let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default();
+    let mut ctx = model.new_context(backend, ctx_params).unwrap();
+    ctx.synchronize();
+}
+
+#[test]
+fn test_context_memory() {
+    let Some((backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        return;
+    }
+    let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default();
+    let ctx = model.new_context(backend, ctx_params).unwrap();
+    let _ = ctx.memory_can_shift();
+    let _ = ctx.memory_seq_pos_min(0);
+}
+
+#[test]
+fn test_context_state_size() {
+    let Some((backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        return;
+    }
+    let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default();
+    let mut ctx = model.new_context(backend, ctx_params).unwrap();
+    let size = ctx.state_get_size();
+    assert!(size > 0, "state size should be > 0");
+    let seq_size = ctx.state_seq_get_size(0);
+    assert!(seq_size > 0);
+}
+
+#[test]
+fn test_context_state_save_restore() {
+    let Some((backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        return;
+    }
+    let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default();
+    let mut ctx = model.new_context(backend, ctx_params).unwrap();
+
+    let size = ctx.state_get_size();
+    let mut buf = vec![0u8; size];
+    let written = ctx.state_get_data(&mut buf);
+    assert!(written > 0);
+
+    let read = ctx.state_set_data(&buf[..written]);
+    assert_eq!(read, written);
+}
+
+#[test]
+fn test_context_perf_reset() {
+    let Some((backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        return;
+    }
+    let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default();
+    let mut ctx = model.new_context(backend, ctx_params).unwrap();
+    ctx.perf_context_reset();
+}
+
+#[test]
+fn test_context_get_model_ptr() {
+    let Some((backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        return;
+    }
+    let ctx_params = llama_cpp_4::context::params::LlamaContextParams::default();
+    let ctx = model.new_context(backend, ctx_params).unwrap();
+    let ptr = ctx.get_model_ptr();
+    assert!(!ptr.is_null());
+}
+
+// ============================================================
+// Sampler with model
+// ============================================================
+
+#[test]
+fn test_infill_sampler() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let sampler = llama_cpp_4::sampling::LlamaSampler::infill(&model);
+    assert_eq!(sampler.name(), "infill");
+}
+
+#[test]
+fn test_grammar_sampler() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let sampler =
+        llama_cpp_4::sampling::LlamaSampler::grammar(&model, "root ::= \"hello\"", "root");
+    assert_eq!(sampler.name(), "grammar");
+}
+
+/// llama.cpp `b10470` dropped `n_ctx_train` from `llama_sampler_init_dry`, so
+/// `LlamaSampler::dry` lost that parameter. Build one against a real vocab to
+/// pin the surviving argument order — every remaining numeric argument is a
+/// different quantity, and a silent reordering would only misbehave at sample
+/// time.
+#[test]
+fn test_dry_sampler() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    // `dry` takes `&self`, so it is reached through an existing sampler.
+    let seed = llama_cpp_4::sampling::LlamaSampler::greedy();
+    let sampler = seed.dry(
+        &model,
+        /* multiplier */ 0.8,
+        /* base */ 1.75,
+        /* allowed_length */ 2,
+        /* penalty_last_n */ 64,
+        ["\n", ":"],
+    );
+    assert_eq!(sampler.name(), "dry");
+}
+
+
+// ============================================================
+// Named chat templates, ftype, embeddings, suppress tokens
+// ============================================================
+
+/// `chat_template(None)` must agree with the deprecated `get_chat_template`,
+/// which reads `tokenizer.chat_template` out of GGUF by hand. If they diverge,
+/// one of the two is reading the wrong key — and the deprecation notice would
+/// be steering callers onto different behaviour, not just a better API.
+#[test]
+#[allow(deprecated)] // comparing against the deprecated path is the point
+fn test_chat_template_default_matches_manual_lookup() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    match (model.chat_template(None), model.get_chat_template(8192)) {
+        (Ok(via_api), Ok(via_meta)) => assert_eq!(via_api, via_meta),
+        // stories260K ships no chat template; both paths must agree on that.
+        (Err(_), Err(_)) => {}
+        (a, b) => panic!("chat_template and get_chat_template disagree: {a:?} vs {b:?}"),
+    }
+}
+
+/// A name the model does not carry must be an error rather than silently
+/// falling back to the default template — the whole point of the parameter is
+/// telling "has a `tool_use` variant" from "does not".
+#[test]
+fn test_chat_template_unknown_name_is_error() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    assert!(model.chat_template(Some("definitely_not_a_template")).is_err());
+}
+
+#[test]
+fn test_model_ftype_is_known() {
+    let Some((_backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        return;
+    }
+    // stories260K is F32; whatever it is, a known ftype must name itself.
+    if let Some(ftype) = model.ftype() {
+        assert!(!ftype.name().is_empty());
+        assert!(!ftype.upstream_name().unwrap().is_empty());
+    }
+}
+
+/// The embedding matrix must be exactly `n_vocab * n_embd` f32s. A mismatch
+/// means the two-call size/fill protocol disagreed with itself.
+#[test]
+fn test_token_embeddings_shape() {
+    let Some(model) = support::model::load_full_model() else {
+        return;
+    };
+    let embd = model.token_embeddings().expect("token embedding matrix");
+    let expected = model.n_vocab() as usize * model.n_embd() as usize;
+    assert_eq!(embd.len(), expected, "expected n_vocab * n_embd f32s");
+    assert!(
+        embd.iter().any(|v| *v != 0.0),
+        "embedding matrix is entirely zero"
+    );
+    assert!(
+        embd.iter().all(|v| v.is_finite()),
+        "embedding matrix contains non-finite values"
+    );
+}
+
+/// Most models declare no suppress tokens; the contract is that this is an
+/// empty slice rather than a null-pointer panic.
+#[test]
+fn test_suppress_tokens_is_empty_or_in_range() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let n_vocab = model.n_vocab();
+    for tok in model.get_vocab().suppress_tokens() {
+        assert!(
+            tok.0 >= 0 && tok.0 < n_vocab,
+            "suppress token {tok:?} outside vocab of {n_vocab}"
+        );
+    }
+}
+
+// ============================================================
+// Newer upstream accessors
+// ============================================================
+
+/// The whole point of `token_embedding_rows` is avoiding
+/// `token_embeddings()`'s `n_vocab * n_embd` allocation, so it must return
+/// exactly the requested rows — and they must match what the full matrix has
+/// at those offsets.
+#[test]
+fn test_token_embedding_rows_match_the_full_matrix() {
+    let Some((_backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        eprintln!("SKIP: vocab-only model has no embedding tensor");
+        return;
+    }
+
+    let n_embd = model.n_embd() as usize;
+    let wanted = [LlamaToken(0), LlamaToken(7), LlamaToken(3)];
+    let rows = model
+        .token_embedding_rows(&wanted)
+        .expect("token embedding rows");
+    assert_eq!(rows.len(), wanted.len() * n_embd);
+
+    let full = model.token_embeddings().expect("token embedding matrix");
+    for (i, tok) in wanted.iter().enumerate() {
+        let from_row = &rows[i * n_embd..(i + 1) * n_embd];
+        let offset = tok.0 as usize * n_embd;
+        let from_full = &full[offset..offset + n_embd];
+        assert_eq!(
+            from_row, from_full,
+            "row {i} (token {tok:?}) disagrees with the full matrix"
+        );
+    }
+}
+
+#[test]
+fn test_token_embedding_rows_of_nothing_is_empty() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    assert!(model.token_embedding_rows(&[]).expect("empty").is_empty());
+}
+
+/// Upstream reports an out-of-range token by writing nothing, which must
+/// surface as an error rather than a buffer of zeros.
+#[test]
+fn test_token_embedding_rows_rejects_out_of_range_tokens() {
+    let Some((_backend, model, vocab_only)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    if vocab_only {
+        eprintln!("SKIP: vocab-only model has no embedding tensor");
+        return;
+    }
+    let past_end = LlamaToken(model.n_vocab());
+    assert!(
+        model.token_embedding_rows(&[past_end]).is_err(),
+        "a token past the end of the vocab must not succeed"
+    );
+}
+
+/// Not a decision model, so the contract is an empty list rather than a
+/// null-pointer walk.
+#[test]
+fn test_decision_labels_is_empty_for_an_ordinary_model() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    assert!(
+        model.decision_labels().is_empty(),
+        "a plain LM must report no decision labels"
+    );
+}
+
+/// Likewise `0` for a model that is not realtime.
+#[test]
+fn test_n_tokens_delay_is_zero_for_an_ordinary_model() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    assert_eq!(model.n_tokens_delay(), 0);
+}
+
+/// `set_attn_rot` mutates the model, so the only thing a test can assert
+/// without a `TurboQuant` checkpoint is that toggling it does not disturb
+/// tokenization or model metadata.
+#[test]
+fn test_set_attn_rot_toggles_without_disturbing_the_model() {
+    let Some((_backend, mut model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let before = model
+        .str_to_token("hello world", AddBos::Never)
+        .expect("tokenize");
+    model.set_attn_rot(false);
+    model.set_attn_rot(true);
+    let after = model
+        .str_to_token("hello world", AddBos::Never)
+        .expect("tokenize");
+    assert_eq!(before, after);
+}
+
+/// `str_to_token` must keep its historic behaviour — special tokens parsed —
+/// now that the parameter is threaded through rather than hardcoded.
+#[test]
+fn test_str_to_token_still_parses_special_tokens_by_default() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let default = model.str_to_token("<s>hi", AddBos::Never).expect("default");
+    let explicit = model
+        .str_to_token_with_special("<s>hi", AddBos::Never, Special::Tokenize)
+        .expect("explicit");
+    assert_eq!(default, explicit);
+}
+
+/// The `_into_` variant must fill the buffer with the same tokens as the
+/// allocating one, and must not append to whatever was already there.
+#[test]
+fn test_str_to_token_into_with_special_replaces_the_buffer() {
+    let Some((_backend, model, _)) = load_test_model() else {
+        eprintln!("SKIP: no test model available");
+        return;
+    };
+    let expected = model
+        .str_to_token_with_special("hello", AddBos::Never, Special::Plaintext)
+        .expect("allocating");
+
+    let mut buffer = vec![LlamaToken(123), LlamaToken(456)];
+    model
+        .str_to_token_into_with_special("hello", AddBos::Never, Special::Plaintext, &mut buffer)
+        .expect("into");
+    assert_eq!(buffer, expected, "stale contents must not survive");
+}

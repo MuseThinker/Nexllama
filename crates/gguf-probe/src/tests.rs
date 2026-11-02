@@ -102,6 +102,30 @@ fn speech_architectures_classify_as_tts() {
 }
 
 #[test]
+fn a_hybrid_attention_model_counts_only_its_full_layers() {
+    let probe = read(gguf(vec![
+        ("qwen35moe.block_count", 4, KvValue::U32(41)),
+        ("qwen35moe.full_attention_interval", 4, KvValue::U32(4)),
+        ("qwen35moe.attention.head_count", 4, KvValue::U32(16)),
+        ("qwen35moe.attention.head_count_kv", 4, KvValue::U32(2)),
+        ("qwen35moe.attention.key_length", 4, KvValue::U32(256)),
+    ]))
+    .expect("parses");
+    // 41 / 4 = 10 full-attention blocks, not 41.
+    assert_eq!(probe.kv_bytes_per_token(), Some(10 * 2 * 256 * 2 * 2));
+}
+
+#[test]
+fn expert_count_marks_a_mixture_of_experts() {
+    let moe = read(gguf(vec![("qwen35moe.expert_count", 4, KvValue::U32(256))])).expect("parses");
+    assert!(moe.is_moe());
+    assert_eq!(moe.expert_count, Some(256));
+
+    let dense = read(gguf(vec![("llama.block_count", 4, KvValue::U32(32))])).expect("parses");
+    assert!(!dense.is_moe());
+}
+
+#[test]
 fn bert_family_classifies_as_embedding() {
     for arch in ["bert", "nomic-bert", "jina-bert-v2", "t5encoder"] {
         assert_eq!(

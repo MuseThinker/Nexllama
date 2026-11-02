@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "gguf-probe"
-version = "0.1.4"
+version = "0.1.5"
 
 [[package]]
 name = "glob"
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "infer-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "gguf-probe",
@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "infer-daemon"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "infer-hub"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -941,8 +941,6 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "llama-cpp-4"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04b78f0771a2b3e29efe425d58214c7e9f8a9874eb9144fd11e849a5c31ac740"
 dependencies = [
  "enumflags2",
  "llama-cpp-sys-4",
@@ -1046,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "model-index"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "gguf-probe",
  "serde_json",

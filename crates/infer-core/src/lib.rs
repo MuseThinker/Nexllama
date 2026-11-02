@@ -29,6 +29,22 @@ pub fn model_class_of(path: &std::path::Path) -> &'static str {
         .unwrap_or("llm")
 }
 
+/// Whether a checkpoint is a mixture-of-experts model.
+///
+/// Only these have `ffn_*_exps` tensors for the CPU-expert fallback to match.
+pub fn is_moe(path: &std::path::Path) -> bool {
+    gguf_probe::probe(path)
+        .map(|probed| probed.is_moe())
+        .unwrap_or(false)
+}
+
+/// Bytes of KV cache one token costs, when the header states the shape.
+pub fn kv_bytes_per_token(path: &std::path::Path) -> Option<u64> {
+    gguf_probe::probe(path)
+        .ok()
+        .and_then(|probed| probed.kv_bytes_per_token())
+}
+
 /// The micro-batch an encoder context is built with.
 ///
 /// An encoder decodes a whole sequence in one batch, so the micro-batch has to
