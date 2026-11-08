@@ -1705,6 +1705,41 @@ fn run_embed(model: &LlamaModel, ctx: &mut LlamaContext, texts: &[String]) -> Re
     })
 }
 
+/// Drop the oldest non-system turns until the prompt fits the context.
+///
+/// A conversation that outgrew its window used to fail with `ContextFull` even
+/// though the newest turn was perfectly serviceable. Keeping the system prompt
+/// and the most recent turns is what a person expects a chat window to do; only
+/// a single turn that cannot fit on its own still reports the overflow.
+fn trim_messages_to_ctx(
+    model: &LlamaModel,
+    templates: Option<&ChatTemplates>,
+    params: &SamplerParams,
+    msgs: &[ChatMsg],
+    n_ctx: usize,
+) -> Vec<ChatMsg> {
+    let mut trimmed = msgs.to_vec();
+    loop {
+        let tokens = match tokenize_text_prompt(templates, model, &trimmed, params) {
+            Ok(tokens) => tokens,
+            // Let the normal path report a template or tokenizer failure.
+            Err(_) => return trimmed,
+        };
+        if tokens.len() < n_ctx {
+            return trimmed;
+        }
+        let Some(pos) = trimmed.iter().position(|m| m.role != "system") else {
+            return trimmed;
+        };
+        // Never remove the turn being answered; if it alone is too large, the
+        // normal context error is the honest answer.
+        if pos + 1 >= trimmed.len() {
+            return trimmed;
+        }
+        trimmed.remove(pos);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_generate<'m, 'd>(
     model: &LlamaModel,
@@ -1729,6 +1764,12 @@ fn run_generate<'m, 'd>(
 ) -> Result<()> {
     let n_ctx = ctx.n_ctx() as usize;
     let n_batch = ctx.n_batch().max(1) as usize;
+
+    // Drop old turns before anything tokenizes the conversation, so the prefix
+    // lookup, the plain path, and every speculative path all see the same
+    // trimmed history.
+    let trimmed = trim_messages_to_ctx(model, templates, params, msgs, n_ctx);
+    let msgs: &[ChatMsg] = &trimmed;
 
     // The reply text is accumulated thread-locally; start this turn clean.
     reset_emitted();

@@ -92,8 +92,8 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     main_gpu: i32,
 
-    /// Context size.
-    #[arg(long, default_value_t = 4096)]
+    /// Context size. 0 = size it from the device and the checkpoint.
+    #[arg(long, default_value_t = 0)]
     n_ctx: u32,
 
     /// Logical batch size.

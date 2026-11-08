@@ -144,11 +144,14 @@ pub enum TuneProgress {
 /// from what the machine actually fits — the sweep never discovers OOM that a
 /// fit check already knew about.
 pub fn quick_plan(max_n_ctx: u32) -> Vec<TuneCandidate> {
-    let tier_a = max_n_ctx.clamp(512, 4096);
-    let tier_b = max_n_ctx.min(8192);
-    let mut tiers = vec![tier_a];
-    if tier_b > tier_a {
-        tiers.push(tier_b);
+    // Context tiers follow what the machine actually fits. A 24 GB card sized
+    // to 32k is measured at 16k and 32k, not at 4k/8k: the small tiers used to
+    // win on speed and then be applied as the load context, which is how a
+    // perfectly good 32k model ended up rejecting a 4k prompt.
+    let max = max_n_ctx.clamp(2048, 262_144);
+    let mut tiers = vec![max];
+    if max > 8192 {
+        tiers.insert(0, (max / 2).max(8192));
     }
 
     let mut plan = Vec::new();
@@ -426,13 +429,22 @@ mod tests {
         let plan = quick_plan(16384);
         assert_eq!(plan.len(), 8);
         let tiers: Vec<u32> = plan.iter().map(|c| c.n_ctx).collect();
-        assert!(tiers.contains(&4096) && tiers.contains(&8192));
+        assert!(tiers.contains(&8192) && tiers.contains(&16384));
+    }
+
+    #[test]
+    fn a_32k_machine_is_measured_at_16k_and_32k() {
+        let plan = quick_plan(32768);
+        let tiers: Vec<u32> = plan.iter().map(|c| c.n_ctx).collect();
+        assert!(tiers.contains(&16384) && tiers.contains(&32768));
+        assert!(plan.iter().all(|c| c.n_ctx <= 32768));
     }
 
     #[test]
     fn the_cap_is_never_exceeded() {
-        for plan in [quick_plan(2048), quick_plan(6000), quick_plan(500_000)] {
-            assert!(plan.iter().all(|c| c.n_ctx <= 8192 || c.n_ctx <= 6000));
+        for max in [2048u32, 6000, 500_000] {
+            let plan = quick_plan(max);
+            assert!(plan.iter().all(|c| c.n_ctx <= max.clamp(2048, 262_144)));
         }
     }
 

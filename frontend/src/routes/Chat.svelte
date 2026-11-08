@@ -282,6 +282,18 @@ function stop() {
   controller?.abort();
 }
 
+// Start a new conversation. Aborting first stops a reply that would otherwise
+// keep writing into a transcript that no longer exists.
+function clearChat() {
+  controller?.abort();
+  stopSpeaking();
+  messages = [];
+  input = '';
+  images = [];
+  error = '';
+  busy = false;
+}
+
 // Speech is a separate request to the daemon's TTS sidecar; it does not need a
 // chat model and does not touch the transcript. One player at a time, so a
 // second "朗读" stops the first rather than layering two voices.
@@ -383,6 +395,14 @@ onMount(() => {
 <div class="page chat">
   <header>
     <h2>{$t('chat.title')}</h2>
+    <button
+      class="ghost"
+      onclick={clearChat}
+      disabled={messages.length === 0 && !busy}
+      title={$t('chat.clear')}
+    >
+      {$t('chat.clear')}
+    </button>
   </header>
 
   <div class="transcript" bind:this={transcript} onscroll={onTranscriptScroll}>
