@@ -231,6 +231,20 @@ export const daemon = {
       0,
     ),
 
+  // Measured tuning. Starting a sweep unloads the resident instance first, so
+  // it gets the same no-timeout treatment as load and unload; the sweep itself
+  // runs in the background and is read through status polls.
+  tuneStart: (model, depth = 'quick') =>
+    req(
+      '/admin/tune',
+      { method: 'POST', body: JSON.stringify({ model, depth }) },
+      0,
+    ),
+  tuneList: () => req('/admin/tune'),
+  tuneStatus: (id) => req(`/admin/tune/${encodeURIComponent(id)}`),
+  tuneCancel: (id) =>
+    req(`/admin/tune/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
+
   chat: (messages, opts = {}) =>
     req('/v1/chat/completions', {
       method: 'POST',

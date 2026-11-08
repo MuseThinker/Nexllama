@@ -1286,3 +1286,58 @@ details.advanced summary {
   border-color: var(--fg);
   color: var(--bg);
 }
+
+/* ── Measured tuning ───────────────────────────────────── */
+.tune-card {
+  margin-top: 14px;
+}
+
+.tune-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tune-head h3 {
+  margin: 0;
+}
+
+.tune-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0 8px;
+  font-size: 12.5px;
+}
+
+.tune-table th,
+.tune-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 7px 9px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.tune-table th {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.tune-table th.num,
+.tune-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.tune-table td code {
+  font-size: 12px;
+}
+
+.tune-skipped {
+  color: var(--warn);
+}
+
+.tune-hint {
+  font-size: 12px;
+  margin-bottom: 0;
+}

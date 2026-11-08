@@ -1,5 +1,5 @@
 <script>
-import { onMount } from 'svelte';
+import { onMount, onDestroy } from 'svelte';
 import { daemon } from '../lib/api.js';
 import { t } from '../lib/i18n.js';
 import { invoke, listen, hasTauri, pickFolder, openExternal } from '../lib/tauri.js';
@@ -116,6 +116,17 @@ let localModels = $state([]);
 // page, but starting it is the first thing this page needs, so it lives here.
 let daemonInfo = $state({ running: false, port: 15656, backend: 'cpu' });
 let daemonBusy = $state(false);
+
+// Measured tuning. A sweep unloads the resident model and owns the GPU while
+// it runs, so there is at most one job on screen at a time and the page polls
+// it instead of holding a request open.
+let tune = $state({ job: null, status: null, busy: false, error: '' });
+const tuneOutcome = $derived(
+  tune.status?.status?.outcome ?? tune.status?.status?.partial ?? null,
+);
+const tuneRows = $derived(tuneOutcome?.measurements ?? []);
+const tuneSkipped = $derived(tuneOutcome?.skipped ?? []);
+const tunePhase = $derived(tune.status?.status?.phase ?? '');
 
 // Chat models first, then everything a user might keep for attachments later;
 // the classes that cannot generate sit at the bottom where the Load button is
@@ -445,6 +456,57 @@ async function persistAutoLoad() {
   }
 }
 
+const tuneSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function startTune(m) {
+  if (tune.busy || busy) return;
+  if (!window.confirm($t('models.tuneConfirm', { model: m.id }))) return;
+  tune.busy = true;
+  tune.error = '';
+  tune.job = null;
+  tune.status = null;
+  try {
+    await ensureDaemon();
+    const job = await daemon.tuneStart(m.id);
+    tune.job = job;
+    // The daemon unloaded the resident instance before the sweep started.
+    await refresh();
+    await pollTune(job.id);
+  } catch (e) {
+    tune.error = describeError(e);
+  } finally {
+    tune.busy = false;
+  }
+}
+
+async function pollTune(id) {
+  while (tune.job?.id === id) {
+    const status = await daemon.tuneStatus(id);
+    tune.status = status;
+    if (status?.status?.phase !== 'running') break;
+    await tuneSleep(2000);
+  }
+  await refresh();
+}
+
+async function cancelTune() {
+  if (!tune.job) return;
+  try {
+    tune.status = await daemon.tuneCancel(tune.job.id);
+  } catch (e) {
+    tune.error = describeError(e);
+  }
+}
+
+function applyTune(c) {
+  adv.nCtx = c.n_ctx;
+  adv.nBatch = c.n_batch;
+  adv.nUbatch = c.n_ubatch;
+  adv.flashAttn = c.flash_attn ? 'on' : 'off';
+  persistAdv();
+  notice = $t('models.tuneApplied', { label: c.label });
+}
+
 async function unload(id) {
   busy = id;
   try {
@@ -663,6 +725,7 @@ onMount(() => {
   return () => {
     un1?.();
     un2?.();
+    tune.job = null;
   };
 });
 
@@ -1242,12 +1305,78 @@ async function saveCloud(silent) {
                 ctx {m.n_ctx} · GPU {m.n_gpu_layers} · {$t('models.idle')} {m.idle_secs}s
               {/if}
             </span>
+            <button class="ghost" onclick={() => startTune(m)} disabled={busy !== '' || tune.busy}>
+              {$t('models.tune')}
+            </button>
             <button class="ghost" onclick={() => unload(m.id)} disabled={busy !== ''}>{$t('models.unload')}</button>
           </li>
         {/each}
       </ul>
     {/if}
   </section>
+
+  {#if tune.job || tune.error}
+    <section class="card tune-card">
+      <div class="tune-head">
+        <h3>{$t('models.tuneTitle')}</h3>
+        {#if tunePhase === 'running'}
+          <button class="ghost" onclick={cancelTune}>{$t('models.tuneCancel')}</button>
+        {/if}
+      </div>
+      <p class="muted">
+        {tune.job?.model ?? ''}
+        {#if tunePhase === 'running'}
+          · {$t('models.tuneRunning')}
+          {Math.min((tune.status?.status?.index ?? 0) + 1, tune.status?.status?.total ?? 0)}/{tune.status?.status?.total ?? 0}
+          {#if tune.status?.status?.label}· {tune.status.status.label}{/if}
+        {:else if tunePhase === 'done'}
+          · {$t('models.tuneDone')}
+        {:else if tunePhase === 'cancelled'}
+          · {$t('models.tuneCancelled')}
+        {:else if tunePhase === 'failed'}
+          · {$t('models.tuneFailed')}: {tune.status?.status?.reason ?? ''}
+        {/if}
+      </p>
+      {#if tune.error}<p class="error">{tune.error}</p>{/if}
+      {#if tuneRows.length > 0}
+        <table class="tune-table">
+          <thead>
+            <tr>
+              <th>{$t('models.tuneConfig')}</th>
+              <th class="num">{$t('models.tuneTok')}</th>
+              <th class="num">{$t('models.tuneTtft')}</th>
+              <th class="num">{$t('models.tunePrefill')}</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each tuneRows as r}
+              <tr>
+                <td><code>{r.candidate.label}</code></td>
+                <td class="num">{r.tokens_per_second.toFixed(2)} tok/s</td>
+                <td class="num">{Math.round(r.first_token_ms)} ms</td>
+                <td class="num">{Math.round(r.prefill_tokens_per_second)} tok/s</td>
+                <td>
+                  <button class="ghost" onclick={() => applyTune(r.candidate)}>
+                    {$t('models.tuneApply')}
+                  </button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {:else if tunePhase === 'done' || tunePhase === 'cancelled'}
+        <p class="muted">{$t('models.tuneNoResult')}</p>
+      {/if}
+      {#if tuneSkipped.length > 0}
+        <p class="muted tune-skipped">
+          {$t('models.tuneSkipped')}:
+          {#each tuneSkipped as s, i}{i ? '; ' : ''}{s.candidate.label} — {s.reason}{/each}
+        </p>
+      {/if}
+      <p class="muted tune-hint">{$t('models.tuneHint')}</p>
+    </section>
+  {/if}
 
   {:else}
   <!-- 云端模型：厂商配置 + 密钥 + 模型选择 -->
