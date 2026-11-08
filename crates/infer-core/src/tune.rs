@@ -222,8 +222,7 @@ fn one_pass(
             LlamaFlashAttnType::Enabled
         } else {
             LlamaFlashAttnType::Disabled
-        })
-        .warmup(false);
+        });
     let mut ctx = model
         .new_context(backend, ctx_params)
         .map_err(|e| InferError::Context(format!("{e:?}")))?;
