@@ -315,9 +315,9 @@ pub fn run_sweep(
         )));
     }
 
-    let backend = LlamaBackend::init().map_err(|e| InferError::Backend(format!("{e:?}")))?;
+    let backend = crate::engine::global_backend()?;
     let model = LlamaModel::load_from_file(
-        &backend,
+        backend,
         model_path,
         &LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers),
     )
@@ -347,7 +347,7 @@ pub fn run_sweep(
 
         // The warm-up pass is untimed: it pays the one-time driver and
         // allocator costs that would otherwise land on the first measurement.
-        match one_pass(&model, &backend, candidate, &prompt, WARMUP_TOKENS) {
+        match one_pass(&model, backend, candidate, &prompt, WARMUP_TOKENS) {
             Ok(_) => {}
             Err(e) => {
                 let reason = format!("warm-up failed: {e}");
@@ -366,7 +366,7 @@ pub fn run_sweep(
         let mut runs = Vec::with_capacity(MEASURE_REPS);
         let mut failed = None;
         for _ in 0..MEASURE_REPS {
-            match one_pass(&model, &backend, candidate, &prompt, MEASURE_GEN_TOKENS) {
+            match one_pass(&model, backend, candidate, &prompt, MEASURE_GEN_TOKENS) {
                 Ok(stat) => runs.push(stat),
                 Err(e) => {
                     failed = Some(format!("measurement failed: {e}"));
@@ -473,5 +473,18 @@ mod tests {
         .expect("a pre-cancelled sweep does not touch the checkpoint");
         assert!(outcome.measurements.is_empty());
         assert!(outcome.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_missing_checkpoint_is_a_model_load_error() {
+        let cancel = AtomicBool::new(false);
+        let outcome = run_sweep(
+            Path::new("does-not-exist.gguf"),
+            0,
+            &quick_plan(4096),
+            &cancel,
+            |_| {},
+        );
+        assert!(matches!(outcome, Err(InferError::ModelLoad(_))));
     }
 }

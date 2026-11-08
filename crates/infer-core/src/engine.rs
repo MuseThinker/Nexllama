@@ -2476,11 +2476,14 @@ fn generate_plain(
     let mut sampler = build_sampler(params, model, model.n_vocab())?;
 
     // The repetition penalties have to see the prompt, the same way the
-    // speculative path feeds it. Without this the sampler's history starts
-    // empty, so a repeated phrase in the prompt is not penalised — and the two
-    // paths disagree about the very first token of an identical request.
-    for &tok in prompt {
-        sampler.accept(tok);
+    // speculative path feeds it. A grammar, however, must start at the first
+    // generated token: feeding it chat-template special tokens such as
+    // `<|im_start|>` makes llama.cpp reject a token the prompt legitimately
+    // contains.
+    if params.response_format_json.is_none() {
+        for &tok in prompt {
+            sampler.accept(tok);
+        }
     }
 
     let t_gen = Instant::now();
@@ -2492,7 +2495,9 @@ fn generate_plain(
 
     while generated < cap && (n_past as usize) < n_ctx {
         let token = sampler.sample(ctx, -1);
-        sampler.accept(token);
+        // `llama_sampler_sample` already accepts the token; accepting it a
+        // second time advances the grammar twice and makes it reject output
+        // that is actually valid.
         if model.is_eog_token(token) {
             break;
         }
