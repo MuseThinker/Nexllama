@@ -285,6 +285,32 @@ weights themselves are the problem, and a `reason` in plain language. The applic
 exposes **Check fit** and **Adopt** per model. The verdict is advice by default;
 `strict_fit: true` refuses a load outright on request.
 
+### Measured tuning
+
+The fit check answers *whether* a model runs; tuning answers *how it should
+run*. Static fitting cannot know whether flash attention actually pays on this
+GPU or how much a larger micro-batch helps prefill here — those depend on the
+driver and the silicon. `POST /admin/tune {"model": "<resident-id>",
+"depth": "quick"}` loads the checkpoint once and measures real
+prefill-plus-generation passes for each candidate configuration: flash attention
+on and off, two micro-batch sizes, and up to two context tiers — eight
+candidates at most.
+
+The protocol is fixed, so two runs compare: one fixed 256-token prompt, 128
+generated tokens, greedy sampling, one untimed warm-up pass, three timed passes
+per candidate, median reported, every pass included so the spread is visible.
+A candidate whose context will not build — usually VRAM for a larger context —
+is skipped with the reason, and the rest of the sweep continues.
+
+The sweep unloads the resident instance first and loads the checkpoint itself,
+so VRAM is never held twice; loading the same file mid-sweep is refused until
+the report lands. Progress and the ranked report are read from
+`GET /admin/tune/{id}`, a running sweep stops on
+`POST /admin/tune/{id}/cancel` and keeps its partial report. Confirming a
+winner is an ordinary `/admin/load` with the tuned parameters — nothing new to
+learn. The report is advice, not a promise: the sweep measures a fixed
+workload, and a different prompt mix can rank the candidates differently.
+
 ### Prefix cache and runtime figures
 
 Because each turn contains the previous one as a prefix, re-encoding that prefix is
@@ -360,6 +386,16 @@ program points at. Neither is offered where the other belongs.
 **Thinking** is set per model in the advanced panel and may be overridden per request
 with `"thinking": true|false`. The switch reaches the chat template as
 `enable_thinking`, so the template that understands it is the one that applies it.
+
+**Constrained output** accepts the OpenAI `response_format` object:
+`{"type":"json_object"}` forces any valid JSON object, and
+`{"type":"json_schema","json_schema":{"schema":{…}}}` forces a reply matching the
+schema. Both are enforced by a grammar built from the schema — the model cannot
+drift out of shape — and the grammar rides with every decoding path, speculative
+decoding included. A schema the converter or llama.cpp refuses is a `400` naming
+the problem, not a mid-reply failure. On a reasoning model the constraint applies
+from the first token, so send `"thinking": false` alongside it when the reply
+should be nothing but the JSON.
 
 **Tool calling** accepts an OpenAI-shaped `tools` array with optional `tool_choice` and
 `parallel_tool_calls`, and answers as an ordinary OpenAI message:
@@ -446,6 +482,9 @@ only the port.
 | POST | `/admin/load` | `{ "model": "path.gguf", "name": "alias", "n_gpu_layers": 999, "n_ctx": 4096, … }` |
 | POST | `/admin/unload` | `{ "model": "alias" }`, or `{}` for every model |
 | POST | `/admin/fit` | Fit a checkpoint, or a `size_bytes`, before downloading |
+| GET, POST | `/admin/tune` | Measured-tuning jobs: list them, or start a sweep |
+| GET | `/admin/tune/{id}` | One job: progress while running, ranked report when done |
+| POST | `/admin/tune/{id}/cancel` | Stop a running sweep; the partial report is kept |
 | GET | `/admin/models` | The models folder, as `model-index` reads it |
 | GET | `/admin/hub/authors` | Trusted HuggingFace publishers offered as search filters |
 | GET | `/admin/hub/search` | `?q=…&author=…&limit=20`; list GGUF repositories |
@@ -456,7 +495,7 @@ only the port.
 | GET, POST | `/admin/providers` | List and configure cloud providers; keys are never returned |
 | POST | `/admin/providers/test` | Retrieve a provider's model list to validate a key |
 | GET, POST | `/admin/routing` | The `auto` policy: `{ "enabled": true, "prefer": "local" }` |
-| POST | `/v1/chat/completions` | OpenAI chat; `"stream": true` for Server-Sent Events |
+| POST | `/v1/chat/completions` | OpenAI chat; `"stream": true` for Server-Sent Events; `response_format` constrains the reply (`json_object`, `json_schema`) |
 | POST | `/api/chat`, `/api/generate` | Ollama chat and single prompt; NDJSON when streaming |
 | POST | `/v1/embeddings`, `/api/embed`, `/api/embeddings` | Embeddings in OpenAI and Ollama shapes |
 | POST | `/v1/rerank`, `/rerank`, `/v1/reranking`, `/reranking` | `{ "model": "…", "query": "…", "documents": ["…"], "top_n": 3 }` |
@@ -485,7 +524,7 @@ the per-model **Advanced** panel. `POST /admin/load` accepts:
 | Context | `n_ctx` (0 = automatic, sized to the machine), `n_batch` (2048), `n_ubatch` (512), `flash_attn` (`auto｜on｜off`), `offload_kqv`, `rope_freq_base`, `rope_freq_scale` |
 | CPU | `threads`, `threads_batch` (0 = automatic) |
 | Adapters | `load_mtp` (bundled MTP head), `lora` (list of adapter paths) |
-| Sampling (per request) | `temperature`, `top_k`, `top_p`, `min_p`, `repeat_penalty`, `repeat_last_n`, `repeat_freq`, `repeat_present`, `seed`, `max_tokens` |
+| Sampling (per request) | `temperature`, `top_k`, `top_p`, `min_p`, `repeat_penalty`, `repeat_last_n`, `repeat_freq`, `repeat_present`, `seed`, `max_tokens`, `response_format` |
 | Speculative (per request) | `speculative`, `ngram_n`, `ngram_m` |
 
 The daemon exposes the same options as command-line flags (`--load-mode`,

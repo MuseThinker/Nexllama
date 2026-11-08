@@ -221,6 +221,14 @@ POST /admin/routing {"enabled":true,"prefer":"local"}
 
 `POST /admin/fit` 接受一个 GGUF 路径——文件还没下载时，只给一个 `size_bytes` 也行——回答你：装不装得下、需要多少内存对比还剩多少、llama.cpp 会选多大的 `n_gpu_layers` 与 `n_ctx`、如果是权重本身太大就建议换一个更小的量化，以及一句人话的 `reason`。应用里对每个模型提供**检查适配**与**采用**。默认只作建议；打开 `strict_fit: true` 就会直接拒绝加载。
 
+### 实测优选
+
+适配检查回答的是**能不能跑**，实测优选回答的是**该怎么跑**。静态拟合无法知道 flash attention 在你这张卡上是否真有收益、更大的微批对 prefill 帮助多大——这取决于驱动和硅片本身。`POST /admin/tune {"model": "<常驻模型id>", "depth": "quick"}` 只加载一次检查点，然后对每个候选配置实测真实的"预填充+生成"：flash attention 开与关、两种微批大小、至多两档上下文——最多八个候选。
+
+测量协议固定不变，因此两次结果可比：一条固定的 256 token 提示、生成 128 token、贪心采样、一次不计时的预热、每个候选计时三次、取中位数，并且每次计时都完整保留，波动一目了然。某个候选的 context 建不起来——通常是大上下文显存不够——会跳过并注明原因，其余候选继续。
+
+sweep 会先卸载常驻实例、自己加载检查点，显存绝不会同时持有两份；sweep 进行中加载同一文件会被拒绝，直到报告出炉。进度与排名报告读 `GET /admin/tune/{id}`，进行中的任务用 `POST /admin/tune/{id}/cancel` 停止，部分报告依然保留。确认最优配置就是一次普通的 `/admin/load`——不用学任何新东西。报告是建议而非承诺：sweep 测的是固定负载，换一种提示风格，候选的排名可能不一样。
+
 ### 前缀缓存与运行指标
 
 因为每一轮都把上一轮当作前缀，重新编码这段前缀，往往占掉首 token 之前的大部分时间。开启 `prefix_cache`（默认开启）后，KV 状态被复用，只编码新增的后缀。加载了草稿模型或 MTP 头时会自动关闭，因为它们的定位与目标各自独立。
@@ -266,6 +274,8 @@ models/Qwen2.5-VL-7B/
 ### 思考开关与工具调用
 
 **思考（Thinking）**按模型在高级面板里设置，也可以在请求里用 `"thinking": true|false` 覆盖。这个开关会以 `enable_thinking` 传进聊天模板，所以真正认得它的模板，就是真正会应用它的模板。
+
+**约束输出**接受 OpenAI 的 `response_format` 对象：`{"type":"json_object"}` 强制返回任意合法的 JSON 对象；`{"type":"json_schema","json_schema":{"schema":{…}}}` 强制返回匹配该 schema 的回复。两者都由根据 schema 构建的语法强制执行——模型不可能跑偏形状——并且语法跟随每一条解码路径，包括投机解码。schema 若被转换器或 llama.cpp 拒绝，会以 `400` 报错并写明原因，而不是在回复中途失败。对会思考的模型，约束从第一个 token 就生效；若希望回复只有 JSON 本身，请同时发送 `"thinking": false`。
 
 **工具调用**接受 OpenAI 格式的 `tools` 数组（`tool_choice` 与 `parallel_tool_calls` 可选），并以一条普通的 OpenAI 消息作答：
 
@@ -327,10 +337,13 @@ curl http://127.0.0.1:15656/v1/chat/completions -H "Content-Type: application/js
 | POST | `/admin/load` | `{ "model": "path.gguf", "name": "alias", "n_gpu_layers": 999, "n_ctx": 4096, … }` |
 | POST | `/admin/unload` | `{ "model": "alias" }`，或 `{}` 表示全部 |
 | POST | `/admin/fit` | 适配检查点，或下载前的 `size_bytes` |
+| GET, POST | `/admin/tune` | 实测优选任务：列出，或启动一轮 sweep |
+| GET | `/admin/tune/{id}` | 单个任务：运行中是进度，完成后是排名报告 |
+| POST | `/admin/tune/{id}/cancel` | 停止进行中的 sweep；部分报告保留 |
 | GET, POST | `/admin/providers` | 列出与配置云端服务商；密钥绝不返回 |
 | POST | `/admin/providers/test` | 拉取服务商的模型列表以校验密钥 |
 | GET, POST | `/admin/routing` | `auto` 策略：`{ "enabled": true, "prefer": "local" }` |
-| POST | `/v1/chat/completions` | OpenAI 对话；`"stream": true` 时为 Server-Sent Events |
+| POST | `/v1/chat/completions` | OpenAI 对话；`"stream": true` 时为 Server-Sent Events；`response_format` 约束回复（`json_object`、`json_schema`） |
 | POST | `/api/chat`、`/api/generate` | Ollama 对话与单次提示；流式为 NDJSON |
 | POST | `/v1/embeddings`、`/api/embed`、`/api/embeddings` | OpenAI 与 Ollama 两种形态的向量 |
 | POST | `/v1/rerank`、`/rerank`、`/v1/reranking`、`/reranking` | `{ "model": "…", "query": "…", "documents": ["…"], "top_n": 3 }` |
@@ -350,7 +363,7 @@ Ollama 的 `options` 会映射到采样器：`temperature`、`top_k`、`top_p`�
 | 上下文 | `n_ctx`（0 = 自动，按机器定大小）、`n_batch`（2048）、`n_ubatch`（512）、`flash_attn`（`auto｜on｜off`）、`offload_kqv`、`rope_freq_base`、`rope_freq_scale` |
 | CPU | `threads`、`threads_batch`（0 = 自动） |
 | 适配器 | `load_mtp`（内置 MTP 头）、`lora`（适配器路径列表） |
-| 采样（按请求） | `temperature`、`top_k`、`top_p`、`min_p`、`repeat_penalty`、`repeat_last_n`、`repeat_freq`、`repeat_present`、`seed`、`max_tokens` |
+| 采样（按请求） | `temperature`、`top_k`、`top_p`、`min_p`、`repeat_penalty`、`repeat_last_n`、`repeat_freq`、`repeat_present`、`seed`、`max_tokens`、`response_format` |
 | 投机（按请求） | `speculative`、`ngram_n`、`ngram_m` |
 
 守护进程也把这些选项以命令行参数的形式暴露出来（`--load-mode`、`--flash-attn`、`--n-batch`、`--no-offload-kqv` …），方便无界面与容器场景。

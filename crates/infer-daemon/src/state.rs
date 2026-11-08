@@ -353,6 +353,9 @@ pub struct AppState {
     pub tts_lock: Arc<tokio::sync::Mutex<()>>,
     /// HuggingFace transfers started over HTTP, and their progress reports.
     pub hub: Arc<crate::hub::HubState>,
+    /// Measured-tuning jobs. Outside `inner` because a sweep runs on its own
+    /// thread and never touches the model lock; only its own status changes.
+    pub tunes: Arc<crate::tune::TuneRegistry>,
 }
 
 impl AppState {
@@ -376,6 +379,7 @@ impl AppState {
             tts_worker: Arc::new(crate::tts::TtsWorker::new(None)),
             tts_lock: Arc::new(tokio::sync::Mutex::new(())),
             hub: Arc::new(crate::hub::HubState::new()),
+            tunes: Arc::new(crate::tune::TuneRegistry::default()),
             inner: Arc::new(Mutex::new(DaemonState {
                 models: HashMap::new(),
                 tts: HashMap::new(),

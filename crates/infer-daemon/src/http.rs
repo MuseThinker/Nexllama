@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{header, header::AUTHORIZATION, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -91,6 +91,12 @@ pub fn router(
         .route("/admin/load", post(load))
         .route("/admin/unload", post(unload))
         .route("/admin/fit", post(fit_check))
+        // Measured tuning: rank context-level configurations by real speed on
+        // this machine. The sweep unloads the resident instance and runs on
+        // its own thread; the report lands under the job's id.
+        .route("/admin/tune", get(tune_list).post(tune_start))
+        .route("/admin/tune/{id}", get(tune_status))
+        .route("/admin/tune/{id}/cancel", post(tune_cancel))
         // The models folder, read with the same rules the desktop library uses
         // (`model-index`), so a browser opened against this daemon shows the
         // library the app would show. Only when `--models-dir` named one.
@@ -380,7 +386,16 @@ impl IntoResponse for ApiError {
 
 impl From<InferError> for ApiError {
     fn from(e: InferError) -> Self {
-        ApiError::Model(e.to_string())
+        match &e {
+            // A bad parameter or a class mismatch is the caller's mistake:
+            // naming the field with a 400 lets a client fix the request, where
+            // a 500 reads as "the server is broken" and invites a retry that
+            // will fail the same way.
+            InferError::InvalidParameter(_) | InferError::Unsupported { .. } => {
+                ApiError::BadRequest(e.to_string())
+            }
+            _ => ApiError::Model(e.to_string()),
+        }
     }
 }
 
@@ -1219,6 +1234,16 @@ async fn load(
     Json(req): Json<LoadRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = model_id(&req);
+    // A running sweep holds this checkpoint's weights on the GPU. Loading the
+    // same file again would not contend for a lock — it would contend for
+    // VRAM, and lose. Wait for the report instead; it is minutes away.
+    if let Some(path) = req.model.as_deref() {
+        if state.tunes.running_for_path(std::path::Path::new(path)) {
+            return Err(ApiError::BadRequest(format!(
+                "a measured-tuning sweep is running against {path}; its report will be at GET /admin/tune"
+            )));
+        }
+    }
     let mut cfg;
     {
         let guard = state.inner.lock().await;
@@ -2167,6 +2192,106 @@ async fn unload(
     Json(json!({ "status": "ok", "unloaded": n }))
 }
 
+/// Start a measured-tuning sweep.
+///
+/// The resident instance is unloaded first — the sweep loads the checkpoint
+/// itself, and holding it twice on one GPU is how OOM happens. The dormant
+/// entry survives, so confirming a winner afterwards is an ordinary load, and
+/// a request that arrives mid-sweep reloads from it too.
+#[derive(Deserialize)]
+struct TuneRequest {
+    /// The resident model id to tune.
+    model: String,
+    /// Only `"quick"` exists so far. The field is read so a client asking for
+    /// a `"detailed"` sweep gets a named refusal instead of a silent fallback.
+    depth: Option<String>,
+}
+
+async fn tune_start(
+    State(state): State<AppState>,
+    Json(req): Json<TuneRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let depth = req.depth.as_deref().unwrap_or("quick");
+    if depth != "quick" {
+        return Err(ApiError::BadRequest(format!(
+            "tune depth \"{depth}\" is not implemented; use \"quick\""
+        )));
+    }
+    let (path, gpu_layers, base_ctx) = {
+        let mut guard = state.inner.lock().await;
+        if state.tunes.running_for_model(&req.model) {
+            return Err(ApiError::BadRequest(format!(
+                "a tuning sweep is already running for model \"{}\"",
+                req.model
+            )));
+        }
+        let loaded = guard
+            .models
+            .get(&req.model)
+            .ok_or_else(|| ApiError::NotLoaded)?;
+        if loaded.info.model_class != "llm" {
+            return Err(ApiError::Unsupported {
+                class: loaded.info.model_class.clone(),
+                what: "be tuned for chat speed — only a chat model has a decode loop".into(),
+            });
+        }
+        let taken = (loaded.path.clone(), loaded.n_gpu_layers, loaded.n_ctx);
+        // Free the GPU before the sweep claims it. Drop happens off the async
+        // context: freeing weights is real work, same as in `unload`.
+        let resident = guard.models.remove(&req.model);
+        if guard.default_model.as_deref() == Some(req.model.as_str()) {
+            guard.default_model = None;
+        }
+        let _ = tokio::task::spawn_blocking(move || drop(resident)).await;
+        taken
+    };
+    let plan = infer_core::tune::quick_plan(base_ctx);
+    let planned = plan.len();
+    let job = state
+        .tunes
+        .start(req.model.clone(), path, gpu_layers, plan, depth);
+    Ok(Json(json!({
+        "id": job.id,
+        "model": req.model,
+        "depth": depth,
+        "planned": planned,
+        "report": format!("GET /admin/tune/{}", job.id),
+        "cancel": format!("POST /admin/tune/{}/cancel", job.id),
+    })))
+}
+
+async fn tune_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(json!({
+        "jobs": state.tunes.list().iter().map(|j| j.to_json()).collect::<Vec<_>>()
+    }))
+}
+
+async fn tune_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .tunes
+        .get(&id)
+        .map(|j| Json(j.to_json()))
+        .ok_or_else(|| ApiError::NotFound(format!("no tuning job \"{id}\"")))
+}
+
+async fn tune_cancel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let job = state
+        .tunes
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("no tuning job \"{id}\"")))?;
+    // Idempotent: cancelling twice sets the same flag. The sweep finishes its
+    // current candidate, then stops and reports what it measured — a partial
+    // report is still a report.
+    job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(Json(job.to_json()))
+}
+
 /// One message, with `content` either plain text or OpenAI-style parts.
 ///
 /// ```json
@@ -2302,6 +2427,11 @@ struct ChatRequest {
     tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     parallel_tool_calls: Option<bool>,
+    /// OpenAI `response_format`: `text` (default), `json_object`, or
+    /// `json_schema` with the schema under `json_schema.schema`. A constrained
+    /// reply is enforced by a grammar, so the model cannot drift out of shape.
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
 }
 
 impl ChatRequest {
@@ -2361,6 +2491,9 @@ impl ChatRequest {
         }
         if let Some(p) = self.parallel_tool_calls {
             s.parallel_tool_calls = p;
+        }
+        if let Some(rf) = &self.response_format {
+            s.response_format_json = Some(rf.to_string());
         }
         s
     }
@@ -3655,6 +3788,36 @@ mod tests {
         assert!(tools.contains("get_weather"));
         assert_eq!(p.tool_choice.as_deref(), Some("required"));
         assert!(p.parallel_tool_calls);
+    }
+
+    #[test]
+    fn response_format_reaches_the_sampler_verbatim() {
+        // The schema travels as text and is converted where the model lives, so
+        // the request layer only guarantees it is not dropped.
+        let req: ChatRequest = serde_json::from_value(json!({
+            "messages": [{ "role": "user", "content": "describe a city" }],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "city",
+                    "schema": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"]
+                    }
+                }
+            },
+        }))
+        .expect("chat request");
+        let rf = req.sampler().response_format_json.expect("carried through");
+        assert!(rf.contains("\"city\""), "schema lost: {rf}");
+
+        // Absent means unconstrained, exactly like a request without tools.
+        let req: ChatRequest = serde_json::from_value(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+        }))
+        .expect("chat request");
+        assert!(req.sampler().response_format_json.is_none());
     }
 
     #[test]

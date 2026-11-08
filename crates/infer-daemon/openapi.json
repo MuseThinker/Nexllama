@@ -134,7 +134,22 @@
           "speculative": { "type": "boolean", "description": "n-gram speculative decoding; exact, but only pays off on repetitive text." },
           "ngram_n": { "type": "integer" },
           "ngram_m": { "type": "integer" },
-          "thinking": { "type": "boolean", "description": "Let a reasoning model think before answering. Omit to use the model's own default; a template that does not support the flag ignores it." }
+          "thinking": { "type": "boolean", "description": "Let a reasoning model think before answering. Omit to use the model's own default; a template that does not support the flag ignores it." },
+          "response_format": {
+            "type": "object",
+            "description": "Constrain the reply. {\"type\":\"json_object\"} forces any valid JSON object; {\"type\":\"json_schema\",\"json_schema\":{\"name\":\"…\",\"schema\":{…}}} forces a reply matching the schema. Enforced by a grammar, so the model cannot drift out of shape. For a reasoning model, send \"thinking\": false alongside it or the constraint applies from the first token.",
+            "properties": {
+              "type": { "type": "string", "enum": ["text", "json_object", "json_schema"] },
+              "json_schema": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "strict": { "type": "boolean" },
+                  "schema": { "type": "object", "description": "The JSON Schema the reply must match." }
+                }
+              }
+            }
+          }
         },
         "required": ["messages"]
       },
@@ -563,6 +578,45 @@
           "200": { "description": "report", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FitReport" } } } },
           "400": { "description": "bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
+      }
+    },
+    "/admin/tune": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "Every tuning job, newest first",
+        "description": "Each job carries its phase (`running`, `done`, `cancelled`, `failed`), the candidate being measured while running, and — when finished — the ranked measurements with every timed pass, plus the candidates that were skipped and why.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": { "200": { "description": "jobs", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "post": {
+        "tags": ["admin"],
+        "summary": "Start a measured-tuning sweep",
+        "description": "Ranks context-level configurations (flash attention, micro-batch, context size) by real prefill-plus-generation speed on this machine — the empirical counterpart to the fit check, which answers whether a model runs rather than how it should run. Unloads the resident instance first: the sweep loads the checkpoint itself, and holding one checkpoint twice on one GPU is how OOM happens. Loading the same file while a sweep runs is refused until the report lands.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["model"], "properties": { "model": { "type": "string", "description": "The resident model id to tune." }, "depth": { "type": "string", "enum": ["quick"], "description": "Only \"quick\" exists so far; the field is read so a client asking for more gets a named refusal." } } }, "example": { "model": "qwen2.5", "depth": "quick" } } } },
+        "responses": {
+          "200": { "description": "job started", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "400": { "description": "model not resident, a sweep already runs for it, or an unimplemented depth", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/admin/tune/{id}": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "One tuning job: progress, then the report",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "job", "content": { "application/json": { "schema": { "type": "object" } } } }, "404": { "description": "no such job", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } } }
+      }
+    },
+    "/admin/tune/{id}/cancel": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Ask a running sweep to stop",
+        "description": "The sweep finishes its current candidate, then stops and keeps the partial report.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "job", "content": { "application/json": { "schema": { "type": "object" } } } }, "404": { "description": "no such job", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } } }
       }
     },
     "/admin/providers": {

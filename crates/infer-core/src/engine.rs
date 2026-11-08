@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use llama_cpp_4::common_sampler::{CommonSampler, CommonSamplerParams};
+use llama_cpp_4::chat::json_schema_to_grammar;
+use llama_cpp_4::common_sampler::{CommonSampler, CommonSamplerParams, GrammarSource};
 use llama_cpp_4::context::params::LlamaContextType;
 use llama_cpp_4::eagle::{Eagle3Session, Eagle3SessionConfig};
 use llama_cpp_4::model::params::LlamaLoadMode;
@@ -2472,7 +2473,7 @@ fn generate_plain(
 ) -> Result<GenStats> {
     let n_batch = ctx.n_batch().max(1) as usize;
     let mut batch = LlamaBatch::new(n_batch, 1);
-    let mut sampler = build_sampler(params, model.n_vocab());
+    let mut sampler = build_sampler(params, model, model.n_vocab())?;
 
     // The repetition penalties have to see the prompt, the same way the
     // speculative path feeds it. Without this the sampler's history starts
@@ -2599,6 +2600,16 @@ fn generate_mtp<'m>(
     sc.penalty_present = params.repeat_present;
     sc.seed = params.seed;
     cs_params.set_scalars(&sc);
+    if let Some(gbnf) = response_format_gbnf(params)? {
+        // OutputFormat tells the sampler the grammar constrains generated text
+        // and may be advanced past the generation prompt; lazy stays off, so
+        // the constraint holds from the first generated token.
+        cs_params
+            .set_grammar(&gbnf, GrammarSource::OutputFormat, false)
+            .map_err(|e| {
+                InferError::InvalidParameter(format!("response_format grammar refused: {e}"))
+            })?;
+    }
     let mut sampler =
         CommonSampler::new(model, &mut cs_params).map_err(|e| InferError::Decode(e.to_string()))?;
     for tok in &prompt {
@@ -2969,6 +2980,16 @@ fn generate_draft_model<'m, 'd>(
     sc.penalty_present = params.repeat_present;
     sc.seed = params.seed;
     cs_params.set_scalars(&sc);
+    if let Some(gbnf) = response_format_gbnf(params)? {
+        // OutputFormat tells the sampler the grammar constrains generated text
+        // and may be advanced past the generation prompt; lazy stays off, so
+        // the constraint holds from the first generated token.
+        cs_params
+            .set_grammar(&gbnf, GrammarSource::OutputFormat, false)
+            .map_err(|e| {
+                InferError::InvalidParameter(format!("response_format grammar refused: {e}"))
+            })?;
+    }
     let mut sampler =
         CommonSampler::new(model, &mut cs_params).map_err(|e| InferError::Decode(e.to_string()))?;
     for tok in &prompt {
@@ -3230,6 +3251,16 @@ fn generate_speculative(
     sc.penalty_present = params.repeat_present;
     sc.seed = params.seed;
     cs_params.set_scalars(&sc);
+    if let Some(gbnf) = response_format_gbnf(params)? {
+        // OutputFormat tells the sampler the grammar constrains generated text
+        // and may be advanced past the generation prompt; lazy stays off, so
+        // the constraint holds from the first generated token.
+        cs_params
+            .set_grammar(&gbnf, GrammarSource::OutputFormat, false)
+            .map_err(|e| {
+                InferError::InvalidParameter(format!("response_format grammar refused: {e}"))
+            })?;
+    }
     let mut sampler =
         CommonSampler::new(model, &mut cs_params).map_err(|e| InferError::Decode(e.to_string()))?;
 
@@ -3635,8 +3666,39 @@ fn emit_token(
     emit_utf8(pending, reply)
 }
 
-fn build_sampler(params: &SamplerParams, n_vocab: i32) -> LlamaSampler {
-    let mut chain: Vec<LlamaSampler> = Vec::with_capacity(6);
+/// The GBNF grammar an OpenAI `response_format` asks for, if any.
+///
+/// Conversion happens once per request, before the first token: a schema the
+/// converter or the C parser rejects is a request error rather than a mid-reply
+/// failure, so the caller learns the shape was wrong while they can still fix
+/// the request. Shared by every generation path — the plain chain and the three
+/// speculative ones — so a constrained reply stays constrained no matter which
+/// decoder runs it.
+fn response_format_gbnf(params: &SamplerParams) -> Result<Option<String>> {
+    let Some(rf) = params.response_format_json.as_deref() else {
+        return Ok(None);
+    };
+    let Some(schema) =
+        SamplerParams::response_format_schema(rf).map_err(InferError::InvalidParameter)?
+    else {
+        return Ok(None);
+    };
+    json_schema_to_grammar(&schema, false)
+        .map(Some)
+        .map_err(|e| {
+            InferError::InvalidParameter(format!("response_format schema is not usable: {e}"))
+        })
+}
+
+fn build_sampler(params: &SamplerParams, model: &LlamaModel, n_vocab: i32) -> Result<LlamaSampler> {
+    let mut chain: Vec<LlamaSampler> = Vec::with_capacity(7);
+    if let Some(gbnf) = response_format_gbnf(params)? {
+        chain.push(
+            LlamaSampler::try_grammar(model, &gbnf, "root").map_err(|e| {
+                InferError::InvalidParameter(format!("response_format grammar refused: {e}"))
+            })?,
+        );
+    }
     if params.repeat_penalty != 1.0 || params.repeat_freq != 0.0 || params.repeat_present != 0.0 {
         chain.push(LlamaSampler::penalties(
             n_vocab,
@@ -3652,14 +3714,14 @@ fn build_sampler(params: &SamplerParams, n_vocab: i32) -> LlamaSampler {
         // used to skip them, which is why temperature 0 disagreed with the
         // speculative path — that one keeps its penalties on.
         chain.push(LlamaSampler::greedy());
-        return LlamaSampler::chain_simple(chain);
+        return Ok(LlamaSampler::chain_simple(chain));
     }
     chain.push(LlamaSampler::top_k(params.top_k));
     chain.push(LlamaSampler::top_p(params.top_p, 1));
     chain.push(LlamaSampler::min_p(params.min_p, 1));
     chain.push(LlamaSampler::temp(params.temperature));
     chain.push(LlamaSampler::dist(params.seed));
-    LlamaSampler::chain_simple(chain)
+    Ok(LlamaSampler::chain_simple(chain))
 }
 
 /// Emit every complete UTF-8 prefix currently buffered, keeping any partial tail.

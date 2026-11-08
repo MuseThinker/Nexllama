@@ -4,6 +4,7 @@ pub mod fit;
 pub mod hwprofile;
 pub mod promptcache;
 pub mod sampler;
+pub mod tune;
 pub mod types;
 
 pub use engine::{

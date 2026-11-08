@@ -4,6 +4,7 @@ mod hub;
 mod lifecycle;
 mod state;
 mod tts;
+mod tune;
 mod ui;
 
 use std::path::{Path, PathBuf};

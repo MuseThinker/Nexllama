@@ -68,6 +68,14 @@ pub struct SamplerParams {
     /// Allow several tool calls in one turn.
     #[serde(default)]
     pub parallel_tool_calls: bool,
+    /// OpenAI `response_format` object as JSON text, when the request sent one.
+    ///
+    /// `json_schema` constrains the reply with a grammar built from the schema;
+    /// `json_object` becomes the most permissive object schema, which is what
+    /// the OpenAI type promises (any valid JSON object). `text` is a no-op.
+    /// `None` means unconstrained output.
+    #[serde(default)]
+    pub response_format_json: Option<String>,
 }
 
 impl Default for SamplerParams {
@@ -97,6 +105,7 @@ impl Default for SamplerParams {
             tools_json: None,
             tool_choice: None,
             parallel_tool_calls: false,
+            response_format_json: None,
         }
     }
 }
@@ -202,6 +211,38 @@ impl SamplerParams {
     pub fn hit_token_cap(&self, generated: usize) -> bool {
         self.max_tokens > 0 && generated >= self.max_tokens
     }
+
+    /// Extract the JSON Schema an OpenAI `response_format` object asks for.
+    ///
+    /// Returns `Ok(None)` when output should stay unconstrained (`text`, or no
+    /// type at all), `Ok(Some(schema))` when the reply must conform to a
+    /// schema, and an error naming the problem for shapes this engine refuses.
+    ///
+    /// `json_object` becomes the most permissive object schema rather than
+    /// relying on an "anything goes" fallback: a schema with no type could
+    /// legitimately mean "any JSON value", but the OpenAI type promises an
+    /// *object*, so the grammar says object. The parsing is separated from
+    /// grammar construction because everything here can be checked without a
+    /// model, while the grammar cannot.
+    pub fn response_format_schema(
+        response_format_json: &str,
+    ) -> std::result::Result<Option<String>, String> {
+        let rf: serde_json::Value = serde_json::from_str(response_format_json)
+            .map_err(|e| format!("response_format is not valid JSON: {e}"))?;
+        match rf.get("type").and_then(serde_json::Value::as_str) {
+            None | Some("text") => Ok(None),
+            Some("json_object") => Ok(Some(r#"{"type":"object"}"#.to_owned())),
+            Some("json_schema") => {
+                let schema = rf.pointer("/json_schema/schema").ok_or_else(|| {
+                    "response_format.json_schema.schema is required".to_string()
+                })?;
+                Ok(Some(schema.to_string()))
+            }
+            Some(other) => Err(format!(
+                "response_format type \"{other}\" is not supported; use text, json_object or json_schema"
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -269,5 +310,68 @@ mod tests {
         assert!(!p.hit_token_cap(511));
         assert!(p.hit_token_cap(512));
         assert!(p.hit_token_cap(513));
+    }
+
+    #[test]
+    fn response_format_text_and_absent_type_stay_unconstrained() {
+        assert!(SamplerParams::response_format_schema(r#"{"type":"text"}"#)
+            .unwrap()
+            .is_none());
+        assert!(SamplerParams::response_format_schema(r#"{"foo":1}"#)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn json_object_becomes_the_most_permissive_object() {
+        let schema = SamplerParams::response_format_schema(r#"{"type":"json_object"}"#)
+            .unwrap()
+            .expect("json_object yields a schema");
+        assert_eq!(schema, r#"{"type":"object"}"#);
+    }
+
+    #[test]
+    fn json_schema_pulls_the_schema_out_of_its_wrapper() {
+        let rf = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "weather",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        });
+        let schema = SamplerParams::response_format_schema(&rf.to_string())
+            .unwrap()
+            .expect("json_schema yields a schema");
+        assert!(
+            schema.contains("\"city\""),
+            "schema lost its body: {schema}"
+        );
+        // The wrapper's `name` and `strict` must not leak into the grammar's
+        // input: only the schema itself constrains anything.
+        assert!(!schema.contains("weather"), "wrapper leaked: {schema}");
+    }
+
+    #[test]
+    fn malformed_response_format_is_named_not_swallowed() {
+        let cases = [
+            ("not json", "not valid JSON"),
+            (
+                r#"{"type":"json_schema"}"#,
+                "json_schema.schema is required",
+            ),
+            (
+                r#"{"type":"sql"}"#,
+                "response_format type \"sql\" is not supported",
+            ),
+        ];
+        for (input, want) in cases {
+            let err = SamplerParams::response_format_schema(input).expect_err("should be refused");
+            assert!(err.contains(want), "want \"{want}\" in \"{err}\"");
+        }
     }
 }
