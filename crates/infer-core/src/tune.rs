@@ -27,7 +27,6 @@
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 
 use llama_cpp_4::prelude::*;
@@ -145,7 +144,7 @@ pub enum TuneProgress {
 /// from what the machine actually fits — the sweep never discovers OOM that a
 /// fit check already knew about.
 pub fn quick_plan(max_n_ctx: u32) -> Vec<TuneCandidate> {
-    let tier_a = max_n_ctx.min(4096).max(512);
+    let tier_a = max_n_ctx.clamp(512, 4096);
     let tier_b = max_n_ctx.min(8192);
     let mut tiers = vec![tier_a];
     if tier_b > tier_a {
@@ -239,7 +238,7 @@ fn one_pass(
         .map_err(|e| InferError::Decode(e.to_string()))?;
     let prefill_secs = t0.elapsed().as_secs_f64();
 
-    let mut sampler = LlamaSampler::greedy();
+    let sampler = LlamaSampler::greedy();
 
     // The first token is sampled from the prompt's logits, outside the decode
     // loop: TTFT is prefill plus this one sample, then the loop times decode.
@@ -301,6 +300,21 @@ pub fn run_sweep(
     cancel: &AtomicBool,
     mut progress: impl FnMut(TuneProgress),
 ) -> Result<SweepOutcome> {
+    // A cancel that arrives before the sweep starts must not load weights just
+    // to discover it was already cancelled.
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(SweepOutcome {
+            measurements: Vec::new(),
+            skipped: Vec::new(),
+        });
+    }
+    if !model_path.is_file() {
+        return Err(InferError::ModelLoad(format!(
+            "{} does not exist",
+            model_path.display()
+        )));
+    }
+
     let backend = LlamaBackend::init().map_err(|e| InferError::Backend(format!("{e:?}")))?;
     let model = LlamaModel::load_from_file(
         &backend,
@@ -397,6 +411,7 @@ pub fn run_sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn a_small_context_cap_yields_one_tier() {
@@ -445,8 +460,8 @@ mod tests {
 
     #[test]
     fn a_cancelled_sweep_returns_a_partial_outcome() {
-        // No model here: the point is that the flag short-circuits before any
-        // candidate runs, so the loop structure is checkable without weights.
+        // No model here: cancelling before the first candidate must short-circuit
+        // before any weights are loaded, and the report is empty but valid.
         let cancel = Arc::new(AtomicBool::new(true));
         let outcome = run_sweep(
             Path::new("does-not-matter.gguf"),
@@ -454,10 +469,9 @@ mod tests {
             &quick_plan(4096),
             &cancel,
             |_| {},
-        );
-        // The load itself fails on a missing file — the cancel check sits
-        // inside the candidate loop, which this test does not reach. The
-        // assertion pins the contract that a missing model is a ModelLoad.
-        assert!(matches!(outcome, Err(InferError::ModelLoad(_))));
+        )
+        .expect("a pre-cancelled sweep does not touch the checkpoint");
+        assert!(outcome.measurements.is_empty());
+        assert!(outcome.skipped.is_empty());
     }
 }

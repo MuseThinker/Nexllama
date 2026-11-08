@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::{header, header::AUTHORIZATION, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -1237,12 +1237,14 @@ async fn load(
     // A running sweep holds this checkpoint's weights on the GPU. Loading the
     // same file again would not contend for a lock — it would contend for
     // VRAM, and lose. Wait for the report instead; it is minutes away.
-    if let Some(path) = req.model.as_deref() {
-        if state.tunes.running_for_path(std::path::Path::new(path)) {
-            return Err(ApiError::BadRequest(format!(
-                "a measured-tuning sweep is running against {path}; its report will be at GET /admin/tune"
-            )));
-        }
+    if state
+        .tunes
+        .running_for_path(std::path::Path::new(&req.model))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "a measured-tuning sweep is running against {}; its report will be at GET /admin/tune",
+            req.model
+        )));
     }
     let mut cfg;
     {
@@ -2225,15 +2227,12 @@ async fn tune_start(
                 req.model
             )));
         }
-        let loaded = guard
-            .models
-            .get(&req.model)
-            .ok_or_else(|| ApiError::NotLoaded)?;
+        let loaded = guard.models.get(&req.model).ok_or(ApiError::NotLoaded)?;
         if loaded.info.model_class != "llm" {
-            return Err(ApiError::Unsupported {
-                class: loaded.info.model_class.clone(),
-                what: "be tuned for chat speed — only a chat model has a decode loop".into(),
-            });
+            return Err(ApiError::BadRequest(format!(
+                "model \"{}\" cannot be tuned for chat speed; only a chat model has a decode loop",
+                loaded.info.model_class
+            )));
         }
         let taken = (loaded.path.clone(), loaded.n_gpu_layers, loaded.n_ctx);
         // Free the GPU before the sweep claims it. Drop happens off the async
@@ -2268,7 +2267,7 @@ async fn tune_list(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 async fn tune_status(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .tunes
@@ -2279,7 +2278,7 @@ async fn tune_status(
 
 async fn tune_cancel(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job = state
         .tunes

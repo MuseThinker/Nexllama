@@ -164,7 +164,7 @@ impl TuneRegistry {
             .values()
             .cloned()
             .collect();
-        jobs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        jobs.sort_by_key(|a| std::cmp::Reverse(a.started_at));
         jobs
     }
 
@@ -185,7 +185,7 @@ impl TuneRegistry {
     /// it was started under.
     pub fn running_for_path(&self, path: &std::path::Path) -> bool {
         self.jobs.lock().expect("registry mutex").values().any(|j| {
-            j.model_path == path
+            j.model_path.as_path() == path
                 && matches!(
                     &*j.status.lock().expect("status mutex"),
                     TuneStatus::Running { .. }
@@ -205,7 +205,7 @@ impl TuneJob {
             "depth": self.depth,
             "elapsed_secs": self.started_at.elapsed().as_secs_f64(),
             "cancel_requested": self.cancel.load(Ordering::Relaxed),
-            "status": status,
+            "status": &*status,
         })
     }
 }
