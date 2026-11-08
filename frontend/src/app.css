@@ -1303,6 +1303,12 @@ details.advanced summary {
   margin: 0;
 }
 
+.tune-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .tune-table {
   width: 100%;
   border-collapse: collapse;
@@ -1331,6 +1337,10 @@ details.advanced summary {
 
 .tune-table td code {
   font-size: 12px;
+}
+
+.tune-table tbody tr.selected {
+  background: var(--panel-2);
 }
 
 .tune-skipped {

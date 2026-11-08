@@ -120,7 +120,7 @@ let daemonBusy = $state(false);
 // Measured tuning. A sweep unloads the resident model and owns the GPU while
 // it runs, so there is at most one job on screen at a time and the page polls
 // it instead of holding a request open.
-let tune = $state({ job: null, status: null, busy: false, error: '' });
+let tune = $state({ job: null, status: null, busy: false, error: '', applied: '' });
 const tuneOutcome = $derived(
   tune.status?.status?.outcome ?? tune.status?.status?.partial ?? null,
 );
@@ -138,7 +138,21 @@ const orderedModels = $derived([...localModels].sort((a, b) => classRank(a) - cl
 // released to make room for another of its kind is still listed here: it is one
 // step away from running again, and hiding it would make the list claim fewer
 // models than the user loaded.
-const loadedModels = $derived((status.models ?? []).filter((m) => !m.cloud));
+const loadedModels = $derived(
+  (status.models ?? []).filter((m) => !m.cloud && m.loaded !== false),
+);
+
+// A library row is one bundle; the daemon may know it by the main file's path
+// or by its display name. Either match means "already in memory", so the
+// library must not offer a second load of it.
+function isBundleLoaded(b) {
+  return (status.models ?? []).some(
+    (m) =>
+      m.loaded !== false &&
+      !m.cloud &&
+      (m.path === b.main || m.id === b.name),
+  );
+}
 let modelsDir = $state('');
 
 let hydrated = false;
@@ -465,6 +479,7 @@ async function startTune(m) {
   tune.error = '';
   tune.job = null;
   tune.status = null;
+  tune.applied = '';
   try {
     await ensureDaemon();
     const job = await daemon.tuneStart(m.id);
@@ -504,7 +519,15 @@ function applyTune(c) {
   adv.nUbatch = c.n_ubatch;
   adv.flashAttn = c.flash_attn ? 'on' : 'off';
   persistAdv();
+  tune.applied = c.label;
   notice = $t('models.tuneApplied', { label: c.label });
+}
+
+function closeTune() {
+  tune.job = null;
+  tune.status = null;
+  tune.error = '';
+  tune.applied = '';
 }
 
 async function unload(id) {
@@ -1159,9 +1182,13 @@ async function saveCloud(silent) {
               {fitBusy === b.main ? $t('models.fitting') : $t('models.fit')}
             </button>
             {/if}
-            <button onclick={() => loadBundle(b)} disabled={busy !== ''}>
-              {loadingPath === b.main ? $t('models.loading') : $t('models.load')}
-            </button>
+            {#if isBundleLoaded(b)}
+              <button class="ghost" disabled>{$t('models.loadedState')}</button>
+            {:else}
+              <button onclick={() => loadBundle(b)} disabled={busy !== ''}>
+                {loadingPath === b.main ? $t('models.loading') : $t('models.load')}
+              </button>
+            {/if}
             {#if fitReport?.path === b.main}
               <div class="fit-report" class:warn={!fitReport.fits}>
                 <span>{fitReport.reason}</span>
@@ -1305,9 +1332,11 @@ async function saveCloud(silent) {
                 ctx {m.n_ctx} · GPU {m.n_gpu_layers} · {$t('models.idle')} {m.idle_secs}s
               {/if}
             </span>
-            <button class="ghost" onclick={() => startTune(m)} disabled={busy !== '' || tune.busy}>
-              {$t('models.tune')}
-            </button>
+            {#if m.info?.model_class === 'llm'}
+              <button class="ghost" onclick={() => startTune(m)} disabled={busy !== '' || tune.busy}>
+                {$t('models.tune')}
+              </button>
+            {/if}
             <button class="ghost" onclick={() => unload(m.id)} disabled={busy !== ''}>{$t('models.unload')}</button>
           </li>
         {/each}
@@ -1319,9 +1348,13 @@ async function saveCloud(silent) {
     <section class="card tune-card">
       <div class="tune-head">
         <h3>{$t('models.tuneTitle')}</h3>
-        {#if tunePhase === 'running'}
-          <button class="ghost" onclick={cancelTune}>{$t('models.tuneCancel')}</button>
-        {/if}
+        <div class="tune-actions">
+          {#if tunePhase === 'running'}
+            <button class="ghost" onclick={cancelTune}>{$t('models.tuneCancel')}</button>
+          {:else}
+            <button class="ghost" onclick={closeTune}>{$t('models.tuneClose')}</button>
+          {/if}
+        </div>
       </div>
       <p class="muted">
         {tune.job?.model ?? ''}
@@ -1351,14 +1384,20 @@ async function saveCloud(silent) {
           </thead>
           <tbody>
             {#each tuneRows as r}
-              <tr>
+              <tr class:selected={tune.applied === r.candidate.label}>
                 <td><code>{r.candidate.label}</code></td>
                 <td class="num">{r.tokens_per_second.toFixed(2)} tok/s</td>
                 <td class="num">{Math.round(r.first_token_ms)} ms</td>
                 <td class="num">{Math.round(r.prefill_tokens_per_second)} tok/s</td>
                 <td>
-                  <button class="ghost" onclick={() => applyTune(r.candidate)}>
-                    {$t('models.tuneApply')}
+                  <button
+                    class="ghost"
+                    onclick={() => applyTune(r.candidate)}
+                    disabled={tune.applied === r.candidate.label}
+                  >
+                    {tune.applied === r.candidate.label
+                      ? $t('models.tuneAppliedState')
+                      : $t('models.tuneApply')}
                   </button>
                 </td>
               </tr>
