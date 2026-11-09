@@ -1297,6 +1297,7 @@ details.advanced summary {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
 }
 
 .tune-head h3 {
@@ -1307,6 +1308,31 @@ details.advanced summary {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+/* One control height for the whole row: a select with its own padding next to
+   ghost buttons used to step by 2–3 px, and the label's margin-top dropped the
+   select below the buttons' baseline. */
+.tune-actions .checkline {
+  margin-top: 0;
+  gap: 6px;
+  font-size: 12.5px;
+}
+
+.tune-actions select,
+.tune-actions button {
+  height: 32px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 12px;
+  font-size: 12.5px;
+  line-height: 1;
+}
+
+.tune-actions select {
+  min-width: 104px;
 }
 
 .tune-table {

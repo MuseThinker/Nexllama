@@ -1465,14 +1465,28 @@ async function saveCloud(silent) {
     <div
       class="tune-menu"
       role="menu"
+      tabindex="-1"
       style="left: {tuneMenu.left}px; top: {tuneMenu.top}px"
-      onclick={(e) => e.stopPropagation()}
     >
-      <button type="button" role="menuitem" onclick={() => pickTune(tuneMenu.model, 'quick')}>
+      <button
+        type="button"
+        role="menuitem"
+        onclick={(e) => {
+          e.stopPropagation();
+          pickTune(tuneMenu.model, 'quick');
+        }}
+      >
         <strong>{$t('models.tuneQuick')}</strong>
         <span>{$t('models.tuneQuickHint')}</span>
       </button>
-      <button type="button" role="menuitem" onclick={() => pickTune(tuneMenu.model, 'deep')}>
+      <button
+        type="button"
+        role="menuitem"
+        onclick={(e) => {
+          e.stopPropagation();
+          pickTune(tuneMenu.model, 'deep');
+        }}
+      >
         <strong>{$t('models.tuneDeep')}</strong>
         <span>{$t('models.tuneDeepHint')}</span>
       </button>
