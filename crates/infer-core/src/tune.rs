@@ -14,10 +14,18 @@
 //!
 //! - one fixed prompt, padded to roughly [`PREFILL_TARGET`] tokens;
 //! - one untimed warm-up pass, then [`MEASURE_REPS`] timed passes of
-//!   prefill plus [`MEASURE_GEN_TOKENS`] generated tokens, greedy sampling;
+//!   prefill plus [`MEASURE_GEN_TOKENS`] generated tokens, sampled with the
+//!   same defaults a chat reply uses (temperature 0.8, top-k 40, top-p 0.95,
+//!   thinking at the model's own default);
 //! - the median across passes, because a single pass absorbs host noise;
 //! - draft acceptance is reported alongside speed, since a drafter that is
 //!   wrong is a second forward pass with nothing to show for it.
+//!
+//! Greedy decoding is deliberately *not* used. With temperature 0 and thinking
+//! forced off, the drafter agrees with the target almost every token on a
+//! predictable continuation, which measured ~89% acceptance and ~89 tok/s for
+//! a configuration that a real sampled reply runs at ~13% acceptance and
+//! ~41 tok/s. That is a best case no chat ever sees.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -126,6 +134,38 @@ pub struct SweepOutcome {
     /// Measured candidates, fastest first.
     pub measurements: Vec<TuneMeasurement>,
     pub skipped: Vec<SkippedCandidate>,
+    /// How the numbers were produced. A report without this is a table of
+    /// numbers nobody can reproduce.
+    pub protocol: TuneProtocol,
+}
+
+/// The fixed workload every candidate was measured with.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct TuneProtocol {
+    pub temperature: f32,
+    pub top_k: i32,
+    pub top_p: f32,
+    pub min_p: f32,
+    /// `thinking` was left at the model's own default, not forced either way.
+    pub thinking: &'static str,
+    pub prompt_tokens: usize,
+    pub gen_tokens: usize,
+    pub reps: usize,
+}
+
+impl TuneProtocol {
+    pub fn current() -> Self {
+        Self {
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.95,
+            min_p: 0.05,
+            thinking: "model default",
+            prompt_tokens: PREFILL_TARGET,
+            gen_tokens: MEASURE_GEN_TOKENS,
+            reps: MEASURE_REPS,
+        }
+    }
 }
 
 /// Progress events for a running sweep.
@@ -308,6 +348,7 @@ pub fn run_sweep(
         return Ok(SweepOutcome {
             measurements,
             skipped,
+            protocol: TuneProtocol::current(),
         });
     }
 
@@ -392,6 +433,7 @@ pub fn run_sweep(
     Ok(SweepOutcome {
         measurements,
         skipped,
+        protocol: TuneProtocol::current(),
     })
 }
 
@@ -476,10 +518,16 @@ fn measure_candidate(
 
     let engine = Engine::load(cfg, |_| {})?;
     let prompt = prompt();
-    let params = |max_tokens: usize| SamplerParams {
-        temperature: 0.0,
-        top_k: 1,
-        seed: 1,
+    let params = |max_tokens: usize, seed: u32| SamplerParams {
+        // Match a real chat reply. Greedy decoding hid the cost of a speculative
+        // round: at temperature 0 the drafter imitates the argmax the target
+        // would pick, so acceptance approached 90% on a predictable prompt and
+        // the report promised speeds a sampled reply never reaches.
+        temperature: 0.8,
+        top_k: 40,
+        top_p: 0.95,
+        min_p: 0.05,
+        seed,
         max_tokens,
         // A no-drafter candidate must really be plain decoding. Leaving this
         // on also enables the n-gram drafter, which made the baseline look
@@ -488,20 +536,28 @@ fn measure_candidate(
         // N-gram drafting is not part of this measurement even when a model
         // drafter is loaded; only the model's own proposals should count.
         ngram_m: 1,
-        thinking: Some(false),
+        // Leave thinking to the model, exactly as `thinking: None` does on the
+        // chat path. Forcing it off changed both the text and the acceptance.
+        thinking: None,
         ..SamplerParams::default()
     };
 
     // Warm-up: one-time driver, allocator, and graph costs must not land on a
     // timed pass.
-    let _ = engine.generate(&prompt, &params(WARMUP_TOKENS), |_| true)?;
+    let _ = engine.generate(&prompt, &params(WARMUP_TOKENS, 1), |_| true)?;
 
     let mut runs = Vec::with_capacity(MEASURE_REPS);
-    for _ in 0..MEASURE_REPS {
+    for rep in 0..MEASURE_REPS {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let stats = engine.generate(&prompt, &params(MEASURE_GEN_TOKENS), |_| true)?;
+        // A different seed per pass samples a different reply, so the median
+        // covers the spread a user will actually see instead of timing the
+        // same 256 tokens five times.
+        let stats =
+            engine.generate(&prompt, &params(MEASURE_GEN_TOKENS, 1 + rep as u32), |_| {
+                true
+            })?;
         runs.push(run_stat(&stats));
     }
     if runs.is_empty() {

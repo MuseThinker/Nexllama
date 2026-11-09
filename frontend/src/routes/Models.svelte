@@ -123,6 +123,10 @@ let daemonBusy = $state(false);
 // it instead of holding a request open.
 let tune = $state({ job: null, status: null, busy: false, error: '', applied: '' });
 let tuneSort = $state('decode');
+// One menu at a time, positioned in viewport coordinates. The model list has a
+// capped height and its own scrollbar, so a menu rendered inside a row would be
+// clipped exactly when the row is near the bottom.
+let tuneMenu = $state(null);
 const tuneOutcome = $derived(
   tune.status?.status?.outcome ?? tune.status?.status?.partial ?? null,
 );
@@ -491,6 +495,35 @@ async function persistAutoLoad() {
 
 const tuneSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/// Open the tuning launcher under its button, or above it when the list is
+/// scrolled to the bottom of the window.
+function toggleTuneMenu(e, m) {
+  // The window click handler closes the menu; without stopping the click here
+  // it would close the menu in the same tick it opened.
+  e.stopPropagation();
+  if (tuneMenu?.model?.id === m.id) {
+    tuneMenu = null;
+    return;
+  }
+  const r = e.currentTarget.getBoundingClientRect();
+  const width = 300;
+  const height = 150;
+  const openUp = window.innerHeight - r.bottom < height + 16;
+  const top = openUp ? r.top - height - 6 : r.bottom + 6;
+  tuneMenu = {
+    model: m,
+    left: Math.max(12, Math.min(r.right - width, window.innerWidth - width - 12)),
+    // A row can sit half past the fold; the menu still has to land somewhere
+    // the user can see and click.
+    top: Math.max(12, Math.min(top, window.innerHeight - height - 12)),
+  };
+}
+
+function pickTune(m, depth) {
+  tuneMenu = null;
+  startTune(m, depth);
+}
+
 async function startTune(m, depth = 'quick') {
   if (tune.busy || busy) return;
   if (!window.confirm($t('models.tuneConfirm', { model: m.id }))) return;
@@ -558,10 +591,30 @@ function closeTune() {
 
 function exportTune() {
   if (!tune.status?.status) return;
+  const status = tune.status.status;
+  const outcome = status.outcome ?? status.partial ?? null;
+  // Export exactly what the table shows, in the order the table shows it. The
+  // rows are rounded to the same precision as the cells, so a number copied out
+  // of the JSON matches the screen instead of being a slightly different float.
+  const rows = tuneRowsSorted.map((r, i) => ({
+    rank: i + 1,
+    ...r,
+    decode_tokens_per_second: Number(r.tokens_per_second.toFixed(2)),
+    prefill_tokens_per_second: Number(r.prefill_tokens_per_second.toFixed(2)),
+    draft_acceptance: r.draft_acceptance == null ? null : Number(r.draft_acceptance.toFixed(4)),
+    draft_acceptance_percent:
+      r.draft_acceptance == null ? null : Number((r.draft_acceptance * 100).toFixed(1)),
+  }));
   const payload = {
     model: tune.job?.model ?? '',
     depth: tune.job?.depth ?? 'quick',
-    ...tune.status.status,
+    phase: status.phase,
+    elapsed_secs: status.elapsed_secs ?? null,
+    sort: tuneSort,
+    applied: tune.applied || null,
+    protocol: outcome?.protocol ?? null,
+    measurements: rows,
+    skipped: outcome?.skipped ?? [],
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -974,6 +1027,15 @@ async function saveCloud(silent) {
 }
 </script>
 
+<svelte:window
+  onclick={() => (tuneMenu = null)}
+  onscrollcapture={() => (tuneMenu = null)}
+  onresize={() => (tuneMenu = null)}
+  onkeydown={(e) => {
+    if (e.key === 'Escape') tuneMenu = null;
+  }}
+/>
+
 <div class="page models">
   <header>
     <h2>{$t('models.title')}</h2>
@@ -1382,35 +1444,15 @@ async function saveCloud(silent) {
               {/if}
             </span>
             {#if m.info?.model_class === 'llm'}
-              <details class="tune-picker">
-                <summary class="ghost" class:disabled={busy !== '' || tune.busy}>
-                  {$t('models.tune')} ▾
-                </summary>
-                <div class="tune-menu">
-                  <button
-                    type="button"
-                    onclick={(e) => {
-                      e.currentTarget.closest('details').open = false;
-                      startTune(m, 'quick');
-                    }}
-                    disabled={busy !== '' || tune.busy}
-                  >
-                    <strong>{$t('models.tuneQuick')}</strong>
-                    <span>{$t('models.tuneQuickHint')}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onclick={(e) => {
-                      e.currentTarget.closest('details').open = false;
-                      startTune(m, 'deep');
-                    }}
-                    disabled={busy !== '' || tune.busy}
-                  >
-                    <strong>{$t('models.tuneDeep')}</strong>
-                    <span>{$t('models.tuneDeepHint')}</span>
-                  </button>
-                </div>
-              </details>
+              <button
+                class="ghost"
+                onclick={(e) => toggleTuneMenu(e, m)}
+                disabled={busy !== '' || tune.busy}
+                aria-haspopup="menu"
+                aria-expanded={tuneMenu?.model?.id === m.id}
+              >
+                {$t('models.tune')} ▾
+              </button>
             {/if}
             <button class="ghost" onclick={() => unload(m.id)} disabled={busy !== ''}>{$t('models.unload')}</button>
           </li>
@@ -1418,6 +1460,24 @@ async function saveCloud(silent) {
       </ul>
     {/if}
   </section>
+
+  {#if tuneMenu}
+    <div
+      class="tune-menu"
+      role="menu"
+      style="left: {tuneMenu.left}px; top: {tuneMenu.top}px"
+      onclick={(e) => e.stopPropagation()}
+    >
+      <button type="button" role="menuitem" onclick={() => pickTune(tuneMenu.model, 'quick')}>
+        <strong>{$t('models.tuneQuick')}</strong>
+        <span>{$t('models.tuneQuickHint')}</span>
+      </button>
+      <button type="button" role="menuitem" onclick={() => pickTune(tuneMenu.model, 'deep')}>
+        <strong>{$t('models.tuneDeep')}</strong>
+        <span>{$t('models.tuneDeepHint')}</span>
+      </button>
+    </div>
+  {/if}
 
   {#if tune.job || tune.error}
     <section class="card tune-card">
@@ -1460,6 +1520,15 @@ async function saveCloud(silent) {
         {/if}
       </p>
       {#if tune.error}<p class="error">{tune.error}</p>{/if}
+      {#if tuneOutcome?.protocol}
+        <p class="muted tune-protocol">
+          {$t('models.tuneProtocol', {
+            prompt: tuneOutcome.protocol.prompt_tokens,
+            gen: tuneOutcome.protocol.gen_tokens,
+            reps: tuneOutcome.protocol.reps,
+          })}
+        </p>
+      {/if}
       {#if tuneRows.length > 0}
         <p class="muted tune-ctx">
           {$t('models.tuneCtxAuto', { n: tuneRows[0].candidate.n_ctx })}

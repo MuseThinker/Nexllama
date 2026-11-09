@@ -74,7 +74,9 @@ const dict = {
     'models.tunePrefill': 'Prefill',
     'models.tuneSkipped': '跳过',
     'models.tuneNoResult': '尚无结果',
-    'models.tuneHint': '固定提示与生成长度，3 次取中位数；换一种提示风格排名可能不同。',
+    'models.tuneHint': '固定提示与生成长度，5 次取中位数；测速使用聊天默认采样，换一种提示风格排名可能不同。',
+    'models.tuneProtocol':
+      '测速协议：T=0.8, top-k 40, top-p 0.95, min-p 0.05，思考模式跟随模型，{prompt} 提示 + {gen} 生成 × {reps} 次取中位数',
     'models.tuneAccept': '接受率',
     'models.tuneMode': '优化模式',
     'models.tuneQuick': '标准优化',
@@ -354,7 +356,9 @@ const dict = {
     'models.tunePrefill': 'Prefill',
     'models.tuneSkipped': 'Skipped',
     'models.tuneNoResult': 'No results yet',
-    'models.tuneHint': 'Fixed prompt and generation length, median of 3 runs; another prompt style may rank differently.',
+    'models.tuneHint': 'Fixed prompt and generation length, median of 5 runs sampled like a chat reply; another prompt style may rank differently.',
+    'models.tuneProtocol':
+      'Measured with T=0.8, top-k 40, top-p 0.95, min-p 0.05, thinking at the model default: {prompt} prompt + {gen} generated, median of {reps} runs',
     'models.tuneAccept': 'Acceptance',
     'models.tuneMode': 'Mode',
     'models.tuneQuick': 'Standard tuning',

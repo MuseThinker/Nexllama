@@ -1353,37 +1353,17 @@ details.advanced summary {
 }
 
 /* ── Parameter tuning launcher ─────────────────────────── */
-.tune-picker {
-  position: relative;
-}
-
-.tune-picker summary {
-  list-style: none;
-  cursor: pointer;
-  display: inline-block;
-  user-select: none;
-}
-
-.tune-picker summary::-webkit-details-marker {
-  display: none;
-}
-
-.tune-picker summary.disabled {
-  opacity: 0.5;
-  pointer-events: none;
-}
-
+/* Rendered at the end of the page in viewport coordinates so the model list's
+   capped height cannot clip it. */
 .tune-menu {
-  position: absolute;
-  right: 0;
-  top: calc(100% + 6px);
-  width: 290px;
+  position: fixed;
+  width: 300px;
   padding: 6px;
   background: var(--panel);
   border: 1px solid var(--border-strong);
   border-radius: 10px;
   box-shadow: 0 14px 34px rgba(0, 0, 0, 0.28);
-  z-index: 30;
+  z-index: 60;
 }
 
 .tune-menu button {

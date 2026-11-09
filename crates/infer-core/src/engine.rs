@@ -296,6 +296,12 @@ impl LoadConfig {
 /// It only ever turns drafting off, and only after enough replies to be sure —
 /// which is the safe direction: the worst case is that a speculative setting
 /// quietly stops being used because measurement said it was not helping.
+///
+/// Upper bound on an explicitly requested draft depth. The KV snapshot count is
+/// sized from the same budget, so anything larger would ask for snapshots that
+/// were never allocated.
+pub const MAX_DRAFT_DEPTH: u32 = 16;
+
 #[derive(Debug)]
 pub struct SpecGate {
     /// Smoothed share of drafted tokens the model confirmed.
@@ -310,6 +316,10 @@ pub struct SpecGate {
     resume: f64,
     /// Replies needed before the rate is trusted.
     min_replies: u64,
+    /// The caller set a draft budget explicitly (a tuned depth, or a number in
+    /// the advanced settings). Honouring it is the whole point of measuring
+    /// depths, so the adaptive heuristic must not quietly cap it at two.
+    explicit: bool,
 }
 
 impl SpecGate {
@@ -322,6 +332,7 @@ impl SpecGate {
             floor: 0.0,
             resume: 0.0,
             min_replies: u64::MAX,
+            explicit: false,
         }
     }
 
@@ -341,14 +352,22 @@ impl SpecGate {
 
     /// Draft length to use, scaled by the acceptance measured so far.
     ///
-    /// Two drafts is the measured sweet spot on both a dense and a MoE target:
-    /// the accepted-token count barely moves between one and two, so the second
-    /// draft only has to survive its own verification to pay off, while a third
-    /// is rejected often enough to lose. Under a poor measured acceptance even
-    /// the second draft is not worth its verification pass. `max` is the
-    /// configured budget — also the KV-snapshot count the contexts were built
-    /// with — so the result never exceeds it.
+    /// Two drafts is the measured sweet spot on both a dense and a MoE target
+    /// *when nobody asked for a different number*: the accepted-token count
+    /// barely moves between one and two, so the second draft only has to
+    /// survive its own verification to pay off, while a third is rejected often
+    /// enough to lose. Under a poor measured acceptance even the second draft
+    /// is not worth its verification pass.
+    ///
+    /// An explicit budget — a depth chosen in the advanced settings or picked
+    /// by a tuning sweep — is returned as-is. Capping it at two made every
+    /// tuning row above two measure the same configuration, which is exactly
+    /// the kind of silent mismatch between a report and a real reply this
+    /// sweep is supposed to prevent.
     fn draft_len(&self, max: u32) -> u32 {
+        if self.explicit {
+            return max.clamp(1, MAX_DRAFT_DEPTH);
+        }
         let capped = max.clamp(1, 2);
         match self.accept {
             Some(a) if a < 0.5 => 1,
@@ -388,6 +407,27 @@ mod spec_tests {
             accepted_draft_tokens: accepted,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn an_explicit_depth_is_not_capped_at_two() {
+        let mut g = SpecGate::enabled(0.3);
+        g.explicit = true;
+        // A report that says "d=6" must actually have drafted six tokens.
+        assert_eq!(g.draft_len(6), 6);
+        // The adaptive gate may still switch drafting off entirely.
+        for _ in 0..20 {
+            g.record(&drafted(8, 0));
+        }
+        assert!(!g.allows());
+    }
+
+    #[test]
+    fn the_default_budget_still_adapts() {
+        let mut g = SpecGate::enabled(0.3);
+        assert_eq!(g.draft_len(2), 2);
+        g.record(&drafted(8, 1));
+        assert_eq!(g.draft_len(2), 1);
     }
 
     #[test]
@@ -1403,6 +1443,9 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
     } else {
         SpecGate::open()
     };
+    // A non-zero budget is a deliberate choice: it came from the advanced
+    // settings or from a tuning winner, not from the engine's own default.
+    spec.explicit = cfg.draft_n_max > 0 || cfg.mtp_n_max > 0;
     // Latched off the first time the KV cache refuses to drop rejected draft
     // tokens (hybrid models), so only one request pays for finding out.
     let drafting = Arc::new(AtomicBool::new(true));
