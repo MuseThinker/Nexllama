@@ -122,7 +122,6 @@ let daemonBusy = $state(false);
 // it runs, so there is at most one job on screen at a time and the page polls
 // it instead of holding a request open.
 let tune = $state({ job: null, status: null, busy: false, error: '', applied: '' });
-let tuneDepth = $state('quick');
 let tuneSort = $state('decode');
 const tuneOutcome = $derived(
   tune.status?.status?.outcome ?? tune.status?.status?.partial ?? null,
@@ -492,7 +491,7 @@ async function persistAutoLoad() {
 
 const tuneSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function startTune(m) {
+async function startTune(m, depth = 'quick') {
   if (tune.busy || busy) return;
   if (!window.confirm($t('models.tuneConfirm', { model: m.id }))) return;
   tune.busy = true;
@@ -502,7 +501,7 @@ async function startTune(m) {
   tune.applied = '';
   try {
     await ensureDaemon();
-    const job = await daemon.tuneStart(m.id, tuneDepth);
+    const job = await daemon.tuneStart(m.id, depth);
     tune.job = job;
     // The daemon unloaded the resident instance before the sweep started.
     await refresh();
@@ -561,7 +560,7 @@ function exportTune() {
   if (!tune.status?.status) return;
   const payload = {
     model: tune.job?.model ?? '',
-    depth: tune.job?.depth ?? tuneDepth,
+    depth: tune.job?.depth ?? 'quick',
     ...tune.status.status,
   };
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
@@ -1344,19 +1343,7 @@ async function saveCloud(silent) {
 
   <!-- 已加载（运行中） -->
   <section class="card">
-    <div class="row space">
-      <h3>{$t('models.loaded')} ({loadedModels.length})</h3>
-      <label class="checkline">
-        {$t('models.tuneMode')}
-        <select bind:value={tuneDepth} disabled={tunePhase === 'running'}>
-          <option value="quick">{$t('models.tuneQuick')}</option>
-          <option value="deep">{$t('models.tuneDeep')}</option>
-        </select>
-      </label>
-    </div>
-    {#if tuneDepth === 'deep'}
-      <p class="muted">{$t('models.tuneDeepHint')}</p>
-    {/if}
+    <h3>{$t('models.loaded')} ({loadedModels.length})</h3>
     {#if loadedModels.length === 0}
       <p class="muted">{$t('models.none')}</p>
     {:else}
@@ -1395,9 +1382,35 @@ async function saveCloud(silent) {
               {/if}
             </span>
             {#if m.info?.model_class === 'llm'}
-              <button class="ghost" onclick={() => startTune(m)} disabled={busy !== '' || tune.busy}>
-                {$t('models.tune')}
-              </button>
+              <details class="tune-picker">
+                <summary class="ghost" class:disabled={busy !== '' || tune.busy}>
+                  {$t('models.tune')} ▾
+                </summary>
+                <div class="tune-menu">
+                  <button
+                    type="button"
+                    onclick={(e) => {
+                      e.currentTarget.closest('details').open = false;
+                      startTune(m, 'quick');
+                    }}
+                    disabled={busy !== '' || tune.busy}
+                  >
+                    <strong>{$t('models.tuneQuick')}</strong>
+                    <span>{$t('models.tuneQuickHint')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onclick={(e) => {
+                      e.currentTarget.closest('details').open = false;
+                      startTune(m, 'deep');
+                    }}
+                    disabled={busy !== '' || tune.busy}
+                  >
+                    <strong>{$t('models.tuneDeep')}</strong>
+                    <span>{$t('models.tuneDeepHint')}</span>
+                  </button>
+                </div>
+              </details>
             {/if}
             <button class="ghost" onclick={() => unload(m.id)} disabled={busy !== ''}>{$t('models.unload')}</button>
           </li>
