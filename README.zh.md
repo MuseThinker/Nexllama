@@ -11,29 +11,31 @@
 
 ## ✨ Nexllama
 
-Nexllama 是一个对硬件有感知能力的一体化本地推理桌面与 API 网关，对 llama.cpp 只做封装、不改动内核。GGUF 模型可以自动下载、一键导入，模型库与 OpenAI 兼容接口一应俱全；不需要自己编译，也不用手工去调 GPU 卸载层数与后端——程序会探测本机硬件并据此完成适配。原生支持 MTP、DFlash2、EAGLE-3、n-gram 投机解码与前缀缓存，并能判断收益、在划不来时自动停用加速。面向 Agent 场景做了优化：流式输出可中断、原生工具调用、模型名容错解析。本地 GGUF 与云端大模型共用一个 API 端点，可选的算力路由能在本地吃不消时平滑切到云端；路由默认关闭、不绑定任何厂商，同时完整保留 llama.cpp 的原生推理性能。
+Nexllama 是一个对硬件有感知能力的一体化本地推理桌面与 API 网关，对 llama.cpp 只做封装、不改动内核。同一个进程同时提供对话、向量、重排与语音合成，共用一套 GGUF 模型库和同一个 OpenAI 兼容端口；模型自动下载、一键导入。不需要自己编译，也不用手工去调 GPU 卸载层数——程序会探测本机硬件并据此完成适配。原生支持 MTP、DFlash2、EAGLE-3、n-gram 投机解码与前缀缓存，KV 缓存默认 `q8_0`，并提供实测参数优化：在你这台机器上真实测试草稿器、草稿深度与批处理形状，而不是照搬经验值。面向 Agent 场景做了优化：流式输出可中断、原生工具调用、模型名容错解析。本地 GGUF 与云端大模型共用一个 API 端点，可选的算力路由默认关闭、不绑定任何厂商，同时完整保留 llama.cpp 的原生推理性能。
 
 ## 🚀 核心亮点
 
 | 特性 | 说明 |
 |---|---|
 | **一体化 All-in-One** | 直接使用原生 llama.cpp，只是把命令行换成了图形界面：模型库、下载器与 OpenAI 兼容 API 全部内置。装完即用，不必再配依赖，也不用记各种参数。 |
-| **硬件自适应** | 推理层数、上下文长度与显存卸载，都由 llama.cpp 自带的 fit 助手推算，不靠估摸；后端按实际硬件来选；本机需要、而安装包里没有的后端，会依据签名清单按需下载、校验并安装。 |
-| **推理够快** | 原生支持 MTP、DFlash2、EAGLE-3 与 n-gram 投机解码，自适应闸门会在收益消失的瞬间停用加速；前缀缓存则消掉长对话中占大头的重复预填充——两者按模型择一生效，从不叠加。 |
+| **四种负载，一个端口** | 对话、向量、重排、语音合成共用一套模型库和同一个 OpenAI 兼容端点：`/v1/chat/completions`、`/v1/embeddings`、`/v1/rerank`、`/v1/audio/speech`，视觉投影器走对话链路。只启动一个守护进程，只盯一处状态，不用为每种负载各维护一套服务。 |
+| **实测参数优化，不靠猜** | 0.2.0 的两级实测会真正加载检查点，在你这张卡上测：草稿器（无、MTP、DFlash2、EAGLE-3）、草稿深度 1/2/3/4/6、flash attention 与安全批处理形状。标准模式在草稿器冠军上再交叉四种批处理；深度模式交叉前两名草稿配置，每候选 5 次 256 token 采样取中位数，报告可按解码 / Prefill / 接受率 / 综合排序，并可导出 JSON。 |
+| **自己适配机器** | 上下文由显存和模型推导，从不作为调优项；KV 缓存默认 `q8_0`。稠密模型装不下时，只把显存装得下的层卸载到 GPU；MoE 模型则把最少数量的专家层留在 CPU，并给 GPU 2 GiB 专家缓存，而不是固定搬走八层；安装包缺的后端会按签名清单按需下载。 |
+| **快得诚实** | 原生 MTP、DFlash2、EAGLE-3 与 n-gram 投机解码，自适应闸门在收益消失时立刻停用；前缀缓存消掉重复预填充。测速按真实聊天采样（T=0.8、思考模式跟随模型），报告里的速度就是实际能拿到的速度，而不是贪心解码的上限。 |
 | **为 Agent 而生** | 提供 OpenAI 兼容端点，OpenClaw、Hermes 以及各类 SDK 客户端无需改动即可接入；原生工具调用、可取消的流式输出、略微过期的模型名也能解析，出错时给出足以据以处理的信息。 |
 | **本地与云端统一** | 本地模型与云厂商直连服务跑在同一个端口上，可选的 `auto` 策略让活儿尽量留在本机、只把本机不擅长的部分送出去——同样的质量、更低的账单，且不锁定任何厂商。 |
 
 > 仓库简介（英文 / GitHub repo description）：*Nexllama is a hardware-aware
-> all-in-one desktop inference and API gateway, losslessly wrapping llama.cpp. It
-> supports auto-download and one-click import for GGUF models with a built-in model
-> repository and OpenAI-compatible API. No manual compilation or GPU layer tuning;
-> hardware resources are auto-detected and optimized. Native support for MTP,
-> DFlash2, EAGLE-3, n-gram speculative decoding and prefix caching, with an
-> evaluator to toggle acceleration. Optimized for Agents, it supports stream
-> cancellation, native tool calling and model name parsing. Unify local GGUF and
-> cloud LLMs under one API endpoint. Optional routing falls back to cloud when local
-> hardware hits limits, disabled by default, vendor-agnostic while preserving full
-> llama.cpp performance.*
+> all-in-one desktop inference and API gateway, losslessly wrapping llama.cpp. One
+> process serves chat, embeddings, reranking and speech synthesis from a built-in
+> GGUF model library over an OpenAI-compatible API. No manual compilation or GPU
+> layer tuning: context and placement are derived from the hardware, the KV cache
+> defaults to q8_0, and a measured two-tier tuning sweep picks the drafter, draft
+> depth and batch shape on the actual GPU. Native MTP, DFlash2, EAGLE-3, n-gram
+> speculative decoding and prefix caching. Optimized for Agents with stream
+> cancellation, native tool calling and tolerant model name parsing. Local and
+> cloud models share one endpoint, with optional vendor-agnostic fallback that is
+> off by default.*
 
 ---
 
@@ -221,15 +223,23 @@ POST /admin/routing {"enabled":true,"prefer":"local"}
 
 `POST /admin/fit` 接受一个 GGUF 路径——文件还没下载时，只给一个 `size_bytes` 也行——回答你：装不装得下、需要多少内存对比还剩多少、llama.cpp 会选多大的 `n_gpu_layers` 与 `n_ctx`、如果是权重本身太大就建议换一个更小的量化，以及一句人话的 `reason`。应用里对每个模型提供**检查适配**与**采用**。默认只作建议；打开 `strict_fit: true` 就会直接拒绝加载。
 
+上下文是推导出来的，不是让用户填的：`n_ctx` 按空闲显存与该模型每个 token 的 KV 开销计算，并按默认的 `q8_0` 缓存折算，而不是按 f16 的最坏情况。放置遵循同一原则：稠密模型装不下时，只把空闲显存装得下的层留在 GPU；MoE 模型则把能补上缺口的最少专家层放到 CPU，并给 GPU 2 GiB 专家缓存，而不是无论模型多大都固定搬走八层。
+
 ### 参数优化（实测优选）
 
-适配检查回答的是**能不能跑**，参数优化回答的是**该怎么跑**。静态拟合无法知道 flash attention 在你这张卡上是否真有收益、更大的微批对 prefill 帮助多大——这取决于驱动和硅片本身。`POST /admin/tune {"model": "<常驻模型id>", "depth": "quick"}` 只加载一次检查点，然后对每个候选配置实测真实的"预填充+生成"：flash attention 开与关、两种微批大小、至多两档上下文——最多八个候选。
+适配检查回答的是**能不能跑**，参数优化回答的是**该怎么跑**。静态拟合无法知道 flash attention 在你这张卡上是否真有收益、草稿器该开多深、更大的微批对 prefill 帮助多大——这取决于驱动和硅片本身。`POST /admin/tune {"model": "<常驻模型id>", "depth": "quick" | "deep"}` 会真正加载检查点，对每个候选配置实测真实生成。
 
-测量协议固定不变，因此两次结果可比：一条固定的 256 token 提示、生成 128 token、贪心采样、一次不计时的预热、每个候选计时三次、取中位数，并且每次计时都完整保留，波动一目了然。某个候选的 context 建不起来——通常是大上下文显存不够——会跳过并注明原因，其余候选继续。
+参数优化分三个阶段：
+
+1. **草稿器与深度**——不开草稿器、内置 MTP 头、外挂 DFlash/EAGLE 检查点，以及深度 1、2、3、4、6。
+2. **批处理形状**——第一阶段的冠军交叉四种安全的 flash attention / 微批 / 批处理组合。
+3. **深度交叉（仅深度模式）**——取前两名**不同**的草稿配置，交叉安全批处理矩阵，让第二名草稿器有机会在别的批处理形状下证明自己。完整笛卡尔积被有意排除：那要多加载几十次，而差异通常已经在噪声以下。
+
+测量协议贴近真实聊天，而不是取上限：一条固定的 256 token 提示、生成 256 token、温度 0.8、top-k 40、top-p 0.95、min-p 0.05，思考模式跟随模型，一次不计时的预热，加五次不同 seed 的计时，取中位数，并且每次计时都完整保留，波动一目了然。采样方式很关键：温度 0 且强制关闭思考时，草稿器几乎每个 token 都和目标一致，报出来的解码速度大约是真实采样回复的两倍。某个候选的 context 建不起来——通常是显存不够——会跳过并注明原因，其余候选继续。
 
 sweep 会先卸载常驻实例、自己加载检查点，显存绝不会同时持有两份；sweep 进行中加载同一文件会被拒绝，直到报告出炉。进度与排名报告读 `GET /admin/tune/{id}`，进行中的任务用 `POST /admin/tune/{id}/cancel` 停止，部分报告依然保留。确认最优配置就是一次普通的 `/admin/load`——不用学任何新东西。报告是建议而非承诺：sweep 测的是固定负载，换一种提示风格，候选的排名可能不一样。
 
-模型页把同一套 sweep 做成了“实测优选”按钮：显示进度与排名报告，并可把选中的一行写回加载参数。
+模型页把同一套 sweep 做成“参数优化 ▾”下拉，里面是**标准优化**与**深度优化**两个选项，各自带一句说明：显示进度与排名报告，可按解码速度 / Prefill / 接受率 / 综合排序，能把表格原样导出为 JSON，并可把选中的一行写回加载参数。上下文长度只在报告里展示，从不作为候选。
 
 ### 前缀缓存与运行指标
 
@@ -266,7 +276,7 @@ models/Qwen2.5-VL-7B/
 
 对话模型是拿来聊、拿来评估的；编码器是给程序指过去用的。两者都不会出现在不该出现的地方。
 
-### 向量、重排与视觉
+### 向量、重排、视觉与语音
 
 - **`/v1/embeddings`**——OpenAI 的响应格式，向量为单位长度；如果直接给出池化后的原始输出，点积就会随文本长短而变。上下文按模型类别配置，而不是靠某个开关。超过上下文的输入会报错并写明上限，绝不悄悄截断。
 - **`/v1/rerank`**——Cohere/Jina 的响应格式。输入按 `BOS query SEP document EOS` 拼好，也就是分类头训练时用的句对；NaN 分数排在最后，坏掉的头不会被评为最佳匹配。

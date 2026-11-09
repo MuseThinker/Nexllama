@@ -13,36 +13,42 @@ hardware fitting, speculative decoding, prefix cache, one local/cloud endpoint.*
 ## ✨ Nexllama
 
 Nexllama is a hardware-aware all-in-one desktop inference and API gateway,
-losslessly wrapping llama.cpp. It supports auto-download and one-click import for
-GGUF models with a built-in model repository and OpenAI-compatible API. No manual
-compilation or GPU layer tuning; hardware resources are auto-detected and
-optimized. Native support for MTP, DFlash2, EAGLE-3, n-gram speculative decoding
-and prefix caching, with an evaluator to toggle acceleration. Optimized for Agents,
-it supports stream cancellation, native tool calling and model name parsing. Unify
-local GGUF and cloud LLMs under one API endpoint. Optional routing falls back to
-cloud when local hardware hits limits, disabled by default, vendor-agnostic while
-preserving full llama.cpp performance.
+losslessly wrapping llama.cpp. One process serves chat, embeddings, reranking and
+speech synthesis, all from the same GGUF model library and the same
+OpenAI-compatible port. Models download automatically or import in one click; there
+is no manual compilation and no GPU-layer guesswork, because the hardware is
+detected and configured for you. Native support for MTP, DFlash2, EAGLE-3 and
+n-gram speculative decoding, prefix caching, a `q8_0` KV cache by default, and a
+measured tuning sweep that tests real drafter, draft-depth and batch
+configurations on your machine instead of trusting a rule of thumb. Optimized for
+Agents, it supports stream cancellation, native tool calling and model name
+parsing. Local GGUF and cloud LLMs share one endpoint, with optional fallback to
+cloud, off by default and vendor-agnostic, while preserving full llama.cpp
+performance.
 
 ## 🚀 Core highlights
 
 | Feature | What it is |
 |---|---|
 | **All-in-One** | llama.cpp used as it is, behind a desktop interface instead of a command line, with the model library, the downloader and the API included. There is nothing else to install and no flags to learn. |
-| **Adaptive hardware fitting** | Layer counts, context length and offload come from llama.cpp's own fitting helpers rather than from an estimate; the backend is chosen from the hardware actually present; a backend the machine needs but the package does not carry is downloaded, verified and installed from a signed manifest on demand. |
-| **Blazing-fast inference** | Native MTP, DFlash2, EAGLE-3 and n-gram speculative decoding, behind an adaptive gate that switches drafting off the moment it stops paying. A prefix cache removes the repeated prefill that dominates time-to-first-token in a long conversation — the two take effect per model, never stacked. |
+| **Four workloads, one port** | Chat, embeddings, reranking and speech synthesis run from one model library and one OpenAI-compatible endpoint: `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/audio/speech`, with vision projectors on the chat path. One daemon to start, one place to watch, no per-workload server to keep in sync. |
+| **Measured tuning, not guesswork** | 0.2.0's two-tier sweep loads the checkpoint and measures what actually happens on this GPU: drafter family (none, MTP, DFlash2, EAGLE-3), draft depth 1/2/3/4/6, flash attention and safe batch shapes. Standard mode follows the drafter winner with four batch variants; deep mode crosses the top two drafter configurations, 5 sampled passes of 256 tokens each, median reported, sortable by decode/prefill/acceptance and exportable as JSON. |
+| **Fits itself to the machine** | Context is derived from VRAM and the checkpoint, never offered as a tuning knob. The KV cache defaults to `q8_0`; a dense model that does not fit offloads only the layers the free VRAM can hold, a MoE model keeps the minimum experts on the CPU plus a GPU expert cache, and a backend the machine needs but the package does not carry is downloaded from a signed manifest on demand. |
+| **Blazing-fast inference, honestly measured** | Native MTP, DFlash2, EAGLE-3 and n-gram speculative decoding behind an adaptive gate that switches drafting off the moment it stops paying, plus a prefix cache that removes repeated prefill. Tuning samples like a real reply (T=0.8, model-default thinking), so the reported speed is the speed you get, not a greedy best case. |
 | **Built for agents** | An OpenAI-compatible endpoint that OpenClaw, Hermes and SDK clients drive unchanged, native tool calling, streaming that can be cancelled, model names that still resolve when slightly stale, and failures reported with the facts needed to act on them. |
 | **Local and cloud, unified** | Local models and direct cloud vendors are served from the same port, and an optional `auto` policy keeps work on the machine and moves only what the machine cannot do well — a lower bill at the same quality, with no provider lock-in. |
 
 > Repository description (for GitHub): *Nexllama is a hardware-aware all-in-one
-> desktop inference and API gateway, losslessly wrapping llama.cpp. It supports
-> auto-download and one-click import for GGUF models with a built-in model repository
-> and OpenAI-compatible API. No manual compilation or GPU layer tuning; hardware
-> resources are auto-detected and optimized. Native support for MTP, DFlash2,
-> EAGLE-3, n-gram speculative decoding and prefix caching, with an evaluator to
-> toggle acceleration. Optimized for Agents, it supports stream cancellation, native
-> tool calling and model name parsing. Unify local GGUF and cloud LLMs under one API
-> endpoint. Optional routing falls back to cloud when local hardware hits limits,
-> disabled by default, vendor-agnostic while preserving full llama.cpp performance.*
+> desktop inference and API gateway, losslessly wrapping llama.cpp. One process
+> serves chat, embeddings, reranking and speech synthesis from a built-in GGUF
+> model library over an OpenAI-compatible API. No manual compilation or GPU layer
+> tuning: context and placement are derived from the hardware, the KV cache
+> defaults to q8_0, and a measured two-tier tuning sweep picks the drafter, draft
+> depth and batch shape on the actual GPU. Native MTP, DFlash2, EAGLE-3, n-gram
+> speculative decoding and prefix caching. Optimized for Agents with stream
+> cancellation, native tool calling and tolerant model name parsing. Local and
+> cloud models share one endpoint, with optional vendor-agnostic fallback that is
+> off by default.*
 
 ---
 
@@ -285,22 +291,44 @@ weights themselves are the problem, and a `reason` in plain language. The applic
 exposes **Check fit** and **Adopt** per model. The verdict is advice by default;
 `strict_fit: true` refuses a load outright on request.
 
+Context is derived, never asked for: `n_ctx` is sized from free VRAM and the
+checkpoint's KV bytes per token, with the `q8_0` cache — the default — accounted
+for at its smaller footprint instead of the f16 worst case. Placement follows the
+same principle: a dense model that does not fit keeps only as many layers on the
+GPU as the free VRAM can hold, and a MoE model keeps the smallest number of expert
+layers on the CPU that closes the gap, with a 2 GiB GPU expert cache, rather than
+moving a fixed eight layers regardless of the model.
+
 ### Measured tuning
 
 The fit check answers *whether* a model runs; tuning answers *how it should
 run*. Static fitting cannot know whether flash attention actually pays on this
-GPU or how much a larger micro-batch helps prefill here — those depend on the
-driver and the silicon. `POST /admin/tune {"model": "<resident-id>",
-"depth": "quick"}` loads the checkpoint once and measures real
-prefill-plus-generation passes for each candidate configuration: flash attention
-on and off, two micro-batch sizes, and up to two context tiers — eight
-candidates at most.
+GPU, how deep a drafter should go, or how much a larger micro-batch helps prefill
+here — those depend on the driver and the silicon. `POST /admin/tune
+{"model": "<resident-id>", "depth": "quick" | "deep"}` loads the checkpoint and
+measures real generations for each candidate.
 
-The protocol is fixed, so two runs compare: one fixed 256-token prompt, 128
-generated tokens, greedy sampling, one untimed warm-up pass, three timed passes
-per candidate, median reported, every pass included so the spread is visible.
-A candidate whose context will not build — usually VRAM for a larger context —
-is skipped with the reason, and the rest of the sweep continues.
+Tuning has three stages:
+
+1. **Drafter and depth** — no drafter, the bundled MTP head, a side-mounted
+   DFlash/EAGLE checkpoint, and draft depths 1, 2, 3, 4 and 6.
+2. **Batch shape** — the stage-1 winner crossed with four safe flash-attention
+   and micro-batch/batch combinations.
+3. **Deep cross (deep mode only)** — the top two *distinct* drafter
+   configurations crossed with the safe batch matrix, so a second drafter can
+   prove itself under a different batch shape. The full Cartesian product is
+   bounded away on purpose; it costs a lot of loads for differences usually below
+   the noise floor.
+
+The protocol mirrors a real chat rather than a best case: one fixed 256-token
+prompt, 256 generated tokens, temperature 0.8, top-k 40, top-p 0.95, min-p 0.05,
+thinking left at the model's default, one untimed warm-up and five timed passes
+with a different seed each, median reported, every pass included so the spread is
+visible. Sampling matters: at temperature 0 with thinking forced off, a drafter
+agreed with the target on almost every token and reported roughly double the
+decode speed a sampled reply actually reaches. A candidate whose context will not
+build — usually VRAM — is skipped with the reason, and the rest of the sweep
+continues.
 
 The sweep unloads the resident instance first and loads the checkpoint itself,
 so VRAM is never held twice; loading the same file mid-sweep is refused until
@@ -308,10 +336,14 @@ the report lands. Progress and the ranked report are read from
 `GET /admin/tune/{id}`, a running sweep stops on
 `POST /admin/tune/{id}/cancel` and keeps its partial report. Confirming a
 winner is an ordinary `/admin/load` with the tuned parameters — nothing new to
-learn. The report is advice, not a promise: the sweep measures a fixed
-workload, and a different prompt mix can rank the candidates differently.
+learn. The report is advice, not a promise: the sweep measures a fixed workload,
+and a different prompt mix can rank the candidates differently.
 
-The Models page exposes the same sweep as a **Tune** button: it shows progress, the ranked report, and writes a chosen row back into the load form.
+The Models page exposes the same sweep as a **Tune** dropdown with **Standard**
+and **Deep** options and a one-line description of each: it shows progress, lets
+the report be sorted by decode speed, prefill, acceptance rate or a balanced
+score, exports the exact ranked table as JSON, and writes a chosen row back into
+the load form. Context length is shown in the report but is never a candidate.
 
 ### Prefix cache and runtime figures
 
@@ -361,7 +393,7 @@ several unrelated models is listed file by file, since ownership cannot be infer
 A chat model is something one converses with to evaluate it; an encoder is something a
 program points at. Neither is offered where the other belongs.
 
-### Embeddings, reranking and vision
+### Embeddings, reranking, vision and speech
 
 - **`/v1/embeddings`** — OpenAI response shape with unit-length vectors; raw pooled
   output would make a dot product depend on text length. The context is configured from
