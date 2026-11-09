@@ -81,6 +81,19 @@ pub enum FlashAttn {
     Off,
 }
 
+/// Precision of the K/V cache.
+///
+/// q8_0 is the default: it is effectively lossless for chat, halves the KV
+/// footprint, and is what lets `fit::auto_ctx` grant a larger context. f16 is
+/// kept for backends where quantized V is unavailable (flash attention off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KvCacheType {
+    F16,
+    #[default]
+    Q8_0,
+}
+
 /// A LoRA adapter applied to the model at load time.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LoraAdapter {
@@ -130,6 +143,13 @@ pub struct LoadConfig {
     pub load_mode: LoadMode,
     pub use_mlock: bool,
     pub flash_attn: FlashAttn,
+    /// Precision of the K cache. Defaults to q8_0.
+    #[serde(default)]
+    pub cache_type_k: KvCacheType,
+    /// Precision of the V cache. Defaults to q8_0; falls back to f16 when
+    /// flash attention is off, because quantized V needs it.
+    #[serde(default)]
+    pub cache_type_v: KvCacheType,
     pub offload_kqv: bool,
     /// RoPE base frequency. 0.0 = model default.
     pub rope_freq_base: f32,
@@ -243,6 +263,8 @@ impl LoadConfig {
             load_mode: LoadMode::Auto,
             use_mlock: false,
             flash_attn: FlashAttn::Auto,
+            cache_type_k: KvCacheType::Q8_0,
+            cache_type_v: KvCacheType::Q8_0,
             offload_kqv: true,
             rope_freq_base: 0.0,
             rope_freq_scale: 0.0,
@@ -1093,6 +1115,16 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
             .with_flash_attn_type(flash)
             .with_offload_kqv(cfg.offload_kqv)
             .with_n_rs_seq(rs_seq);
+        // Quantized V needs flash attention; without it, leave both caches at
+        // llama.cpp's f16 default rather than failing the load.
+        if !matches!(flash, LlamaFlashAttnType::Disabled) {
+            if cfg.cache_type_k == KvCacheType::Q8_0 {
+                ctx_params = ctx_params.with_cache_type_k(llama_cpp_4::quantize::GgmlType::Q8_0);
+            }
+            if cfg.cache_type_v == KvCacheType::Q8_0 {
+                ctx_params = ctx_params.with_cache_type_v(llama_cpp_4::quantize::GgmlType::Q8_0);
+            }
+        }
         if cfg.moe_cache_mib > 0 && cfg.n_cpu_moe > 0 {
             ctx_params = ctx_params.with_moe_cache_size(cfg.moe_cache_mib as usize * 1024 * 1024);
         }

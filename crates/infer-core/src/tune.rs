@@ -29,10 +29,10 @@ use crate::sampler::SamplerParams;
 use crate::types::{ChatMsg, GenStats};
 
 /// Generated tokens per timed pass.
-pub const MEASURE_GEN_TOKENS: usize = 128;
+pub const MEASURE_GEN_TOKENS: usize = 256;
 
 /// Timed passes per candidate. Three gives a median that survives one outlier.
-pub const MEASURE_REPS: usize = 3;
+pub const MEASURE_REPS: usize = 5;
 
 /// The prompt is padded to roughly this many tokens by repeating [`PROMPT_SEED`].
 pub const PREFILL_TARGET: usize = 256;
@@ -134,6 +134,10 @@ pub enum TuneProgress {
     Started {
         total: usize,
     },
+    /// Emitted after stage one, once the cross-check set is known.
+    Planned {
+        total: usize,
+    },
     CandidateStarted {
         index: usize,
         label: String,
@@ -148,92 +152,238 @@ pub enum TuneProgress {
     },
 }
 
-/// The matrix a sweep measures.
+/// Stage one of the sweep: the drafter family and its depth, measured at the
+/// reference batch shape. Context stays whatever `fit::auto_ctx` chose.
 ///
-/// The drafter family and depth are the high-value knobs; flash attention and
-/// the batch shape follow at the fixed context. A model with neither an MTP head
-/// nor a side checkpoint gets only the non-drafting candidates.
+/// The winner of this stage is then crossed with flash attention and the batch
+/// shape by [`cross_plan`]. That two-stage shape is deliberate: crossing every
+/// drafter with every batch setting would be 14 x 4 loads, most of which cannot
+/// beat the winner.
 pub fn quick_plan(caps: &TuneCapabilities) -> Vec<TuneCandidate> {
-    let n_ctx = caps.n_ctx.max(2048);
     let mut plan = Vec::new();
-    let push = |plan: &mut Vec<TuneCandidate>, drafter, depth, fa, n_batch, n_ubatch| {
-        let name = match drafter {
-            Drafter::None => "draft=none".to_string(),
-            Drafter::Mtp => format!("MTP-head d={depth}"),
-            Drafter::Draft => format!("{} d={depth}", caps.draft_label),
-        };
-        plan.push(TuneCandidate {
-            label: format!(
-                "{name} fa={} ubatch={n_ubatch} batch={n_batch}",
-                if fa { "on" } else { "off" }
-            ),
-            n_ctx,
-            n_batch,
-            n_ubatch,
-            flash_attn: fa,
-            drafter,
-            draft_n_max: depth,
-        });
-    };
-
-    // The reference: no drafter, flash attention on, the default batch.
-    push(&mut plan, Drafter::None, 0, true, 2048, 512);
+    plan.push(candidate(caps, Drafter::None, 0, true, 2048, 512));
     if caps.has_mtp {
         for depth in [1, 2, 3, 4, 6] {
-            push(&mut plan, Drafter::Mtp, depth, true, 2048, 512);
+            plan.push(candidate(caps, Drafter::Mtp, depth, true, 2048, 512));
         }
     }
     if caps.draft_model.is_some() {
         for depth in [1, 2, 3, 4, 6] {
-            push(&mut plan, Drafter::Draft, depth, true, 2048, 512);
+            plan.push(candidate(caps, Drafter::Draft, depth, true, 2048, 512));
         }
     }
-    // Non-drafting variants, so the winner is not judged against only one
-    // flash-attention or batch setting.
-    push(&mut plan, Drafter::None, 0, false, 2048, 512);
-    push(&mut plan, Drafter::None, 0, true, 2048, 2048);
-    push(&mut plan, Drafter::None, 0, true, 4096, 1024);
     plan
 }
 
-/// Run one sweep. `base` carries the model path and the settings shared by every
-/// candidate; only the fields in [`TuneCandidate`] are overridden.
+/// Stage two: the stage-one winner with flash attention and batch alternatives.
+///
+/// The drafter and depth are carried over unchanged, so the comparison answers
+/// "what is the best batch shape *for this drafter*", not "what is the best
+/// batch shape for a different configuration".
+pub fn cross_plan(best: &TuneCandidate) -> Vec<TuneCandidate> {
+    let name = best
+        .label
+        .split(" fa=")
+        .next()
+        .unwrap_or("draft")
+        .to_string();
+    let mut out = Vec::new();
+    for (fa, n_batch, n_ubatch) in [
+        (false, best.n_batch, best.n_ubatch),
+        (true, best.n_batch, 2048),
+        (true, best.n_batch, 1024),
+        (true, 4096, 1024),
+    ] {
+        if fa == best.flash_attn && n_batch == best.n_batch && n_ubatch == best.n_ubatch {
+            continue;
+        }
+        out.push(TuneCandidate {
+            label: format!(
+                "{name} fa={} ubatch={n_ubatch} batch={n_batch}",
+                if fa { "on" } else { "off" }
+            ),
+            n_ctx: best.n_ctx,
+            n_batch,
+            n_ubatch,
+            flash_attn: fa,
+            drafter: best.drafter,
+            draft_n_max: best.draft_n_max,
+        });
+    }
+    out
+}
+
+/// Deep mode: the top two drafter configurations crossed with the full batch
+/// matrix. Bounded on purpose — the full 11 x 12 Cartesian product is over a
+/// hundred loads for differences that are usually below the noise floor.
+pub fn deep_cross_plan(winners: &[TuneCandidate]) -> Vec<TuneCandidate> {
+    let mut out = Vec::new();
+    for base in winners.iter().take(2) {
+        let name = base
+            .label
+            .split(" fa=")
+            .next()
+            .unwrap_or("draft")
+            .to_string();
+        for fa in [false, true] {
+            for n_ubatch in [512, 1024, 2048] {
+                for n_batch in [2048, 4096] {
+                    if n_batch == 4096 && n_ubatch > 1024 {
+                        continue;
+                    }
+                    if fa == base.flash_attn && n_batch == base.n_batch && n_ubatch == base.n_ubatch
+                    {
+                        continue;
+                    }
+                    out.push(TuneCandidate {
+                        label: format!(
+                            "{name} fa={} ubatch={n_ubatch} batch={n_batch}",
+                            if fa { "on" } else { "off" }
+                        ),
+                        n_ctx: base.n_ctx,
+                        n_batch,
+                        n_ubatch,
+                        flash_attn: fa,
+                        drafter: base.drafter,
+                        draft_n_max: base.draft_n_max,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+fn candidate(
+    caps: &TuneCapabilities,
+    drafter: Drafter,
+    depth: u32,
+    fa: bool,
+    n_batch: u32,
+    n_ubatch: u32,
+) -> TuneCandidate {
+    let name = match drafter {
+        Drafter::None => "draft=none".to_string(),
+        Drafter::Mtp => format!("MTP-head d={depth}"),
+        Drafter::Draft => format!("{} d={depth}", caps.draft_label),
+    };
+    TuneCandidate {
+        label: format!(
+            "{name} fa={} ubatch={n_ubatch} batch={n_batch}",
+            if fa { "on" } else { "off" }
+        ),
+        n_ctx: caps.n_ctx.max(2048),
+        n_batch,
+        n_ubatch,
+        flash_attn: fa,
+        drafter,
+        draft_n_max: depth,
+    }
+}
+
+/// Run one two-stage sweep. `base` carries the model path and the settings
+/// shared by every candidate; only the fields in [`TuneCandidate`] are
+/// overridden.
 pub fn run_sweep(
     base: &LoadConfig,
     plan: &[TuneCandidate],
+    deep: bool,
     cancel: &AtomicBool,
     mut progress: impl FnMut(TuneProgress),
 ) -> Result<SweepOutcome> {
     let mut measurements = Vec::new();
     let mut skipped = Vec::new();
+    let mut index = 0usize;
 
     progress(TuneProgress::Started { total: plan.len() });
-    for (index, candidate) in plan.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        progress(TuneProgress::CandidateStarted {
-            index,
-            label: candidate.label.clone(),
+    if !run_stage(
+        base,
+        plan,
+        cancel,
+        &mut index,
+        &mut measurements,
+        &mut skipped,
+        &mut progress,
+    ) {
+        return Ok(SweepOutcome {
+            measurements,
+            skipped,
         });
-        match measure_candidate(base, candidate, cancel) {
-            Ok(m) => {
-                progress(TuneProgress::CandidateDone {
-                    index,
-                    tokens_per_second: m.tokens_per_second,
+    }
+
+    // Only a candidate that actually drafted may win. A configuration that
+    // asked for MTP but produced no draft tokens is not a slow drafter; it is
+    // a drafter that did not load, and cross-checking its batch shape would
+    // just produce four more mislabeled rows.
+    let best = measurements
+        .iter()
+        .filter(|m| m.candidate.drafter == Drafter::None || m.draft_acceptance.is_some())
+        .max_by(|a, b| a.tokens_per_second.total_cmp(&b.tokens_per_second))
+        .map(|m| m.candidate.clone());
+
+    if let Some(best) = best {
+        let staged = cross_plan(&best);
+        if !staged.is_empty() {
+            progress(TuneProgress::Planned {
+                total: plan.len() + staged.len(),
+            });
+            let _ = run_stage(
+                base,
+                &staged,
+                cancel,
+                &mut index,
+                &mut measurements,
+                &mut skipped,
+                &mut progress,
+            );
+        }
+
+        if deep && !cancel.load(Ordering::Relaxed) {
+            // Two distinct drafter/depth winners, not two batch shapes of the
+            // same drafter. The point of deep mode is to test whether a second
+            // drafter could win under a different batch shape.
+            let mut picked: Vec<TuneCandidate> = Vec::new();
+            let mut sorted: Vec<&TuneMeasurement> = measurements
+                .iter()
+                .filter(|m| m.candidate.drafter == Drafter::None || m.draft_acceptance.is_some())
+                .collect();
+            sorted.sort_by(|a, b| b.tokens_per_second.total_cmp(&a.tokens_per_second));
+            for m in sorted {
+                let already = picked.iter().any(|p| {
+                    p.drafter == m.candidate.drafter && p.draft_n_max == m.candidate.draft_n_max
                 });
-                measurements.push(m);
+                if !already {
+                    picked.push(m.candidate.clone());
+                }
+                if picked.len() == 2 {
+                    break;
+                }
             }
-            Err(e) => {
-                let reason = e.to_string();
-                progress(TuneProgress::CandidateSkipped {
-                    index,
-                    reason: reason.clone(),
+            if !picked.is_empty() {
+                let mut deep_plan = deep_cross_plan(&picked);
+                deep_plan.retain(|c| {
+                    !measurements.iter().any(|m| {
+                        m.candidate.drafter == c.drafter
+                            && m.candidate.draft_n_max == c.draft_n_max
+                            && m.candidate.flash_attn == c.flash_attn
+                            && m.candidate.n_batch == c.n_batch
+                            && m.candidate.n_ubatch == c.n_ubatch
+                    })
                 });
-                skipped.push(SkippedCandidate {
-                    candidate: candidate.clone(),
-                    reason,
-                });
+                if !deep_plan.is_empty() {
+                    progress(TuneProgress::Planned {
+                        total: index + deep_plan.len(),
+                    });
+                    let _ = run_stage(
+                        base,
+                        &deep_plan,
+                        cancel,
+                        &mut index,
+                        &mut measurements,
+                        &mut skipped,
+                        &mut progress,
+                    );
+                }
             }
         }
     }
@@ -243,6 +393,51 @@ pub fn run_sweep(
         measurements,
         skipped,
     })
+}
+
+/// Measure one stage. Returns false when cancellation stopped it.
+#[allow(clippy::too_many_arguments)]
+fn run_stage(
+    base: &LoadConfig,
+    plan: &[TuneCandidate],
+    cancel: &AtomicBool,
+    index: &mut usize,
+    measurements: &mut Vec<TuneMeasurement>,
+    skipped: &mut Vec<SkippedCandidate>,
+    progress: &mut impl FnMut(TuneProgress),
+) -> bool {
+    for candidate in plan {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let current = *index;
+        *index += 1;
+        progress(TuneProgress::CandidateStarted {
+            index: current,
+            label: candidate.label.clone(),
+        });
+        match measure_candidate(base, candidate, cancel) {
+            Ok(m) => {
+                progress(TuneProgress::CandidateDone {
+                    index: current,
+                    tokens_per_second: m.tokens_per_second,
+                });
+                measurements.push(m);
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                progress(TuneProgress::CandidateSkipped {
+                    index: current,
+                    reason: reason.clone(),
+                });
+                skipped.push(SkippedCandidate {
+                    candidate: candidate.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+    true
 }
 
 fn measure_candidate(
@@ -311,6 +506,11 @@ fn measure_candidate(
     }
     if runs.is_empty() {
         return Err(InferError::Decode("cancelled before any timed pass".into()));
+    }
+    if candidate.drafter != Drafter::None && runs.iter().all(|r| r.draft_acceptance.is_none()) {
+        return Err(InferError::Decode(
+            "the requested drafter produced no draft tokens; it may not have loaded".into(),
+        ));
     }
 
     let med = |values: Vec<f64>| median(values);
@@ -388,10 +588,24 @@ mod tests {
     }
 
     #[test]
-    fn a_model_with_no_drafter_gets_only_the_non_drafting_matrix() {
+    fn a_model_with_no_drafter_starts_from_one_baseline() {
         let plan = quick_plan(&caps(false, false));
-        assert_eq!(plan.len(), 4);
+        assert_eq!(plan.len(), 1);
         assert!(plan.iter().all(|p| p.drafter == Drafter::None));
+    }
+
+    #[test]
+    fn the_cross_stage_keeps_the_winner_drafter_and_depth() {
+        let c = caps(true, true);
+        let best = candidate(&c, Drafter::Mtp, 3, true, 2048, 512);
+        let cross = cross_plan(&best);
+        assert_eq!(cross.len(), 4);
+        assert!(cross
+            .iter()
+            .all(|p| p.drafter == Drafter::Mtp && p.draft_n_max == 3 && p.n_ctx == best.n_ctx));
+        assert!(cross.iter().any(|p| !p.flash_attn));
+        assert!(cross.iter().any(|p| p.n_ubatch == 2048));
+        assert!(cross.iter().any(|p| p.n_batch == 4096));
     }
 
     #[test]
@@ -409,6 +623,23 @@ mod tests {
             .collect();
         assert_eq!(mtp, vec![1, 2, 3, 4, 6]);
         assert_eq!(side, vec![1, 2, 3, 4, 6]);
+    }
+
+    #[test]
+    fn the_deep_plan_crosses_two_winners_without_the_full_product() {
+        let c = caps(true, true);
+        let a = candidate(&c, Drafter::Mtp, 3, true, 2048, 512);
+        let b = candidate(&c, Drafter::Draft, 2, true, 2048, 512);
+        let deep = deep_cross_plan(&[a, b]);
+        // 2 winners x (2 FA x 5 safe batch shapes - 1 already measured) = 18.
+        assert_eq!(deep.len(), 18);
+        assert!(deep
+            .iter()
+            .any(|p| p.drafter == Drafter::Mtp && p.draft_n_max == 3));
+        assert!(deep
+            .iter()
+            .any(|p| p.drafter == Drafter::Draft && p.draft_n_max == 2));
+        assert!(deep.iter().all(|p| p.n_ctx == c.n_ctx));
     }
 
     #[test]
@@ -436,7 +667,8 @@ mod tests {
         let cancel = AtomicBool::new(true);
         let base = LoadConfig::new("does-not-matter.gguf");
         let plan = quick_plan(&caps(false, false));
-        let outcome = run_sweep(&base, &plan, &cancel, |_| {}).expect("cancel short-circuits");
+        let outcome =
+            run_sweep(&base, &plan, false, &cancel, |_| {}).expect("cancel short-circuits");
         assert!(outcome.measurements.is_empty());
         assert!(outcome.skipped.is_empty());
     }

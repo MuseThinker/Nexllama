@@ -101,29 +101,45 @@ impl TuneRegistry {
         std::thread::spawn(move || {
             let started = worker.started_at;
             let mut current_total = total;
-            let outcome = tune::run_sweep(&worker.base, &plan, &worker.cancel, |ev| {
-                if let Ok(mut s) = worker.status.lock() {
-                    match ev {
-                        TuneProgress::Started { total } => {
-                            current_total = total;
-                            *s = TuneStatus::Running {
-                                index: 0,
-                                total,
-                                label: String::new(),
-                            };
+            let outcome = tune::run_sweep(
+                &worker.base,
+                &plan,
+                worker.depth == "deep",
+                &worker.cancel,
+                |ev| {
+                    if let Ok(mut s) = worker.status.lock() {
+                        match ev {
+                            TuneProgress::Started { total } => {
+                                current_total = total;
+                                *s = TuneStatus::Running {
+                                    index: 0,
+                                    total,
+                                    label: String::new(),
+                                };
+                            }
+                            TuneProgress::Planned { total } => {
+                                current_total = total;
+                                if let TuneStatus::Running { index, label, .. } = &*s {
+                                    *s = TuneStatus::Running {
+                                        index: *index,
+                                        total,
+                                        label: label.clone(),
+                                    };
+                                }
+                            }
+                            TuneProgress::CandidateStarted { index, label } => {
+                                *s = TuneStatus::Running {
+                                    index,
+                                    total: current_total,
+                                    label,
+                                };
+                            }
+                            TuneProgress::CandidateDone { .. }
+                            | TuneProgress::CandidateSkipped { .. } => {}
                         }
-                        TuneProgress::CandidateStarted { index, label } => {
-                            *s = TuneStatus::Running {
-                                index,
-                                total: current_total,
-                                label,
-                            };
-                        }
-                        TuneProgress::CandidateDone { .. }
-                        | TuneProgress::CandidateSkipped { .. } => {}
                     }
-                }
-            });
+                },
+            );
             let elapsed = started.elapsed().as_secs_f64();
             let mut s = worker.status.lock().expect("status mutex");
             *s = match outcome {

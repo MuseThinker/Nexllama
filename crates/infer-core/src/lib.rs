@@ -8,8 +8,8 @@ pub mod tune;
 pub mod types;
 
 pub use engine::{
-    EmbedResult, Engine, EngineHandle, EngineInfo, FlashAttn, LoadConfig, LoadEvent, LoadMode,
-    LoraAdapter, RerankResult,
+    EmbedResult, Engine, EngineHandle, EngineInfo, FlashAttn, KvCacheType, LoadConfig, LoadEvent,
+    LoadMode, LoraAdapter, RerankResult,
 };
 pub use error::{InferError, Result};
 pub use fit::{FitReport, ModelFootprint};
@@ -37,6 +37,15 @@ pub fn is_moe(path: &std::path::Path) -> bool {
     gguf_probe::probe(path)
         .map(|probed| probed.is_moe())
         .unwrap_or(false)
+}
+
+/// Transformer layer count, when the GGUF header states it.
+pub fn layer_count(path: &std::path::Path) -> Option<u32> {
+    gguf_probe::probe(path)
+        .ok()
+        .and_then(|probed| probed.block_count)
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
 }
 
 /// Bytes of KV cache one token costs, when the header states the shape.

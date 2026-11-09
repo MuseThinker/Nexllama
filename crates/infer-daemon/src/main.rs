@@ -330,11 +330,12 @@ async fn main() -> anyhow::Result<()> {
         if cfg.n_ctx == 0 {
             if let Ok(hardware) = infer_core::hwprofile::probe() {
                 let path = std::path::Path::new(model);
-                cfg.n_ctx = infer_core::fit::auto_ctx(
+                cfg.n_ctx = infer_core::fit::auto_ctx_kv(
                     infer_core::model_class_of(path),
                     infer_core::fit::train_ctx(path),
                     infer_core::fit::ModelFootprint::of(path),
                     &hardware,
+                    cfg.cache_type_k == infer_core::KvCacheType::Q8_0,
                 );
                 tracing::info!(n_ctx = cfg.n_ctx, "context sized automatically");
             }

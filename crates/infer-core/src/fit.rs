@@ -417,6 +417,24 @@ pub fn auto_ctx(
         .clamp(MIN_CTX, AUTO_CTX_CAP)
 }
 
+/// Like [`auto_ctx`], but accounts for a q8_0 KV cache.
+///
+/// q8_0 stores each K/V element in roughly half the bytes of f16, so the same
+/// card can hold about twice as many tokens. The device rung still caps the
+/// answer; this only lifts the memory ceiling.
+pub fn auto_ctx_kv(
+    class: &str,
+    train_ctx: Option<u32>,
+    mut footprint: ModelFootprint,
+    hardware: &HardwareProfile,
+    q8_cache: bool,
+) -> u32 {
+    if q8_cache {
+        footprint.kv_bytes_per_token = footprint.kv_bytes_per_token.map(|v| (v / 2).max(1));
+    }
+    auto_ctx(class, train_ctx, footprint, hardware)
+}
+
 /// Check a size that has no local file yet — a download that has not started.
 ///
 /// Weights are the only thing known at that point, and they dominate, so this

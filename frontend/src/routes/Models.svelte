@@ -27,6 +27,7 @@ const advDefaults = {
   loadMode: 'auto',
   useMlock: false,
   flashAttn: 'auto',
+  kvCache: 'q8_0',
   offloadKqv: true,
   ropeFreqBase: 0,
   ropeFreqScale: 0,
@@ -121,12 +122,29 @@ let daemonBusy = $state(false);
 // it runs, so there is at most one job on screen at a time and the page polls
 // it instead of holding a request open.
 let tune = $state({ job: null, status: null, busy: false, error: '', applied: '' });
+let tuneDepth = $state('quick');
+let tuneSort = $state('decode');
 const tuneOutcome = $derived(
   tune.status?.status?.outcome ?? tune.status?.status?.partial ?? null,
 );
 const tuneRows = $derived(tuneOutcome?.measurements ?? []);
 const tuneSkipped = $derived(tuneOutcome?.skipped ?? []);
 const tunePhase = $derived(tune.status?.status?.phase ?? '');
+
+function tuneScore(r) {
+  switch (tuneSort) {
+    case 'prefill':
+      return r.prefill_tokens_per_second;
+    case 'acceptance':
+      return r.draft_acceptance ?? 0;
+    case 'balanced':
+      return r.tokens_per_second + r.prefill_tokens_per_second / 200 + (r.draft_acceptance ?? 0) * 20;
+    default:
+      return r.tokens_per_second;
+  }
+}
+
+const tuneRowsSorted = $derived([...tuneRows].sort((a, b) => tuneScore(b) - tuneScore(a)));
 
 // Chat models first, then everything a user might keep for attachments later;
 // the classes that cannot generate sit at the bottom where the Load button is
@@ -370,6 +388,8 @@ function loadBody(path) {
     load_mode: adv.loadMode,
     use_mlock: adv.useMlock,
     flash_attn: adv.flashAttn,
+    cache_type_k: adv.kvCache,
+    cache_type_v: adv.kvCache,
     offload_kqv: adv.offloadKqv,
     rope_freq_base: Number(adv.ropeFreqBase),
     rope_freq_scale: Number(adv.ropeFreqScale),
@@ -482,7 +502,7 @@ async function startTune(m) {
   tune.applied = '';
   try {
     await ensureDaemon();
-    const job = await daemon.tuneStart(m.id);
+    const job = await daemon.tuneStart(m.id, tuneDepth);
     tune.job = job;
     // The daemon unloaded the resident instance before the sweep started.
     await refresh();
@@ -535,6 +555,22 @@ function closeTune() {
   tune.status = null;
   tune.error = '';
   tune.applied = '';
+}
+
+function exportTune() {
+  if (!tune.status?.status) return;
+  const payload = {
+    model: tune.job?.model ?? '',
+    depth: tune.job?.depth ?? tuneDepth,
+    ...tune.status.status,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `nexllama-tune-${tune.job?.id ?? 'report'}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 async function unload(id) {
@@ -1263,6 +1299,13 @@ async function saveCloud(silent) {
           </select>
         </label>
         <label class="field">
+          <span>{$t('settings.kvCache')}</span>
+          <select bind:value={adv.kvCache}>
+            <option value="q8_0">q8_0 (默认)</option>
+            <option value="f16">f16</option>
+          </select>
+        </label>
+        <label class="field">
           <span>{$t('settings.ropeFreqBase')}</span>
           <input type="number" min="0" step="1000" bind:value={adv.ropeFreqBase} />
         </label>
@@ -1301,7 +1344,19 @@ async function saveCloud(silent) {
 
   <!-- 已加载（运行中） -->
   <section class="card">
-    <h3>{$t('models.loaded')} ({loadedModels.length})</h3>
+    <div class="row space">
+      <h3>{$t('models.loaded')} ({loadedModels.length})</h3>
+      <label class="checkline">
+        {$t('models.tuneMode')}
+        <select bind:value={tuneDepth} disabled={tunePhase === 'running'}>
+          <option value="quick">{$t('models.tuneQuick')}</option>
+          <option value="deep">{$t('models.tuneDeep')}</option>
+        </select>
+      </label>
+    </div>
+    {#if tuneDepth === 'deep'}
+      <p class="muted">{$t('models.tuneDeepHint')}</p>
+    {/if}
     {#if loadedModels.length === 0}
       <p class="muted">{$t('models.none')}</p>
     {:else}
@@ -1356,9 +1411,23 @@ async function saveCloud(silent) {
       <div class="tune-head">
         <h3>{$t('models.tuneTitle')}</h3>
         <div class="tune-actions">
+          {#if tuneRows.length > 0}
+            <label class="checkline">
+              {$t('models.tuneSort')}
+              <select bind:value={tuneSort}>
+                <option value="decode">{$t('models.tuneSortDecode')}</option>
+                <option value="prefill">{$t('models.tuneSortPrefill')}</option>
+                <option value="acceptance">{$t('models.tuneSortAccept')}</option>
+                <option value="balanced">{$t('models.tuneSortBalanced')}</option>
+              </select>
+            </label>
+          {/if}
           {#if tunePhase === 'running'}
             <button class="ghost" onclick={cancelTune}>{$t('models.tuneCancel')}</button>
           {:else}
+            {#if tuneRows.length > 0}
+              <button class="ghost" onclick={exportTune}>{$t('models.tuneExport')}</button>
+            {/if}
             <button class="ghost" onclick={closeTune}>{$t('models.tuneClose')}</button>
           {/if}
         </div>
@@ -1393,7 +1462,7 @@ async function saveCloud(silent) {
             </tr>
           </thead>
           <tbody>
-            {#each tuneRows as r}
+            {#each tuneRowsSorted as r}
               <tr class:selected={tune.applied === r.candidate.label}>
                 <td><code>{r.candidate.label}</code></td>
                 <td class="num">{r.tokens_per_second.toFixed(2)} tok/s</td>

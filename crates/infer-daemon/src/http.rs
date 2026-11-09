@@ -1173,6 +1173,12 @@ struct LoadRequest {
     use_mlock: Option<bool>,
     #[serde(default)]
     flash_attn: Option<FlashAttn>,
+    /// K/V cache precision. `q8_0` is the default; f16 is the fallback for
+    /// backends where quantized V is unavailable.
+    #[serde(default)]
+    cache_type_k: Option<infer_core::KvCacheType>,
+    #[serde(default)]
+    cache_type_v: Option<infer_core::KvCacheType>,
     #[serde(default)]
     offload_kqv: Option<bool>,
     #[serde(default)]
@@ -1379,6 +1385,18 @@ async fn load(
     if let Some(v) = req.flash_attn {
         cfg.flash_attn = v;
     }
+    if let Some(v) = req.cache_type_k {
+        cfg.cache_type_k = v;
+    }
+    if let Some(v) = req.cache_type_v {
+        cfg.cache_type_v = v;
+    }
+    // Quantized V needs flash attention; without it, the context falls back to
+    // f16 rather than failing to load.
+    if matches!(cfg.flash_attn, FlashAttn::Off) {
+        cfg.cache_type_k = infer_core::KvCacheType::F16;
+        cfg.cache_type_v = infer_core::KvCacheType::F16;
+    }
     if let Some(v) = req.offload_kqv {
         cfg.offload_kqv = v;
     }
@@ -1540,11 +1558,12 @@ async fn load(
     if cfg.n_ctx == 0 {
         let hardware = infer_core::hwprofile::probe()
             .map_err(|e| ApiError::Model(format!("could not read this machine's memory: {e}")))?;
-        cfg.n_ctx = infer_core::fit::auto_ctx(
+        cfg.n_ctx = infer_core::fit::auto_ctx_kv(
             inbound_class,
             infer_core::fit::train_ctx(std::path::Path::new(&req.model)),
             infer_core::fit::ModelFootprint::of(std::path::Path::new(&req.model)),
             &hardware,
+            cfg.cache_type_k == infer_core::KvCacheType::Q8_0,
         );
         notes.push(format!(
             "context sized to {} tokens automatically ({} model, {} of video memory)",
@@ -1560,6 +1579,39 @@ async fn load(
         ));
     }
     let n_ctx = cfg.n_ctx;
+
+    // Dense models that do not fit: offload only as many layers as the free
+    // VRAM can hold. MoE models use the expert fallback below instead, because
+    // moving experts keeps attention and KV on the GPU.
+    if !is_moe && cfg.n_gpu_layers >= 999 && inbound_class == "llm" {
+        if let Ok(hardware) = infer_core::hwprofile::probe() {
+            if let Some(gpu) = hardware.best_gpu() {
+                let weights_mb = std::fs::metadata(&req.model)
+                    .map(|m| m.len() / (1024 * 1024))
+                    .unwrap_or(0);
+                let kv_mb = infer_core::kv_bytes_per_token(std::path::Path::new(&req.model))
+                    .unwrap_or(0)
+                    .saturating_mul(u64::from(n_ctx))
+                    / (1024 * 1024);
+                let need_mb = weights_mb + kv_mb + 1024;
+                if gpu.vram_free_mb > 0 && gpu.vram_free_mb + 512 < need_mb {
+                    let layers = infer_core::layer_count(std::path::Path::new(&req.model))
+                        .unwrap_or(32)
+                        .max(1);
+                    let budget = gpu.vram_free_mb.saturating_sub(kv_mb + 1024);
+                    let per_layer = (weights_mb / u64::from(layers)).max(1);
+                    let fit_layers = budget / per_layer;
+                    cfg.n_gpu_layers =
+                        u32::try_from(fit_layers.min(u64::from(layers))).unwrap_or(0);
+                    notes.push(format!(
+                        "video memory is short ({} MiB free, about {} MiB needed): {} of {} \
+                         layers are offloaded to the GPU, the rest run on the CPU",
+                        gpu.vram_free_mb, need_mb, cfg.n_gpu_layers, layers
+                    ));
+                }
+            }
+        }
+    }
 
     // MoE fallback: keep every expert on the GPU when the model fits, and move
     // the first 8 layers' experts to the CPU when it does not. Dense models
@@ -1597,11 +1649,26 @@ async fn load(
                     )));
                 }
                 if gpu.vram_free_mb > 0 && gpu.vram_free_mb + 256 < need_mb {
-                    cfg.n_cpu_moe = 8;
+                    // Smallest expert offload that closes the gap. Experts are
+                    // most of a MoE layer's weights, so a layer's share is a
+                    // conservative estimate; rounding up to four layers keeps
+                    // the fallback from landing just short and OOMing again.
+                    let layers = infer_core::layer_count(std::path::Path::new(&req.model))
+                        .unwrap_or(32)
+                        .max(1);
+                    let deficit = need_mb.saturating_sub(gpu.vram_free_mb);
+                    let per_layer = (weights_mb / u64::from(layers)).max(1);
+                    let needed = deficit.div_ceil(per_layer).max(1);
+                    let rounded = needed.div_ceil(4) * 4;
+                    cfg.n_cpu_moe = u32::try_from(rounded.min(u64::from(layers))).unwrap_or(layers);
+                    if req.moe_cache_mib.is_none() {
+                        cfg.moe_cache_mib = 2048;
+                    }
                     notes.push(format!(
-                        "video memory is short ({} MiB free, about {} MiB needed): the first 8 \
-                         layers' experts are kept on the CPU so the load does not run out of memory",
-                        gpu.vram_free_mb, need_mb
+                        "video memory is short ({} MiB free, about {} MiB needed): the first {} \
+                         layers' experts are kept on the CPU (estimated minimum), with a 2 GiB \
+                         GPU expert cache",
+                        gpu.vram_free_mb, need_mb, cfg.n_cpu_moe
                     ));
                 }
             }
@@ -2214,9 +2281,9 @@ async fn tune_start(
     Json(req): Json<TuneRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let depth = req.depth.as_deref().unwrap_or("quick");
-    if depth != "quick" {
+    if depth != "quick" && depth != "deep" {
         return Err(ApiError::BadRequest(format!(
-            "tune depth \"{depth}\" is not implemented; use \"quick\""
+            "tune depth \"{depth}\" is not implemented; use \"quick\" or \"deep\""
         )));
     }
     let (base, caps) = {
