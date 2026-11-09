@@ -2219,7 +2219,7 @@ async fn tune_start(
             "tune depth \"{depth}\" is not implemented; use \"quick\""
         )));
     }
-    let (path, gpu_layers, base_ctx) = {
+    let (base, caps) = {
         let mut guard = state.inner.lock().await;
         if state.tunes.running_for_model(&req.model) {
             return Err(ApiError::BadRequest(format!(
@@ -2234,7 +2234,35 @@ async fn tune_start(
                 loaded.info.model_class
             )));
         }
-        let taken = (loaded.path.clone(), loaded.n_gpu_layers, loaded.n_ctx);
+        let mut base = loaded.config.clone();
+        base.n_ctx = loaded.n_ctx;
+        base.n_gpu_layers = loaded.n_gpu_layers;
+        // The sweep only needs the chat model; an image projector would hold
+        // memory without contributing to a text decode measurement.
+        base.mmproj = None;
+        let draft_model = loaded.draft_model.clone();
+        let draft_label = draft_model
+            .as_deref()
+            .map(|p| {
+                let n = p.to_ascii_lowercase();
+                if n.contains("dflash") {
+                    "DFlash2"
+                } else if n.contains("eagle") {
+                    "EAGLE-3"
+                } else if n.contains("mtp") || n.contains("nextn") {
+                    "MTP-file"
+                } else {
+                    "draft"
+                }
+            })
+            .unwrap_or("draft")
+            .to_string();
+        let caps = infer_core::tune::TuneCapabilities {
+            n_ctx: loaded.n_ctx,
+            has_mtp: loaded.info.mtp,
+            draft_model,
+            draft_label,
+        };
         // Free the GPU before the sweep claims it. Drop happens off the async
         // context: freeing weights is real work, same as in `unload`.
         let resident = guard.models.remove(&req.model);
@@ -2242,13 +2270,11 @@ async fn tune_start(
             guard.default_model = None;
         }
         let _ = tokio::task::spawn_blocking(move || drop(resident)).await;
-        taken
+        (base, caps)
     };
-    let plan = infer_core::tune::quick_plan(base_ctx);
+    let plan = infer_core::tune::quick_plan(&caps);
     let planned = plan.len();
-    let job = state
-        .tunes
-        .start(req.model.clone(), path, gpu_layers, plan, depth);
+    let job = state.tunes.start(req.model.clone(), base, plan, depth);
     Ok(Json(json!({
         "id": job.id,
         "model": req.model,

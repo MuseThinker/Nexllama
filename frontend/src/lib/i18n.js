@@ -75,6 +75,8 @@ const dict = {
     'models.tuneSkipped': '跳过',
     'models.tuneNoResult': '尚无结果',
     'models.tuneHint': '固定提示与生成长度，3 次取中位数；换一种提示风格排名可能不同。',
+    'models.tuneAccept': '接受率',
+    'models.tuneCtxAuto': '上下文自动：{n}（不作为优化项）',
     'models.default': '默认',
     'models.library': '本地模型库',
     'models.libraryHint': 'LLM（含视觉）用于对话框测试与调参；标记 API 的 embedding / rerank 模型通过 HTTP 接口提供服务。',
@@ -340,6 +342,8 @@ const dict = {
     'models.tuneSkipped': 'Skipped',
     'models.tuneNoResult': 'No results yet',
     'models.tuneHint': 'Fixed prompt and generation length, median of 3 runs; another prompt style may rank differently.',
+    'models.tuneAccept': 'Acceptance',
+    'models.tuneCtxAuto': 'Context auto: {n} (not a tuning knob)',
     'models.default': 'default',
     'models.library': 'Local library',
     'models.libraryHint':

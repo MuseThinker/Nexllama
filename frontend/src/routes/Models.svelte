@@ -514,10 +514,17 @@ async function cancelTune() {
 }
 
 function applyTune(c) {
-  adv.nCtx = c.n_ctx;
+  // Context is not a tuning result; leave `nCtx` at 0 so the daemon keeps
+  // deriving it from the device and the checkpoint.
   adv.nBatch = c.n_batch;
   adv.nUbatch = c.n_ubatch;
   adv.flashAttn = c.flash_attn ? 'on' : 'off';
+  adv.draftNMax = c.draft_n_max;
+  const id = tune.job?.model;
+  if (id) {
+    drafter[id] =
+      c.drafter === 'mtp' ? 'mtp' : c.drafter === 'draft' ? 'draft' : 'none';
+  }
   persistAdv();
   tune.applied = c.label;
   notice = $t('models.tuneApplied', { label: c.label });
@@ -1372,12 +1379,15 @@ async function saveCloud(silent) {
       </p>
       {#if tune.error}<p class="error">{tune.error}</p>{/if}
       {#if tuneRows.length > 0}
+        <p class="muted tune-ctx">
+          {$t('models.tuneCtxAuto', { n: tuneRows[0].candidate.n_ctx })}
+        </p>
         <table class="tune-table">
           <thead>
             <tr>
               <th>{$t('models.tuneConfig')}</th>
               <th class="num">{$t('models.tuneTok')}</th>
-              <th class="num">{$t('models.tuneTtft')}</th>
+              <th class="num">{$t('models.tuneAccept')}</th>
               <th class="num">{$t('models.tunePrefill')}</th>
               <th></th>
             </tr>
@@ -1387,7 +1397,9 @@ async function saveCloud(silent) {
               <tr class:selected={tune.applied === r.candidate.label}>
                 <td><code>{r.candidate.label}</code></td>
                 <td class="num">{r.tokens_per_second.toFixed(2)} tok/s</td>
-                <td class="num">{Math.round(r.first_token_ms)} ms</td>
+                <td class="num">
+                  {r.draft_acceptance == null ? '—' : (r.draft_acceptance * 100).toFixed(1) + '%'}
+                </td>
                 <td class="num">{Math.round(r.prefill_tokens_per_second)} tok/s</td>
                 <td>
                   <button

@@ -19,12 +19,14 @@ use std::time::Instant;
 use serde::Serialize;
 
 use infer_core::tune::{self, SweepOutcome, TuneCandidate, TuneProgress};
+use infer_core::LoadConfig;
 
 /// One tune run, from start to report.
 pub struct TuneJob {
     pub id: String,
     pub model_id: String,
     pub model_path: PathBuf,
+    pub base: LoadConfig,
     pub depth: String,
     pub started_at: Instant,
     pub cancel: Arc<AtomicBool>,
@@ -67,8 +69,7 @@ impl TuneRegistry {
     pub fn start(
         &self,
         model_id: String,
-        model_path: PathBuf,
-        n_gpu_layers: u32,
+        base: LoadConfig,
         plan: Vec<TuneCandidate>,
         depth: &str,
     ) -> Arc<TuneJob> {
@@ -79,10 +80,12 @@ impl TuneRegistry {
                 .map(|d| d.as_millis())
                 .unwrap_or(0)
         );
+        let model_path = base.model_path.clone();
         let job = Arc::new(TuneJob {
             id: id.clone(),
             model_id,
             model_path,
+            base,
             depth: depth.to_string(),
             started_at: Instant::now(),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -98,35 +101,29 @@ impl TuneRegistry {
         std::thread::spawn(move || {
             let started = worker.started_at;
             let mut current_total = total;
-            let outcome = tune::run_sweep(
-                &worker.model_path,
-                n_gpu_layers,
-                &plan,
-                &worker.cancel,
-                |ev| {
-                    if let Ok(mut s) = worker.status.lock() {
-                        match ev {
-                            TuneProgress::Started { total } => {
-                                current_total = total;
-                                *s = TuneStatus::Running {
-                                    index: 0,
-                                    total,
-                                    label: String::new(),
-                                };
-                            }
-                            TuneProgress::CandidateStarted { index, label } => {
-                                *s = TuneStatus::Running {
-                                    index,
-                                    total: current_total,
-                                    label,
-                                };
-                            }
-                            TuneProgress::CandidateDone { .. }
-                            | TuneProgress::CandidateSkipped { .. } => {}
+            let outcome = tune::run_sweep(&worker.base, &plan, &worker.cancel, |ev| {
+                if let Ok(mut s) = worker.status.lock() {
+                    match ev {
+                        TuneProgress::Started { total } => {
+                            current_total = total;
+                            *s = TuneStatus::Running {
+                                index: 0,
+                                total,
+                                label: String::new(),
+                            };
                         }
+                        TuneProgress::CandidateStarted { index, label } => {
+                            *s = TuneStatus::Running {
+                                index,
+                                total: current_total,
+                                label,
+                            };
+                        }
+                        TuneProgress::CandidateDone { .. }
+                        | TuneProgress::CandidateSkipped { .. } => {}
                     }
-                },
-            );
+                }
+            });
             let elapsed = started.elapsed().as_secs_f64();
             let mut s = worker.status.lock().expect("status mutex");
             *s = match outcome {
@@ -220,11 +217,16 @@ mod tests {
         // start() spawns a thread that will fail on the missing file; the
         // status is Running until that thread finishes, which is the window
         // the load path must refuse in. Both queries must agree.
+        let caps = tune::TuneCapabilities {
+            n_ctx: 4096,
+            has_mtp: false,
+            draft_model: None,
+            draft_label: "draft".into(),
+        };
         let job = reg.start(
             "m".into(),
-            PathBuf::from("does-not-exist.gguf"),
-            0,
-            tune::quick_plan(4096),
+            LoadConfig::new("does-not-exist.gguf"),
+            tune::quick_plan(&caps),
             "quick",
         );
         // Race-free enough: the thread has to load a missing file first, but a
