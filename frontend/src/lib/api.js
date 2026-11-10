@@ -72,7 +72,21 @@ async function req(path, opts = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
   } catch (e) {
     throw readableAbort(e, timeoutMs);
   }
-  if (!res.ok) throw httpError(res);
+  if (!res.ok) {
+    // The daemon puts the actionable sentence in the body (`{"error": "..."}`);
+    // throwing on the status line alone turned every load failure into
+    // "500: Internal Server Error", which says nothing about what to fix.
+    const err = httpError(res);
+    try {
+      const detail = (await res.clone().json())?.error;
+      if (typeof detail === 'string' && detail.trim()) {
+        err.message = `${res.status}: ${detail}`;
+      }
+    } catch {
+      /* not JSON; the status line is all we have */
+    }
+    throw err;
+  }
   return res.json();
 }
 

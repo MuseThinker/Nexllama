@@ -738,13 +738,28 @@ async fn release_all_except(state: &AppState, keep: &str) -> Vec<Loaded> {
 /// Load on a worker thread, naming the model in the log either way.
 async fn spawn_engine(cfg: LoadConfig, log_id: &str) -> Result<infer_core::Engine, InferError> {
     let log_id = log_id.to_string();
+    let load_id = log_id.clone();
     match tokio::task::spawn_blocking(move || {
-        Engine::load(cfg, |ev| tracing::info!(?log_id, ?ev, "load"))
+        Engine::load(cfg, |ev| tracing::info!(?load_id, ?ev, "load"))
     })
     .await
     {
-        Ok(result) => result,
-        Err(e) => Err(InferError::Backend(format!("load task failed: {e}"))),
+        Ok(result) => match result {
+            Ok(engine) => Ok(engine),
+            Err(e) => {
+                // The message is returned to the caller, but a failed load is
+                // also the one thing worth having in the log afterwards: the
+                // UI only shows a status line, and a native failure leaves no
+                // stack behind.
+                tracing::error!(%log_id, error = %e, "model load failed");
+                Err(e)
+            }
+        },
+        Err(e) => {
+            let e = InferError::Backend(format!("load task failed: {e}"));
+            tracing::error!(%log_id, error = %e, "model load task failed");
+            Err(e)
+        }
     }
 }
 
@@ -1434,6 +1449,16 @@ async fn load(
         if v > 0 {
             cfg.load_mtp = true;
         }
+    }
+    // A load request owns the model it loads. A budget inherited from the
+    // daemon's startup config must not follow it: a daemon started with
+    // `--mtp-n-max` for a 27B would otherwise ask an ASR or embedding model
+    // loaded later to draft, and fail with "needs a chat model (class llm)" —
+    // a bare 500 with no hint of which setting caused it.
+    let can_draft = inbound_class == "llm" && infer_core::has_mtp(Path::new(&req.model));
+    if !asked_mtp || !can_draft {
+        cfg.load_mtp = false;
+        cfg.mtp_n_max = 0;
     }
     if let Some(v) = req.lora.as_ref() {
         cfg.lora = v
