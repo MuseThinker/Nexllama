@@ -152,7 +152,9 @@ const tuneRowsSorted = $derived([...tuneRows].sort((a, b) => tuneScore(b) - tune
 // Chat models first, then everything a user might keep for attachments later;
 // the classes that cannot generate sit at the bottom where the Load button is
 // clearly not for talking to.
-const classRank = (b) => ({ vision: 1, llm: 2, speculative: 3, tts: 4, embedding: 5, rerank: 6 }[b.kind] ?? 3);
+const classRank = (b) =>
+  ({ vision: 1, asr: 2, llm: 3, speculative: 4, tts: 5, embedding: 6, rerank: 7 }[b.kind] ??
+    4);
 const orderedModels = $derived([...localModels].sort((a, b) => classRank(a) - classRank(b)));
 
 // Everything the service knows about, resident or not. A model that was
@@ -1254,6 +1256,7 @@ async function saveCloud(silent) {
             <span class="file-name">
               {b.name}
               {#if b.kind === 'vision'}<span class="badge">vision</span>{/if}
+              {#if b.kind === 'asr'}<span class="badge api">ASR</span>{/if}
               {#if b.kind === 'speculative'}<span class="badge" title={b.draft}>spec</span>{/if}
               {#if b.mtp}<span class="badge">MTP</span>{/if}
               {#if b.class === 'tts'}<span class="badge api">TTS</span>{/if}
@@ -1264,7 +1267,7 @@ async function saveCloud(silent) {
             <span class="file-size">
               {fmt(b.size)}{#if b.files.length > 1} · {b.files.length} {$t('models.files')}{/if}
             </span>
-            {#if b.mtp || b.draft}
+            {#if (b.mtp || b.draft) && b.kind !== 'asr'}
               <label class="checkline" title={$t('models.drafterHint')}>
                 <select
                   value={drafter[b.name] ?? 'auto'}
@@ -1415,6 +1418,7 @@ async function saveCloud(silent) {
             <span class="file-name">
               {m.id}
               {#if m.info?.vision}<span class="badge">vision</span>{/if}
+              {#if m.info?.audio}<span class="badge api">ASR</span>{/if}
               {#if m.draft_model}
                 <span class="badge" title={m.draft_model}>{kindOf(m.draft_model)}</span>
               {:else if m.load_mtp && m.info?.mtp}

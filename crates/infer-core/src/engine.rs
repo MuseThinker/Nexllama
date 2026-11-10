@@ -401,6 +401,30 @@ impl SpecGate {
 mod spec_tests {
     use super::*;
 
+    #[test]
+    fn asr_output_splits_the_language_header() {
+        assert_eq!(
+            parse_asr_output("language Chinese<asr_text>你好。", None),
+            (Some("Chinese".to_string()), "你好。".to_string())
+        );
+        // The header can wrap onto its own line.
+        assert_eq!(
+            parse_asr_output("language English\n<asr_text>Hello", None),
+            (Some("English".to_string()), "Hello".to_string())
+        );
+        // Silent audio names no language.
+        assert_eq!(
+            parse_asr_output("language None<asr_text>", None),
+            (None, String::new())
+        );
+        // A forced language makes the reply plain text; the header is still
+        // stripped if the conversion emits one anyway.
+        assert_eq!(
+            parse_asr_output("Hello", Some("English")),
+            (Some("English".to_string()), "Hello".to_string())
+        );
+    }
+
     fn drafted(proposed: usize, accepted: usize) -> GenStats {
         GenStats {
             draft_tokens: proposed,

@@ -2297,7 +2297,7 @@ fn asr_language(raw: &str) -> Option<String> {
         "hu" | "hungarian" => "Hungarian",
         "mk" | "macedonian" => "Macedonian",
         "ro" | "romanian" => "Romanian",
-        other => return Some(other.to_string()),
+        _ => return Some(t.to_string()),
     };
     Some(canonical.to_string())
 }
@@ -3860,6 +3860,19 @@ mod tests {
     use tower::ServiceExt;
 
     type TestRequest = axum::http::Request<Body>;
+
+    #[test]
+    fn asr_language_maps_iso_codes_to_model_names() {
+        assert_eq!(asr_language("zh").as_deref(), Some("Chinese"));
+        assert_eq!(asr_language("EN").as_deref(), Some("English"));
+        assert_eq!(asr_language(" yue ").as_deref(), Some("Cantonese"));
+        // Auto-detection is the absence of a forced language, not a name.
+        assert_eq!(asr_language("auto"), None);
+        assert_eq!(asr_language("  "), None);
+        // A name the table does not know is passed through untouched; the
+        // model either understands it or reports that it does not.
+        assert_eq!(asr_language("Klingon").as_deref(), Some("Klingon"));
+    }
 
     fn app(key: Option<&str>) -> Router {
         let state = AppState::new(Duration::from_secs(0), LoadConfig::new(""));

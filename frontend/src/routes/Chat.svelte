@@ -22,6 +22,15 @@ let speculative = $state(false);
 let ngramN = $state(4);
 let ngramM = $state(8);
 let models = $state([]);
+// The unfiltered list, so the audio path can find a speech model that the chat
+// model picker deliberately hides.
+let allModels = $state([]);
+// The one speech-recognition model the audio path can use. Kept out of the chat
+// picker because text chat through an ASR bundle is nonsense, but still needed
+// here to transcribe an attachment.
+const asrModel = $derived(
+  allModels.find((m) => m.info?.audio && !m.info?.vision) ?? null,
+);
 let apiOnly = $state(0);
 let selected = $state('');
 // The drafter belongs to the model that was loaded with one: a bundled MTP
@@ -151,6 +160,137 @@ function removeImage(i) {
   if (dropped?.url) URL.revokeObjectURL(dropped.url);
 }
 
+// ── Audio attachments ─────────────────────────────────────
+// Audio is not sent to the chat model: it is transcribed into the input box by
+// the loaded ASR model, so the user can check the text before sending. That is
+// the whole feature, and it lives here rather than in a fourth page.
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+let audioBusy = $state(false);
+let recording = $state(false);
+let recorder = null;
+let audioInput;
+let chunks = [];
+
+const isAudio = (f) =>
+  f.type.startsWith('audio/') || /\.(wav|mp3|flac)$/i.test(f.name ?? '');
+
+async function addAttachments(files) {
+  const list = [...files];
+  await addImages(list);
+  for (const file of list) {
+    if (isAudio(file)) await transcribeAudio(file);
+  }
+  if (audioInput) audioInput.value = '';
+}
+
+async function transcribeAudio(file) {
+  error = '';
+  if (!asrModel) {
+    error = $t('chat.asrNeedsModel');
+    return;
+  }
+  if (file.size > MAX_AUDIO_BYTES) {
+    error = `${file.name || 'audio'}: ${$t('chat.audioTooLarge')}`;
+    return;
+  }
+  audioBusy = true;
+  try {
+    const r = await daemon.transcribe(file, { model: asrModel.id });
+    const text = (r?.text ?? '').trim();
+    if (!text) {
+      error = $t('chat.asrEmpty');
+      return;
+    }
+    input = input.trim() ? `${input.trim()}\n${text}` : text;
+  } catch (e) {
+    error = $t('chat.asrFailed', { error: String(e?.message ?? e) });
+  } finally {
+    audioBusy = false;
+  }
+}
+
+/// Record from the microphone, resample to the 16 kHz mono WAV the audio
+/// encoder expects, and transcribe it. MediaRecorder produces WebM/Opus, which
+/// libmtmd cannot decode, so the conversion happens in the page.
+async function toggleRecord() {
+  if (recording) {
+    recorder?.stop();
+    return;
+  }
+  if (!asrModel) {
+    error = $t('chat.asrNeedsModel');
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    error = $t('chat.micDenied');
+    return;
+  }
+  chunks = [];
+  recorder = new MediaRecorder(stream);
+  recorder.ondataavailable = (e) => {
+    if (e.data.size) chunks.push(e.data);
+  };
+  recorder.onstop = async () => {
+    recording = false;
+    for (const track of stream.getTracks()) track.stop();
+    const blob = new Blob(chunks, { type: recorder?.mimeType || 'audio/webm' });
+    recorder = null;
+    try {
+      await transcribeAudio(await toWav(blob));
+    } catch {
+      error = $t('chat.asrEmpty');
+      audioBusy = false;
+    }
+  };
+  recorder.start();
+  recording = true;
+}
+
+async function toWav(blob) {
+  const ctx = new AudioContext();
+  const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
+  await ctx.close();
+  const rate = 16000;
+  const frames = Math.max(1, Math.ceil(decoded.duration * rate));
+  const off = new OfflineAudioContext(1, frames, rate);
+  const src = off.createBufferSource();
+  src.buffer = decoded;
+  src.connect(off.destination);
+  src.start();
+  const rendered = await off.startRendering();
+  return encodeWav(rendered.getChannelData(0), rate);
+}
+
+function encodeWav(samples, rate) {
+  const out = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(out);
+  const str = (o, s) => {
+    for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i));
+  };
+  str(0, 'RIFF');
+  v.setUint32(4, 36 + samples.length * 2, true);
+  str(8, 'WAVE');
+  str(12, 'fmt ');
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true);
+  v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  str(36, 'data');
+  v.setUint32(40, samples.length * 2, true);
+  let at = 44;
+  for (let i = 0; i < samples.length; i++, at += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(at, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new File([out], 'recording.wav', { type: 'audio/wav' });
+}
+
 const CHAT_MODEL_KEY = 'nexllama.chatModel';
 
 let refreshing = false;
@@ -167,6 +307,7 @@ async function refreshModels() {
   refreshing = true;
   try {
     const s = await daemon.status();
+    allModels = s.models ?? [];
     // Only generation models belong here. Embedding, rerank and TTS models
     // serve the HTTP API; none of them decodes a chat continuation. A
     // speech-recognition bundle is an LLM too, but text chat through it is
@@ -515,21 +656,43 @@ onMount(() => {
       <input
         bind:this={fileInput}
         type="file"
-        accept="image/*"
+        accept="image/*,.wav,.mp3,.flac,audio/wav,audio/mpeg,audio/flac"
         multiple
         hidden
-        onchange={(e) => addImages([...e.target.files]).catch(() => {})}
+        onchange={(e) => addAttachments([...e.target.files]).catch(() => {})}
       />
       <button
         class="ghost attach"
         onclick={() => fileInput?.click()}
-        disabled={busy}
-        title={$t('chat.attachImage')}
+        disabled={busy || audioBusy}
+        title={$t('chat.attachMedia')}
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21.4 11.05l-8.5 8.5a5.5 5.5 0 01-7.78-7.78l8.5-8.5a3.67 3.67 0 015.18 5.18l-8.49 8.5a1.83 1.83 0 01-2.59-2.6l7.85-7.85" />
         </svg>
       </button>
+      <button
+        class="ghost attach"
+        class:recording
+        onclick={toggleRecord}
+        disabled={busy || audioBusy}
+        title={recording ? $t('chat.stopRecord') : $t('chat.record')}
+        aria-label={recording ? $t('chat.stopRecord') : $t('chat.record')}
+      >
+        {#if recording}
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <rect x="7" y="7" width="10" height="10" rx="2" />
+          </svg>
+        {:else}
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="3" width="6" height="11" rx="3" />
+            <path d="M5 11a7 7 0 0014 0M12 18v3" />
+          </svg>
+        {/if}
+      </button>
+      {#if audioBusy}
+        <span class="asr-busy">{$t('chat.transcribing')}</span>
+      {/if}
 
       <select
         class="model"

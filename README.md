@@ -164,8 +164,8 @@ npm --prefix frontend install
 .\scripts\package.ps1                 # standard: cpu + cuda + NVIDIA runtime
 .\scripts\package.ps1 -Edition lite   # lite: leaves the runtime out
 .\scripts\package.ps1 -Edition both   # both, from one daemon build
-# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.0_x64-setup.exe
-# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.0_x64-lite-setup.exe
+# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.1_x64-setup.exe
+# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.1_x64-lite-setup.exe
 ```
 
 `-Native` bakes the build machine's instruction set in — faster CPU inference, but
@@ -414,6 +414,15 @@ program points at. Neither is offered where the other belongs.
   token and lifecycle stay the same; the response is `audio/wav`. An optional `voice`
   is a path to a wav/mp3 reference. The model is not bundled — download
   `ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF` (weights + `mmproj`) yourself.
+- **Speech recognition** — load a Qwen3-ASR bundle (weights plus its audio `mmproj`,
+  e.g. `ggml-org/Qwen3-ASR-0.6B-GGUF`), then `POST /v1/audio/transcriptions` with a
+  WAV, MP3 or FLAC file. The audio encoder runs in this process through llama.cpp's
+  mtmd path — no sidecar, no second port — and the reply is `{"text": ...}`. `language`
+  takes an ISO code (`zh`, `en`, …) or the model's own name (`Chinese`, `English`, …);
+  omitting it lets the model detect the language. In the chat panel the paperclip
+  accepts audio and the microphone button records; both put the transcript into the
+  input box for review instead of sending it, and recordings are converted to 16 kHz
+  mono WAV in the page.
 
 ### Reasoning control and tool calling
 

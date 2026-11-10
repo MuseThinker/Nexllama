@@ -128,8 +128,8 @@ npm --prefix frontend install
 .\scripts\package.ps1                 # 标准版：cpu + cuda + 英伟达运行库
 .\scripts\package.ps1 -Edition lite   # 精简版：不打包英伟达运行库
 .\scripts\package.ps1 -Edition both   # 两者都出，只编译一次守护进程
-# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.0_x64-setup.exe
-# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.0_x64-lite-setup.exe
+# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.1_x64-setup.exe
+# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.1_x64-lite-setup.exe
 ```
 
 `-Native` 会把构建机的指令集编进去——CPU 推理更快，但产物只能在同款或同代 CPU 上运行。个人自用无所谓，要发给别人就别加。
@@ -282,6 +282,7 @@ models/Qwen2.5-VL-7B/
 - **`/v1/rerank`**——Cohere/Jina 的响应格式。输入按 `BOS query SEP document EOS` 拼好，也就是分类头训练时用的句对；NaN 分数排在最后，坏掉的头不会被评为最佳匹配。
 - **视觉**——含投影器的模型包，在 `/v1/chat/completions` 上接受 OpenAI 风格的 `image_url` 片段。只收 `data:` URL：`http(s)` URL 会把每个请求变成 SSRF 的入口，而裸路径则会指向主机上的文件。模型卸载到 GPU 后，投影器也在 GPU 上跑——一张 336×252 的图在 40 GB 卡上约 200 ms，纯 CPU 则要 50 s 左右。
 - **语音**——在模型库中加载 Qwen3-TTS 模型包（权重加音频 `mmproj`），然后调用 `POST /v1/audio/speech`，请求体如 `{"input": "...", "language": "zh"}`。常驻的 `llama-tts-worker` 只在加载时读取一次模型，之后一直保留到卸载 TTS 模型，因此后续请求不再重复付出加载时间。端口、令牌和生命周期都保持不变，返回 `audio/wav`。可选的 `voice` 是 wav/mp3 参考音频路径。模型不随安装包分发，请自行下载 `ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF`（权重 + `mmproj`）。
+- **语音识别**——加载 Qwen3-ASR 模型包（权重加音频 `mmproj`，如 `ggml-org/Qwen3-ASR-0.6B-GGUF`），然后 `POST /v1/audio/transcriptions` 上传 WAV、MP3 或 FLAC。音频编码器走 llama.cpp 的 mtmd 链路，在本进程内运行——没有侧车、没有第二个端口，返回 `{"text": ...}`。`language` 接受 ISO 码（`zh`、`en` …）或模型自己的语言名（`Chinese`、`English` …）；不传则由模型自动识别。对话面板里，回形针可以添加音频、麦克风按钮可以直接录音，两者都会先把文字放进输入框供你检查，而不是直接发送；录音会在页面内转成 16 kHz 单声道 WAV。
 
 ### 思考开关与工具调用
 
