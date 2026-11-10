@@ -7,23 +7,23 @@
 [![文档: OpenAPI 3.1](https://img.shields.io/badge/docs-OpenAPI%203.1-green.svg)]
 [![English](https://img.shields.io/badge/lang-English-lightgrey.svg)](README.md)
 
-**Nexllama：本地大模型的一体化推理桌面与 API 网关——原样封装 llama.cpp，硬件自动适配、投机解码加速、前缀缓存，本地与云端共用一个端口。**
+**Nexllama：本地推理的一体化桌面与 API 网关——原样封装 llama.cpp，硬件自动适配、投机解码加速、前缀缓存，本地与云端共用一个端口。**
 
 ## ✨ Nexllama
 
-Nexllama 是一个对硬件有感知能力的一体化本地推理桌面与 API 网关，对 llama.cpp 只做封装、不改动内核。同一个进程同时提供对话、向量、重排、语音合成与语音识别，共用一套 GGUF 模型库和同一个 OpenAI 兼容端口；模型自动下载、一键导入。不需要自己编译，也不用手工去调 GPU 卸载层数——程序会探测本机硬件并据此完成适配。原生支持 MTP、DFlash2、EAGLE-3、n-gram 投机解码与前缀缓存，KV 缓存默认 `q8_0`，并提供实测参数优化：在你这台机器上真实测试草稿器、草稿深度与批处理形状，而不是照搬经验值。面向 Agent 场景做了优化：流式输出可中断、原生工具调用、模型名容错解析。本地 GGUF 与云端大模型共用一个 API 端点，可选的算力路由默认关闭、不绑定任何厂商，同时完整保留 llama.cpp 的原生推理性能。
+Nexllama 是一个能自动适配硬件的一体化本地推理桌面与 API 网关，原样封装 llama.cpp，不改内核。一个进程同时提供对话、向量、重排、语音合成和语音识别，共用一套 GGUF 模型库和一个 OpenAI 兼容端口；模型可以自动下载、一键导入。不用自己编译，也不用逐层调 GPU 卸载——启动时会识别硬件并自动配好。原生支持 MTP、DFlash2、EAGLE-3 与 n-gram 投机解码、前缀缓存，KV 缓存默认 `q8_0`；参数优化会在本机实测草稿器、草稿深度和批处理形状，而不是照搬结论。面向 Agent 场景，流式输出可中断，支持原生工具调用和模型名容错。本地 GGUF 与云端模型共用一个 API 端点，可选的算力路由默认关闭、不绑定厂商，同时保留 llama.cpp 的原生性能。
 
 ## 🚀 核心亮点
 
 | 特性 | 说明 |
 |---|---|
-| **一体化 All-in-One** | 直接使用原生 llama.cpp，只是把命令行换成了图形界面：模型库、下载器与 OpenAI 兼容 API 全部内置。装完即用，不必再配依赖，也不用记各种参数。 |
-| **五种负载，一个端口** | 对话、向量、重排、语音合成与语音识别共用一套模型库和同一个 OpenAI 兼容端点：`/v1/chat/completions`、`/v1/embeddings`、`/v1/rerank`、`/v1/audio/speech`、`/v1/audio/transcriptions`，视觉投影器走对话链路。只启动一个守护进程，只盯一处状态，不用为每种负载各维护一套服务。 |
-| **实测参数优化，不靠猜** | v0.2.1 的两级实测会真正加载检查点，在你这张卡上测：草稿器（无、MTP、DFlash2、EAGLE-3）、草稿深度 1/2/3/4/6、flash attention 与安全批处理形状。标准模式在草稿器冠军上再交叉四种批处理；深度模式交叉前两名草稿配置，每候选 5 次 256 token 采样取中位数，报告可按解码 / Prefill / 接受率 / 综合排序，并可导出 JSON。 |
-| **自己适配机器** | 上下文由显存和模型推导，从不作为调优项；KV 缓存默认 `q8_0`。稠密模型装不下时，只把显存装得下的层卸载到 GPU；MoE 模型则把最少数量的专家层留在 CPU，并给 GPU 2 GiB 专家缓存，而不是固定搬走八层；安装包缺的后端会按签名清单按需下载。 |
-| **快得诚实** | 原生 MTP、DFlash2、EAGLE-3 与 n-gram 投机解码，自适应闸门在收益消失时立刻停用；前缀缓存消掉重复预填充。测速按真实聊天采样（T=0.8、思考模式跟随模型），报告里的速度就是实际能拿到的速度，而不是贪心解码的上限。 |
-| **为 Agent 而生** | 提供 OpenAI 兼容端点，OpenClaw、Hermes 以及各类 SDK 客户端无需改动即可接入；原生工具调用、可取消的流式输出、略微过期的模型名也能解析，出错时给出足以据以处理的信息。 |
-| **本地与云端统一** | 本地模型与云厂商直连服务跑在同一个端口上，可选的 `auto` 策略让活儿尽量留在本机、只把本机不擅长的部分送出去——同样的质量、更低的账单，且不锁定任何厂商。 |
+| **一体化 All-in-One** | 直接用原生 llama.cpp，只是把命令行换成了界面：模型库、下载器和 OpenAI 兼容 API 全部内置。装完即用，不用配依赖，也不用记参数。 |
+| **五种负载，一个端口** | 对话、向量、重排、语音合成、语音识别共用一套模型库和同一个 OpenAI 兼容端点：`/v1/chat/completions`、`/v1/embeddings`、`/v1/rerank`、`/v1/audio/speech`、`/v1/audio/transcriptions`，视觉投影器走对话链路。只启动一个服务，只盯一处状态，不必为每种负载单独维护一套。 |
+| **实测参数优化，不靠猜** | 不会照搬经验值：真正加载模型，在你这张卡上测草稿器（无、MTP、DFlash2、EAGLE-3）、草稿深度 1/2/3/4/6、flash attention 与安全批处理形状。标准模式先选草稿器，再交叉四种批处理；深度模式让前两名草稿配置再比一轮。每候选 5 次 256 token 采样取中位数，报告可按解码 / Prefill / 接受率 / 综合排序，并能导出 JSON。 |
+| **推理加速，实测为准** | 原生支持 MTP、DFlash2、EAGLE-3 与 n-gram 投机解码，自适应闸门在收益消失时停用；前缀缓存消掉重复预填充。测速与聊天用同一套采样参数，报告里的数字就是实际能拿到的速度。 |
+| **智能适配机器** | 上下文由显存和模型自动推导，不作为调优项；KV 缓存默认 `q8_0`。显存不够时，稠密模型只卸载装得下的层，MoE 模型只把最少的专家层留在 CPU 并给 GPU 专家缓存，而不是固定搬走八层；安装包缺的后端会按签名清单按需下载。 |
+| **为 Agent 而生** | OpenAI 兼容端点，OpenClaw、Hermes 和各类 SDK 客户端不用改就能接入；原生工具调用、可中断的流式输出、略微过期的模型名也能解析，出错时给出能直接处理的信息。 |
+| **本地与云端统一** | 本地模型和云厂商直连跑在同一个端口上。可选的 `auto` 策略尽量把活留在本机，只把本机不擅长的部分送出去——同样的质量、更低的账单，不锁定厂商。 |
 
 > 仓库简介（英文 / GitHub repo description）：*Nexllama is a hardware-aware
 > all-in-one desktop inference and API gateway, losslessly wrapping llama.cpp. One
@@ -43,20 +43,20 @@ Nexllama 是一个对硬件有感知能力的一体化本地推理桌面与 API 
 
 ### Windows
 
-两种安装包，差别只有一点：要不要把英伟达运行库一起打包。
+两个安装包的区别只有一点：是否自带 NVIDIA 运行库。
 
 | 安装包 | 体积 | 适用机器 |
 |---|---|---|
-| **标准版** [`Nexllama_0.2.1_x64-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.1/Nexllama_0.2.1_x64-setup.exe) | ~497 MB | **推荐首选。** 内置一份可移植的 CPU 构建和英伟达 CUDA 运行库（`cudart64`、`cublas64`、`cublasLt64`），不需要预装任何东西。新电脑、笔记本，或者你不确定装没装过 CUDA 的机器，都选它：有 N 卡就走 GPU，没有就自动用 CPU。 |
-| **精简版** [`Nexllama_0.2.1_x64-lite-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.1/Nexllama_0.2.1_x64-lite-setup.exe) | ~145 MB | 只适合**已经装好 CUDA 运行库**的机器，通常是开发机。它省掉了那三个英伟达 DLL——其中 `cublasLt64_13.dll` 一个就有 428 MB。**新电脑或从没装过 CUDA 的机器请用标准版**：缺运行库时 CUDA 后端起不来，应用会退回 CPU 运行（能用，但慢得多）。 |
+| **标准版** [`Nexllama_0.2.1_x64-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.1/Nexllama_0.2.1_x64-setup.exe) | ~497 MB | **首选。** 自带可移植的 CPU 后端和 NVIDIA CUDA 运行库（`cudart64`、`cublas64`、`cublasLt64`），不需要预装任何东西。有 N 卡就走 GPU，没有就自动用 CPU——新机器、笔记本、不确定装没装 CUDA 的机器，都选它。 |
+| **精简版** [`Nexllama_0.2.1_x64-lite-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.1/Nexllama_0.2.1_x64-lite-setup.exe) | ~145 MB | 只适合**已经装好 CUDA 运行库**的机器，通常是开发机。它省掉三个 NVIDIA DLL，其中 `cublasLt64_13.dll` 单个就有 428 MB。**新机器或没装过 CUDA 的机器请用标准版**：缺运行库时 CUDA 后端起不来，只能退回 CPU（能用，但慢得多）。 |
 
 两个安装包的产品名、安装目录与开机启动项一致，装另一个会直接覆盖，不会留下两份。
 
-安装包未做代码签名，Windows 可能提示“未知发布者”。请选择 **更多信息 → 仍要运行**，并用 [`SHA256SUMS.txt`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.1/SHA256SUMS.txt) 校验下载文件。
+安装包没有代码签名，Windows 可能提示“未知发布者”。请点 **更多信息 → 仍要运行**，并用 [`SHA256SUMS.txt`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.1/SHA256SUMS.txt) 校验下载内容。
 
-运行安装程序并打开 Nexllama。首次启动时，应用会按本机情况挑一个后端，并在 `http://127.0.0.1:15656` 上拉起守护进程。
+运行安装程序，打开 Nexllama。首次启动时，应用会根据本机硬件选择后端，并在 `http://127.0.0.1:15656` 启动守护进程。
 
-安装器的选项页会问你要留下什么——桌面快捷方式和开机自启，默认都勾选，之后随时可在设置里改。
+安装选项会问是否创建桌面快捷方式、是否开机自启，默认都勾选，之后可在设置里修改。
 
 模型默认从 `C:\models` 读取；想换位置就在设置里改，或者在首次启动前把一个 GGUF 放进去。
 
