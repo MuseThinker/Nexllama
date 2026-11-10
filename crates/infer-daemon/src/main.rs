@@ -332,6 +332,10 @@ async fn main() -> anyhow::Result<()> {
                 && infer_core::has_mtp(std::path::Path::new(model)))
         {
             cfg.load_mtp = false;
+            // `--mtp-n-max` also implies the head (`load_mtp || mtp_n_max > 0`),
+            // so clearing only the flag would still ask an embedding model to
+            // draft and fail its load.
+            cfg.mtp_n_max = 0;
         }
         cfg.draft_n_max = args.draft_n_max;
         // An automatic context is sized here exactly as it is on `/admin/load`.
