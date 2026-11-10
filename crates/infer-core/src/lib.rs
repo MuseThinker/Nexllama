@@ -8,8 +8,8 @@ pub mod tune;
 pub mod types;
 
 pub use engine::{
-    EmbedResult, Engine, EngineHandle, EngineInfo, FlashAttn, KvCacheType, LoadConfig, LoadEvent,
-    LoadMode, LoraAdapter, RerankResult,
+    AsrOptions, AsrResult, EmbedResult, Engine, EngineHandle, EngineInfo, FlashAttn, KvCacheType,
+    LoadConfig, LoadEvent, LoadMode, LoraAdapter, RerankResult,
 };
 pub use error::{InferError, Result};
 pub use fit::{FitReport, ModelFootprint};
@@ -36,6 +36,17 @@ pub fn model_class_of(path: &std::path::Path) -> &'static str {
 pub fn is_moe(path: &std::path::Path) -> bool {
     gguf_probe::probe(path)
         .map(|probed| probed.is_moe())
+        .unwrap_or(false)
+}
+
+/// Whether a projector carries an audio encoder.
+///
+/// The text checkpoint in an ASR bundle is an ordinary LLM, so the projector is
+/// the only file that says the pair can hear. Read from the header, before any
+/// load, which is what lets the library group it as speech recognition.
+pub fn mmproj_has_audio(path: &std::path::Path) -> bool {
+    gguf_probe::probe(path)
+        .map(|probed| probed.audio_encoder)
         .unwrap_or(false)
 }
 

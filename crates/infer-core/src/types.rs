@@ -13,6 +13,13 @@ pub struct ChatMsg {
     /// of base64 back out.
     #[serde(default, skip_serializing)]
     pub images: Vec<Vec<u8>>,
+    /// Encoded audio clips attached to this turn, in order (WAV, MP3, FLAC).
+    ///
+    /// Raw file bytes for the same reason as `images`: libmtmd decodes and
+    /// resamples them to the audio encoder's rate, so decoding here would only
+    /// duplicate work it already does correctly.
+    #[serde(default, skip_serializing)]
+    pub audio: Vec<Vec<u8>>,
     /// The tool calls an assistant turn requested, as the OpenAI `tool_calls`
     /// array. Passed back to the chat template so the model sees what it asked
     /// for before the results arrive.
@@ -29,6 +36,7 @@ impl ChatMsg {
             role: role.into(),
             content: content.into(),
             images: Vec::new(),
+            audio: Vec::new(),
             tool_calls: None,
             tool_call_id: None,
         }
@@ -36,6 +44,11 @@ impl ChatMsg {
 
     pub fn with_images(mut self, images: Vec<Vec<u8>>) -> Self {
         self.images = images;
+        self
+    }
+
+    pub fn with_audio(mut self, audio: Vec<Vec<u8>>) -> Self {
+        self.audio = audio;
         self
     }
 
@@ -51,6 +64,15 @@ impl ChatMsg {
 
     pub fn image_count(&self) -> usize {
         self.images.len()
+    }
+
+    pub fn audio_count(&self) -> usize {
+        self.audio.len()
+    }
+
+    /// Media items on this turn, in the order the prompt markers must appear.
+    pub fn media_count(&self) -> usize {
+        self.images.len() + self.audio.len()
     }
 }
 

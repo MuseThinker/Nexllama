@@ -75,6 +75,9 @@ pub fn router(
         // Speech synthesis, served by the `llama-tts` sidecar. Same port and
         // same bearer token as everything else; no second server to expose.
         .route("/v1/audio/speech", post(speech))
+        // Speech recognition, served in-process by an ASR bundle (llama.cpp's
+        // mtmd audio projector). OpenAI-compatible multipart surface.
+        .route("/v1/audio/transcriptions", post(transcription))
         // Upstream llama.cpp registers the same four rerank spellings.
         .route("/v1/rerank", post(rerank))
         .route("/rerank", post(rerank))
@@ -139,6 +142,10 @@ pub fn router(
 
     app.layer(cors_layer(&cors_origins))
         .layer(RequestBodyLimitLayer::new(limits::BODY_BYTES))
+        // `RequestBodyLimitLayer` caps the stream, but extractors keep their own
+        // 2 MB default — below a real audio upload, and `Multipart` is an
+        // extractor. Both limits have to be raised.
+        .layer(axum::extract::DefaultBodyLimit::max(limits::BODY_BYTES))
         .with_state(state)
 }
 
@@ -624,6 +631,10 @@ async fn fit_check(
 enum ModelSlot {
     Chat,
     Vision,
+    /// Speech recognition: an LLM whose projector is an audio encoder. Kept
+    /// apart from Chat so a transcription model is not picked as the default
+    /// chat model, and so `/v1/chat/completions` can refuse it by slot.
+    Audio,
     Embedding,
     Rerank,
 }
@@ -633,6 +644,7 @@ impl ModelSlot {
         match self {
             ModelSlot::Chat => "the other chat model",
             ModelSlot::Vision => "the other vision model",
+            ModelSlot::Audio => "the other speech model",
             ModelSlot::Embedding => "the other embedding model",
             ModelSlot::Rerank => "the other rerank model",
         }
@@ -641,21 +653,22 @@ impl ModelSlot {
 
 /// The slot a checkpoint occupies, read from its header alone.
 ///
-/// `vision` is passed in when the caller already knows — a bundle being loaded
+/// `mmproj` is passed in when the caller already knows — a bundle being loaded
 /// with its projector — because the projector file is what makes it one, and
-/// that pairing is only known at load time.
-fn model_slot_for(path: &std::path::Path, vision: Option<bool>) -> Option<ModelSlot> {
+/// that pairing is only known at load time. An audio projector outranks the
+/// text checkpoint's class: an ASR bundle's weights are an ordinary LLM.
+fn model_slot_for(path: &std::path::Path, mmproj: Option<&std::path::Path>) -> Option<ModelSlot> {
     let class = infer_core::model_class_of(path);
     match class {
         "embedding" => Some(ModelSlot::Embedding),
         "rerank" => Some(ModelSlot::Rerank),
         // An unreadable file classifies as a chat model, which is the safe
         // default: it will simply be asked to serve as one.
-        _ => Some(if vision.unwrap_or(false) {
-            ModelSlot::Vision
-        } else {
-            ModelSlot::Chat
-        }),
+        _ => match mmproj {
+            Some(mmproj) if infer_core::mmproj_has_audio(mmproj) => Some(ModelSlot::Audio),
+            Some(_) => Some(ModelSlot::Vision),
+            None => Some(ModelSlot::Chat),
+        },
     }
 }
 
@@ -664,6 +677,7 @@ fn slot_of(info: &infer_core::EngineInfo) -> ModelSlot {
     match info.model_class.as_str() {
         "embedding" => ModelSlot::Embedding,
         "rerank" => ModelSlot::Rerank,
+        _ if info.audio && !info.vision => ModelSlot::Audio,
         _ if info.vision => ModelSlot::Vision,
         _ => ModelSlot::Chat,
     }
@@ -1481,6 +1495,31 @@ async fn load(
         cfg.prefix_cache_max_mb = mb;
     }
 
+    // Replacing a resident model of the same id: free the old instance first.
+    // Loading the new copy beside it needs both sets of weights on the device,
+    // which a model that already fills the card cannot do — llama.cpp fails
+    // inside the second load and can take the whole daemon with it. The old
+    // configuration is kept as `dormant`, so a request that names the model
+    // still reloads it if this attempt fails.
+    let replaced = {
+        let mut guard = state.inner.lock().await;
+        let old = guard.models.remove(&id);
+        if let Some(replaced) = &old {
+            guard
+                .dormant
+                .insert(id.clone(), Dormant::from_loaded(replaced));
+        }
+        old
+    };
+    if let Some(old) = replaced {
+        notes.push(
+            "the model was already resident; the previous instance was released before loading \
+             the new parameters"
+                .into(),
+        );
+        let _ = tokio::task::spawn_blocking(move || drop(old)).await;
+    }
+
     // Measured before anything is displaced: refusing a load must not cost the
     // caller the model that is already serving. A measurement that fails is
     // advisory too — `fit.rs` documents "never refuses a model on its own" and
@@ -1705,7 +1744,7 @@ async fn load(
     // can act on. Parked models keep their configuration in `dormant`, so the
     // next request that names one reloads it — the same path the idle reaper
     // uses, and nothing is lost if the load below fails.
-    let incoming_slot = model_slot_for(&path, req.mmproj.as_ref().map(|_| true));
+    let incoming_slot = model_slot_for(&path, req.mmproj.as_deref().map(Path::new));
     if let Some(slot) = incoming_slot {
         let parked = park_models_in_slot(&state, &id, slot).await;
         if !parked.is_empty() {
@@ -1734,7 +1773,7 @@ async fn load(
             // room for 600 MB is a worse answer than saying what is missing.
             let may_release_all = matches!(
                 incoming_slot,
-                Some(ModelSlot::Chat) | Some(ModelSlot::Vision)
+                Some(ModelSlot::Chat) | Some(ModelSlot::Vision) | Some(ModelSlot::Audio)
             );
             let freed = if may_release_all {
                 release_all_except(&state, &id).await
@@ -2042,6 +2081,227 @@ fn speech_voice(weights: &Path, voice: Option<&str>) -> ApiResult<Option<std::pa
 /// The work happens in `llama-tts`, a sidecar that shares this backend's
 /// llama.cpp DLLs. The port, the token and the lifecycle stay the daemon's;
 /// only the audio generation lives outside the process.
+/// `POST /v1/audio/transcriptions` — OpenAI-compatible speech recognition.
+///
+/// Runs in this process: an ASR bundle is an ordinary llama.cpp text model plus
+/// an audio projector, so there is no sidecar to spawn and no second port to
+/// expose. Audio is decoded and resampled by libmtmd (WAV, MP3, FLAC), which is
+/// why the bytes are forwarded untouched.
+async fn transcription(
+    State(state): State<AppState>,
+    mut form: axum::extract::Multipart,
+) -> ApiResult<Response> {
+    let mut audio: Option<Vec<u8>> = None;
+    let mut requested: Option<String> = None;
+    let mut language: Option<String> = None;
+    let mut context: Option<String> = None;
+    let mut format = String::from("json");
+
+    while let Some(field) = form
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("multipart: {e}")))?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "file" => {
+                if audio.is_some() {
+                    return Err(ApiError::BadRequest(
+                        "only one audio file per request".into(),
+                    ));
+                }
+                audio = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|e| ApiError::BadRequest(format!("file: {e}")))?
+                        .to_vec(),
+                );
+            }
+            "model" => {
+                requested = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| ApiError::BadRequest(format!("model: {e}")))?,
+                )
+            }
+            "language" => {
+                let value = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("language: {e}")))?;
+                language = asr_language(&value);
+            }
+            "prompt" => {
+                context = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| ApiError::BadRequest(format!("prompt: {e}")))?,
+                )
+            }
+            "response_format" => {
+                format = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("response_format: {e}")))?
+                    .trim()
+                    .to_ascii_lowercase()
+            }
+            // Greedy decoding is the right default for a transcript; the field
+            // is accepted for client compatibility and deliberately ignored.
+            "temperature" | "timestamp_granularities[]" => {
+                let _ = field.bytes().await;
+            }
+            _ => {
+                let _ = field.bytes().await;
+            }
+        }
+    }
+
+    let Some(audio) = audio.filter(|a| !a.is_empty()) else {
+        return Err(ApiError::BadRequest(
+            "file is required and must not be empty".into(),
+        ));
+    };
+    if !matches!(format.as_str(), "json" | "text" | "verbose_json") {
+        return Err(ApiError::BadRequest(format!(
+            "response_format {format:?} needs timestamps this model does not produce; use json, text or verbose_json"
+        )));
+    }
+
+    let (handle, id, _active) = {
+        let mut guard = state.inner.lock().await;
+        let id = match requested.filter(|m| !m.trim().is_empty()) {
+            Some(name) => match guard.models.get(&name) {
+                Some(l) if matches!(slot_of(&l.info), ModelSlot::Audio) => name,
+                Some(_) => {
+                    return Err(ApiError::BadRequest(format!(
+                        "{name} is not a speech model; load an ASR bundle (weights plus an audio mmproj)"
+                    )))
+                }
+                None => {
+                    return Err(ApiError::NotFound(format!(
+                        "{name:?} is not loaded; load an ASR bundle first"
+                    )))
+                }
+            },
+            None => guard
+                .models
+                .iter()
+                .find(|(_, l)| matches!(slot_of(&l.info), ModelSlot::Audio))
+                .map(|(k, _)| k.clone())
+                .ok_or_else(|| {
+                    ApiError::NotFound(
+                        "no speech model is loaded; load an ASR bundle (weights plus an audio mmproj) first"
+                            .into(),
+                    )
+                })?,
+        };
+        let handle = guard
+            .models
+            .get(&id)
+            .ok_or(ApiError::NotLoaded)?
+            .engine
+            .handle();
+        // A transcription can run longer than the idle timer; this keeps the
+        // reaper from unloading the model underneath it.
+        let active = guard.begin(&id).ok_or(ApiError::NotLoaded)?;
+        (handle, id, active)
+    };
+
+    let opts = infer_core::AsrOptions {
+        language,
+        context,
+        max_tokens: 0,
+    };
+    let result = tokio::task::spawn_blocking(move || handle.transcribe(audio, opts))
+        .await
+        .map_err(|e| ApiError::Model(format!("transcription task failed: {e}")))?
+        .map_err(|e| ApiError::Model(e.to_string()))?;
+
+    tracing::info!(
+        model = %id,
+        language = ?result.language,
+        inferred = result.stats.generated_tokens,
+        "transcribed audio"
+    );
+
+    Ok(match format.as_str() {
+        "text" => (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            result.text,
+        )
+            .into_response(),
+        "verbose_json" => Json(json!({
+            "task": "transcribe",
+            "language": result.language,
+            "text": result.text,
+            "segments": [{
+                "id": 0,
+                "start": 0.0,
+                "end": serde_json::Value::Null,
+                "text": result.text,
+            }],
+            "usage": {
+                "prompt_tokens": result.stats.prompt_tokens,
+                "completion_tokens": result.stats.generated_tokens,
+                "total_tokens": result.stats.prompt_tokens + result.stats.generated_tokens,
+            },
+        }))
+        .into_response(),
+        _ => Json(json!({ "text": result.text })).into_response(),
+    })
+}
+
+/// Map OpenAI's `language` values onto the canonical names Qwen3-ASR expects.
+///
+/// The model is strict about the names (`Chinese`, not `zh`), and OpenAI clients
+/// send ISO-639-1. An unknown value is passed through: a model that understands
+/// it gets what the caller meant, and one that does not says so.
+fn asr_language(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let canonical = match t.to_ascii_lowercase().as_str() {
+        "auto" | "none" => return None,
+        "zh" | "chinese" | "cmn" => "Chinese",
+        "en" | "english" => "English",
+        "yue" | "cantonese" => "Cantonese",
+        "ja" | "japanese" => "Japanese",
+        "ko" | "korean" => "Korean",
+        "de" | "german" => "German",
+        "fr" | "french" => "French",
+        "es" | "spanish" => "Spanish",
+        "pt" | "portuguese" => "Portuguese",
+        "ru" | "russian" => "Russian",
+        "it" | "italian" => "Italian",
+        "ar" | "arabic" => "Arabic",
+        "th" | "thai" => "Thai",
+        "vi" | "vietnamese" => "Vietnamese",
+        "id" | "indonesian" => "Indonesian",
+        "tr" | "turkish" => "Turkish",
+        "hi" | "hindi" => "Hindi",
+        "ms" | "malay" => "Malay",
+        "nl" | "dutch" => "Dutch",
+        "sv" | "swedish" => "Swedish",
+        "da" | "danish" => "Danish",
+        "fi" | "finnish" => "Finnish",
+        "pl" | "polish" => "Polish",
+        "cs" | "czech" => "Czech",
+        "fil" | "filipino" => "Filipino",
+        "fa" | "persian" => "Persian",
+        "el" | "greek" => "Greek",
+        "hu" | "hungarian" => "Hungarian",
+        "mk" | "macedonian" => "Macedonian",
+        "ro" | "romanian" => "Romanian",
+        other => return Some(other.to_string()),
+    };
+    Some(canonical.to_string())
+}
+
 async fn speech(
     State(state): State<AppState>,
     Json(req): Json<SpeechRequest>,
@@ -2687,11 +2947,9 @@ async fn ensure_ready(state: &AppState, id: &str) -> ApiResult<()> {
     tracing::info!(%id, "reloading a model freed while idle");
     // One model per slot applies here too: naming a released model is a request
     // to switch to it, and the device has no room to hold both.
-    if let Some(slot) = model_slot_for(&d.path, Some(d.info.vision)) {
-        let parked = park_models_in_slot(state, id, slot).await;
-        if !parked.is_empty() {
-            let _ = tokio::task::spawn_blocking(move || drop(parked)).await;
-        }
+    let parked = park_models_in_slot(state, id, slot_of(&d.info)).await;
+    if !parked.is_empty() {
+        let _ = tokio::task::spawn_blocking(move || drop(parked)).await;
     }
     let cfg = d.config.clone();
     let engine = tokio::task::spawn_blocking(move || Engine::load(cfg, |_| {}))
@@ -2752,6 +3010,18 @@ async fn chat_engine(
     if class != "llm" {
         return Err(ApiError::NotFound(format!(
             "{id} is a {class} model — it cannot generate text; load a chat model (class llm)",
+        )));
+    }
+    // A speech-recognition bundle is an LLM, but its only useful input is audio.
+    // Text chat through it produces invented transcripts, so point the caller at
+    // the endpoint that does the job.
+    if guard
+        .models
+        .get(&id)
+        .is_some_and(|l| matches!(slot_of(&l.info), ModelSlot::Audio))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "{id} is a speech model; POST audio to /v1/audio/transcriptions instead"
         )));
     }
     let (engine, thinking) = {

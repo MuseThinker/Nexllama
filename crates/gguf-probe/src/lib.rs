@@ -174,6 +174,14 @@ pub struct Probe {
     pub full_attention_interval: Option<u64>,
     /// `<arch>.expert_count`, present on mixture-of-experts models.
     pub expert_count: Option<u64>,
+    /// Whether the file is a projector with an audio encoder.
+    ///
+    /// `clip.audio.*` (projector type, mel shape) or `clip.has_audio_encoder` is
+    /// how an mmproj says it can hear. The text checkpoint behind an ASR bundle
+    /// is an ordinary LLM, so this is the only header that tells the two apart.
+    pub audio_encoder: bool,
+    /// Whether the file is a projector with a vision encoder.
+    pub vision_encoder: bool,
 }
 
 impl Probe {
@@ -366,6 +374,8 @@ fn read_header<R: BufRead + Seek>(mut reader: R) -> Result<Probe, ProbeError> {
         embedding_length: None,
         full_attention_interval: None,
         expert_count: None,
+        audio_encoder: false,
+        vision_encoder: false,
     };
 
     for _ in 0..kv_count {
@@ -387,6 +397,18 @@ fn read_header<R: BufRead + Seek>(mut reader: R) -> Result<Probe, ProbeError> {
             }
             ("rerank.head_count", GgufType::U32) => {
                 found.rerank_heads = Some(u64::from(read_u32(&mut reader)?));
+            }
+            (key, value_type)
+                if key.starts_with("clip.audio.") || key == "clip.has_audio_encoder" =>
+            {
+                found.audio_encoder = true;
+                skip_value(&mut reader, value_type)?;
+            }
+            (key, value_type)
+                if key.starts_with("clip.vision.") || key == "clip.has_vision_encoder" =>
+            {
+                found.vision_encoder = true;
+                skip_value(&mut reader, value_type)?;
             }
             ("rerank.head_count", GgufType::U64) => {
                 found.rerank_heads = Some(u64::from_le_bytes(read_u8x8(&mut reader)?));

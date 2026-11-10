@@ -1,7 +1,9 @@
 <script>
 import { onDestroy, onMount } from 'svelte';
 import { daemon } from '../lib/api.js';
+import { startDaemon } from '../lib/daemonctl.js';
 import { t } from '../lib/i18n.js';
+import { hasTauri } from '../lib/tauri.js';
 
 let messages = $state([]);
 let input = $state('');
@@ -152,6 +154,10 @@ function removeImage(i) {
 const CHAT_MODEL_KEY = 'nexllama.chatModel';
 
 let refreshing = false;
+// A dead daemon is a lifecycle problem, not a model one. Without this, the page
+// polls a port nobody is listening on forever and every message fails as
+// "failed to fetch" — which reads like the reloaded model refusing to answer.
+let lastRevive = 0;
 
 async function refreshModels() {
   // Skip a poll whose predecessor is still waiting: the daemon can be busy
@@ -162,9 +168,13 @@ async function refreshModels() {
   try {
     const s = await daemon.status();
     // Only generation models belong here. Embedding, rerank and TTS models
-    // serve the HTTP API; none of them decodes a chat continuation.
+    // serve the HTTP API; none of them decodes a chat continuation. A
+    // speech-recognition bundle is an LLM too, but text chat through it is
+    // nonsense, so it is served by /v1/audio/transcriptions instead.
     const chatty = (s.models ?? []).filter(
-      (m) => !['embedding', 'rerank', 'tts'].includes(m.info?.model_class),
+      (m) =>
+        !['embedding', 'rerank', 'tts'].includes(m.info?.model_class) &&
+        !(m.info?.audio && !m.info?.vision),
     );
     apiOnly = (s.models ?? []).length - chatty.length;
     models = chatty;
@@ -180,7 +190,16 @@ async function refreshModels() {
       selected = pick?.id ?? '';
     }
   } catch {
-    /* daemon offline */
+    // The daemon is not answering. Start it once every few seconds rather than
+    // on every poll, and let the next successful poll refresh the list.
+    if (hasTauri && Date.now() - lastRevive > 10_000) {
+      lastRevive = Date.now();
+      try {
+        await startDaemon();
+      } catch {
+        /* the start error is shown by the page that owns the daemon controls */
+      }
+    }
   } finally {
     refreshing = false;
   }

@@ -19,7 +19,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 tokio-stream = "0.1"
 tower-http = { version = "0.6", features = ["cors", "limit", "fs"] }
 # Proxying cloud providers on the same port as the local engine. rustls so the

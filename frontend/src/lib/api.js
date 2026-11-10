@@ -285,6 +285,46 @@ export const daemon = {
   },
 
   /**
+   * Transcribe an audio clip through `/v1/audio/transcriptions`.
+   *
+   * `file` is a Blob/File; the daemon decodes and resamples WAV, MP3 and FLAC
+   * itself, so nothing is converted here. No `content-type` header: the browser
+   * has to set the multipart boundary.
+   */
+  transcribe: async (file, opts = {}) => {
+    const form = new FormData();
+    form.append('file', file, file.name || 'audio.wav');
+    if (opts.model) form.append('model', opts.model);
+    if (opts.language) form.append('language', opts.language);
+    if (opts.prompt) form.append('prompt', opts.prompt);
+    form.append('response_format', opts.response_format || 'json');
+    const key = apiKey();
+    let res;
+    try {
+      res = await fetch(baseUrl() + '/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: key ? { authorization: `Bearer ${key}` } : {},
+        body: form,
+      });
+    } catch (e) {
+      throw readableAbort(e, 0);
+    }
+    if (!res.ok) {
+      const err = httpError(res);
+      try {
+        const detail = (await res.json())?.error;
+        if (typeof detail === 'string' && detail.trim()) {
+          err.message = `${res.status}: ${detail}`;
+        }
+      } catch {
+        /* not JSON; the status line is all we have */
+      }
+      throw err;
+    }
+    return res.json();
+  },
+
+  /**
    * Stream one completion, yielding a parsed frame per event.
    *
    * `signal` aborts the request, and the reader is released on the way out

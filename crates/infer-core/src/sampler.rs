@@ -76,6 +76,15 @@ pub struct SamplerParams {
     /// `None` means unconstrained output.
     #[serde(default)]
     pub response_format_json: Option<String>,
+    /// Qwen3-ASR style language forcing, as a canonical name (`Chinese`,
+    /// `English`, …).
+    ///
+    /// The model asks for it *after* the assistant generation prompt, not in the
+    /// user turn: `language Chinese<asr_text>`. That position is part of the
+    /// prompt the model was trained on, so it travels with the request rather
+    /// than being glued on by the HTTP layer.
+    #[serde(default)]
+    pub asr_language: Option<String>,
 }
 
 impl Default for SamplerParams {
@@ -106,6 +115,7 @@ impl Default for SamplerParams {
             tool_choice: None,
             parallel_tool_calls: false,
             response_format_json: None,
+            asr_language: None,
         }
     }
 }

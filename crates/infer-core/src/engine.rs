@@ -781,6 +781,9 @@ pub struct EngineInfo {
     /// Whether a projector was loaded, i.e. whether this model can see images.
     #[serde(default)]
     pub vision: bool,
+    /// Whether the loaded projector has an audio encoder (speech input).
+    #[serde(default)]
+    pub audio: bool,
     #[serde(default)]
     pub mmproj_path: Option<PathBuf>,
     /// Which decoder family the GGUF carries: `llm`, `embedding` or `rerank`.
@@ -808,6 +811,28 @@ pub struct EngineInfo {
     /// the reason is reported here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_error: Option<String>,
+}
+
+/// Options for [`Engine::transcribe`].
+#[derive(Debug, Clone, Default)]
+pub struct AsrOptions {
+    /// Canonical language name the model understands (`Chinese`, `English`, …).
+    /// `None` lets the model detect it.
+    pub language: Option<String>,
+    /// Short context placed in the system turn. Qwen3-ASR accepts an empty one.
+    pub context: Option<String>,
+    /// Hard cap on generated tokens; `0` uses 2048.
+    pub max_tokens: usize,
+}
+
+/// One transcription plus the timing that produced it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AsrResult {
+    /// The transcript with the model's `language X<asr_text>` header removed.
+    pub text: String,
+    /// Language the model reported, or the one that was forced.
+    pub language: Option<String>,
+    pub stats: GenStats,
 }
 
 /// Progress emitted while a model is loading.
@@ -931,6 +956,53 @@ impl EngineHandle {
         }
     }
 
+    /// Transcribe one audio clip with a loaded ASR model.
+    ///
+    /// Mirrors Qwen3-ASR's own recipe: a system turn carrying the optional
+    /// context, then a user turn holding nothing but the audio, with the
+    /// language tag (when one is forced) appended after the assistant prompt.
+    /// Greedy sampling: a transcript is not a creative writing task, and
+    /// sampling only adds hallucinated words.
+    pub fn transcribe(&self, audio: Vec<u8>, opts: AsrOptions) -> Result<AsrResult> {
+        if !self.info().audio {
+            return Err(InferError::MediaUnavailable { media: 1 });
+        }
+        let context = opts.context.unwrap_or_default();
+        let msgs = [
+            ChatMsg::new("system", context),
+            ChatMsg::new("user", "").with_audio(vec![audio]),
+        ];
+        let params = SamplerParams {
+            temperature: 0.0,
+            top_k: 1,
+            top_p: 1.0,
+            min_p: 0.0,
+            seed: 1,
+            max_tokens: if opts.max_tokens == 0 {
+                2048
+            } else {
+                opts.max_tokens
+            },
+            speculative: false,
+            ngram_m: 1,
+            thinking: None,
+            asr_language: opts.language.clone(),
+            ..SamplerParams::default()
+        };
+
+        let mut raw = String::new();
+        let stats = self.generate(&msgs, &params, |piece| {
+            raw.push_str(piece);
+            true
+        })?;
+        let (language, text) = parse_asr_output(&raw, opts.language.as_deref());
+        Ok(AsrResult {
+            text,
+            language,
+            stats,
+        })
+    }
+
     /// Embed each text, returning one vector per input in the same order.
     pub fn embed(&self, texts: &[String]) -> Result<EmbedResult> {
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -1021,6 +1093,41 @@ impl Engine {
     pub fn rerank(&self, query: &str, documents: &[String]) -> Result<RerankResult> {
         self.handle.rerank(query, documents)
     }
+
+    /// Transcribe one audio clip with a loaded ASR model.
+    ///
+    /// The prompt mirrors Qwen3-ASR's own recipe: a system turn carrying the
+    /// optional context, then a user turn holding nothing but the audio, with
+    /// the language tag (when one is forced) appended after the assistant
+    /// prompt. Greedy sampling: a transcript is not a creative writing task, and
+    /// sampling only adds hallucinated words.
+    pub fn transcribe(&self, audio: Vec<u8>, opts: AsrOptions) -> Result<AsrResult> {
+        self.handle.transcribe(audio, opts)
+    }
+}
+
+/// Split Qwen3-ASR's `language X<asr_text>transcript` output.
+///
+/// A forced language makes the model emit plain text, but older conversions
+/// still write the header; stripping it in both cases keeps the caller from
+/// having to know which shape it got.
+fn parse_asr_output(raw: &str, forced: Option<&str>) -> (Option<String>, String) {
+    let s = raw.trim();
+    let (meta, text) = match s.split_once("<asr_text>") {
+        Some((meta, text)) => (Some(meta.trim()), text.trim()),
+        None => (None, s),
+    };
+    let language = forced
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            meta.and_then(|m| m.strip_prefix("language"))
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && *l != "None")
+                .map(str::to_string)
+        });
+    (language, text.to_string())
 }
 
 impl Drop for Engine {
@@ -1451,8 +1558,10 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
     let drafting = Arc::new(AtomicBool::new(true));
 
     // The projector has to be built against the already-loaded text model, and it
-    // is optional: without one the model simply cannot see images.
-    let vision = match &cfg.mmproj {
+    // is optional: without one the model cannot see images or hear audio.
+    // A pure ASR bundle ships an audio-only projector, so both capabilities are
+    // accepted; which one is present is reported to the caller.
+    let (vision, supports_audio) = match &cfg.mmproj {
         Some(path) => {
             let params = MtmdContextParams::default()
                 .with_flash_attn_type(match cfg.flash_attn {
@@ -1460,24 +1569,32 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
                     FlashAttn::On => LlamaFlashAttnType::Enabled,
                     FlashAttn::Off => LlamaFlashAttnType::Disabled,
                 })
+                // Long clips become several audio chunks. The default 1024 is
+                // the text budget; an audio encoder's token count can exceed it
+                // on a single 30 s window, and a chunk that does not fit fails
+                // the whole prompt.
+                .with_batch_max_tokens(4096)
                 .print_timings(false)
                 .warmup(false);
             match MtmdContext::init_from_file(path, &model, params) {
-                Ok(ctx) if !ctx.supports_vision() => {
+                Ok(ctx) if !ctx.supports_vision() && !ctx.supports_audio() => {
                     let _ = ready.send(LoadEvent::Error(format!(
-                        "{} has no vision projector (audio/video only)",
+                        "{} has no vision or audio encoder",
                         path.display()
                     )));
                     return;
                 }
-                Ok(ctx) => Some(ctx),
+                Ok(ctx) => {
+                    let audio = ctx.supports_audio();
+                    (Some(ctx), audio)
+                }
                 Err(e) => {
                     let _ = ready.send(LoadEvent::Error(format!("mmproj {}: {e}", path.display())));
                     return;
                 }
             }
         }
-        None => None,
+        None => (None, false),
     };
 
     // llama.cpp builds contexts with warmup disabled and leaves the run to the
@@ -1549,7 +1666,8 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
         n_params: model.n_params(),
         model_size: model.model_size(),
         ftype: model.ftype().map(|f| format!("{f:?}")),
-        vision: vision.is_some(),
+        vision: vision.as_ref().is_some_and(|c| c.supports_vision()),
+        audio: supports_audio,
         mmproj_path: cfg.mmproj.clone(),
         model_class: class.as_str().to_string(),
         // What an embedding or rank call actually returns: a pooled embedding
@@ -2222,21 +2340,31 @@ fn fill_prompt(
     start: usize,
 ) -> Result<(usize, i32, Vec<LlamaToken>)> {
     let images: usize = msgs.iter().map(ChatMsg::image_count).sum();
-    let Some(vision) = vision.as_ref().filter(|_| images > 0) else {
-        if images > 0 {
-            return Err(InferError::VisionUnavailable { images });
+    let audio: usize = msgs.iter().map(ChatMsg::audio_count).sum();
+    let media = images + audio;
+    let Some(vision) = vision.as_ref().filter(|_| media > 0) else {
+        if media > 0 {
+            return Err(InferError::MediaUnavailable { media });
         }
         return fill_text_prompt(model, ctx, templates, params, msgs, n_ctx, n_batch, start);
     };
-    // An image prompt takes the mtmd path, which owns its own encoding and has
+    // A media prompt takes the mtmd path, which owns its own encoding and has
     // no token prefix to match against, so any cached offset is ignored here.
     // It also keeps the legacy template path: libmtmd renders the conversation
     // itself, and reasoning control is a text-only concern for now.
 
-    let prompt = render_prompt(model, msgs, vision)?;
+    let prompt = render_prompt(model, msgs, vision, params)?;
 
-    let mut bitmaps = Vec::with_capacity(images);
+    // The bitmaps must be in the same order as their markers in the prompt:
+    // render_prompt puts audio first, then the turn's text, then images.
+    let mut bitmaps = Vec::with_capacity(media);
     for msg in msgs {
+        for data in &msg.audio {
+            bitmaps.push(
+                MtmdBitmap::from_buf(vision, data)
+                    .map_err(|e| InferError::Audio(format!("audio: {e}")))?,
+            );
+        }
         for data in &msg.images {
             bitmaps.push(
                 MtmdBitmap::from_buf(vision, data)
@@ -2433,22 +2561,38 @@ fn fill_text_prompt(
 /// marker is just text as far as the template is concerned: some templates emit
 /// one themselves, most do not. Counting after templating and topping up is more
 /// robust than trying to predict which is which.
-fn render_prompt(model: &LlamaModel, msgs: &[ChatMsg], vision: &MtmdContext) -> Result<String> {
+fn render_prompt(
+    model: &LlamaModel,
+    msgs: &[ChatMsg],
+    vision: &MtmdContext,
+    params: &SamplerParams,
+) -> Result<String> {
     let marker = vision.marker().to_string();
-    let images: usize = msgs.iter().map(ChatMsg::image_count).sum();
+    let media: usize = msgs.iter().map(ChatMsg::media_count).sum();
 
-    // Put each marker in the message that carries the picture. Appending the
-    // shortfall to the whole prompt instead used to hoist every image above the
-    // system prompt and out of its own turn, which is not a conversation the
-    // model was trained on — the turn the picture belongs to is the point.
+    // Put each marker in the message that carries the picture or clip. Appending
+    // the shortfall to the whole prompt instead used to hoist every image above
+    // the system prompt and out of its own turn, which is not a conversation the
+    // model was trained on — the turn the media belongs to is the point.
+    //
+    // Audio goes in front of the text: ASR models read the clip before the
+    // instruction, while images stay after it, as the vision templates expect.
     let messages = msgs
         .iter()
         .map(|m| {
             let mut content = m.content.clone();
             let have = content.matches(&marker).count();
-            let want = m.image_count();
+            let want = m.media_count();
             if want > have {
-                content.push_str(&marker.repeat(want - have));
+                let mut missing = want - have;
+                if m.audio_count() > 0 {
+                    let front = m.audio_count().min(missing);
+                    content = format!("{}{content}", marker.repeat(front));
+                    missing -= front;
+                }
+                if missing > 0 {
+                    content.push_str(&marker.repeat(missing));
+                }
             }
             LlamaChatMessage::new(m.role.clone(), content)
         })
@@ -2459,18 +2603,27 @@ fn render_prompt(model: &LlamaModel, msgs: &[ChatMsg], vision: &MtmdContext) -> 
         .apply_chat_template(None, &messages, true)
         .map_err(|e| InferError::ChatTemplate(e.to_string()))?;
 
+    // Qwen3-ASR asks for a forced language *after* the assistant prompt, so the
+    // reply is plain transcription text instead of `language X<asr_text>...`.
+    let prompt = match &params.asr_language {
+        Some(lang) if !lang.trim().is_empty() => {
+            format!("{prompt}language {}<asr_text>", lang.trim())
+        }
+        _ => prompt,
+    };
+
     let present = prompt.matches(&marker).count();
-    match present.cmp(&images) {
+    match present.cmp(&media) {
         std::cmp::Ordering::Equal => Ok(prompt),
         std::cmp::Ordering::Less => {
-            // The template dropped the markers it was handed. The images still
-            // have to go somewhere, and the end of the prompt at least leaves
+            // The template dropped the markers it was handed. The media still
+            // has to go somewhere, and the end of the prompt at least leaves
             // every turn intact.
-            let extra = marker.repeat(images - present);
+            let extra = marker.repeat(media - present);
             Ok(format!("{prompt}{extra}"))
         }
         std::cmp::Ordering::Greater => Err(InferError::Vision(format!(
-            "the chat template emits {present} media markers but {images} images were attached"
+            "the chat template emits {present} media markers but {media} items were attached"
         ))),
     }
 }

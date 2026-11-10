@@ -19,9 +19,15 @@ pub enum InferError {
         "{images} image(s) attached, but this model has no vision projector (no mmproj loaded)"
     )]
     VisionUnavailable { images: usize },
+    /// The request carried media but the model has no projector for it.
+    #[error("{media} media item(s) attached, but this model has no audio/vision projector (no mmproj loaded)")]
+    MediaUnavailable { media: usize },
     /// Image encoding or multimodal prompt assembly failed.
     #[error("vision failed: {0}")]
     Vision(String),
+    /// Audio decoding or multimodal prompt assembly failed.
+    #[error("audio failed: {0}")]
+    Audio(String),
     /// Embedding a text failed, usually because the model has no pooling type.
     #[error("embedding failed: {0}")]
     Embedding(String),

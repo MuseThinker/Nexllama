@@ -181,29 +181,45 @@ pub fn bundle(name: &str, dir: &str, files: Vec<serde_json::Value>) -> serde_jso
         .map(|p| p.classify().as_str().to_string())
         .unwrap_or_else(|| gguf_probe::ModelClass::Llm.as_str().to_string());
     let mtp = probe.as_ref().is_some_and(gguf_probe::Probe::has_mtp);
+    // The projector is what says whether a bundle can hear, see, or both. An
+    // ASR bundle's text weights are an ordinary LLM, so the main header alone
+    // would file it under chat and invite the wrong load.
+    let projector = pick("projector");
+    let projector_probe = projector
+        .as_ref()
+        .and_then(|p| p.as_str())
+        .and_then(|p| gguf_probe::probe(p).ok());
+    let audio = projector_probe.as_ref().is_some_and(|p| p.audio_encoder);
+    let vision = projector_probe.as_ref().is_some_and(|p| p.vision_encoder);
+    let kind = if class == "tts" {
+        // A TTS bundle also has a projector, but it is an audio encoder, not a
+        // vision one: calling it "vision" would put it in the wrong group and
+        // invite a chat load.
+        "tts"
+    } else if audio && !vision {
+        "asr"
+    } else if projector.is_some() {
+        // A projector that cannot be read is still a projector; the common case
+        // is vision, and mislabelling it "llm" would offer it for plain chat.
+        "vision"
+    } else if pick("draft").is_some() {
+        "speculative"
+    } else {
+        class.as_str()
+    };
     serde_json::json!({
         "name": name,
         "dir": dir,
         "size": size,
         "main": main,
-        "projector": pick("projector"),
+        "projector": projector,
         "draft": pick("draft"),
         "loras": loras,
         "class": class,
         "mtp": mtp,
         "draft_kind": pick("draft").and_then(|d| d.as_str().map(draft_kind_label)),
-        "kind": if class == "tts" {
-            // A TTS bundle also has a projector, but it is an audio encoder,
-            // not a vision one: calling it "vision" would put it in the wrong
-            // group and invite a chat load.
-            "tts"
-        } else if pick("projector").is_some() {
-            "vision"
-        } else if pick("draft").is_some() {
-            "speculative"
-        } else {
-            class.as_str()
-        },
+        "kind": kind,
+        "audio": audio,
         "files": files,
     })
 }
