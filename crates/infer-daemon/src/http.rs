@@ -2561,6 +2561,19 @@ async fn tune_start(
                 loaded.info.model_class
             )));
         }
+        // A speech bundle is an LLM by class, but the sweep would strip its
+        // audio encoder (`base.mmproj = None`) and then measure text decoding
+        // against a text prompt — numbers that describe nothing the model is
+        // used for. Its cost is the encoder, and that needs its own protocol.
+        if loaded.info.audio && !loaded.info.vision {
+            return Err(ApiError::BadRequest(
+                "speech-recognition models are not tuned by the chat-speed sweep; that sweep \
+                 measures a text decode loop, and this model's work is audio encoding. A \
+                 transcription benchmark (seconds of audio per second, first-text latency) is \
+                 the measurement that applies."
+                    .into(),
+            ));
+        }
         let mut base = loaded.config.clone();
         base.n_ctx = loaded.n_ctx;
         base.n_gpu_layers = loaded.n_gpu_layers;

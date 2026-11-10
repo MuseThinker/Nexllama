@@ -1465,7 +1465,7 @@ async function saveCloud(silent) {
                 ctx {m.n_ctx} · GPU {m.n_gpu_layers} · {$t('models.idle')} {m.idle_secs}s
               {/if}
             </span>
-            {#if m.info?.model_class === 'llm'}
+            {#if m.info?.model_class === 'llm' && !(m.info?.audio && !m.info?.vision)}
               <button
                 class="ghost"
                 onclick={(e) => toggleTuneMenu(e, m)}
