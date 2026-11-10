@@ -61,6 +61,7 @@ const dict = {
 
     'models.title': '模型',
     'models.refresh': '刷新',
+    'models.refreshHint': '重新读取已加载模型和服务状态（页面不会自动刷新）',
     'models.loaded': '已加载',
     'models.none': '暂无已加载模型。',
     'models.unload': '卸载',
@@ -354,6 +355,7 @@ const dict = {
 
     'models.title': 'Models',
     'models.refresh': 'Refresh',
+    'models.refreshHint': 'Re-read loaded models and service state (the page does not poll)',
     'models.loaded': 'Loaded',
     'models.none': 'No model loaded.',
     'models.unload': 'Unload',

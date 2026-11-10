@@ -658,19 +658,6 @@ async function unload(id) {
   }
 }
 
-async function unloadAll() {
-  busy = '*';
-  try {
-    await daemon.unload();
-    await refresh();
-    await persistAutoLoad();
-  } catch (e) {
-    error = describeError(e);
-  } finally {
-    busy = '';
-  }
-}
-
 async function search() {
   if (!query.trim()) return;
   searching = true;
@@ -1060,10 +1047,9 @@ async function saveCloud(silent) {
   <header>
     <h2>{$t('models.title')}</h2>
     <div class="row">
-      <button class="ghost" onclick={refreshAll}>{$t('models.refresh')}</button>
-      {#if loadedModels.length > 0}
-        <button class="ghost" onclick={unloadAll} disabled={busy !== ''}>{$t('models.unload')}</button>
-      {/if}
+      <button class="ghost" onclick={refreshAll} title={$t('models.refreshHint')}>
+        {$t('models.refresh')}
+      </button>
     </div>
   </header>
 
