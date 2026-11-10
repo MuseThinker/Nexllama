@@ -128,8 +128,8 @@ npm --prefix frontend install
 .\scripts\package.ps1                 # 标准版：cpu + cuda + 英伟达运行库
 .\scripts\package.ps1 -Edition lite   # 精简版：不打包英伟达运行库
 .\scripts\package.ps1 -Edition both   # 两者都出，只编译一次守护进程
-# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.1_x64-setup.exe
-# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.1_x64-lite-setup.exe
+# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.2_x64-setup.exe
+# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.2_x64-lite-setup.exe
 ```
 
 `-Native` 会把构建机的指令集编进去——CPU 推理更快，但产物只能在同款或同代 CPU 上运行。个人自用无所谓，要发给别人就别加。

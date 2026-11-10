@@ -1585,7 +1585,7 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
     // is optional: without one the model cannot see images or hear audio.
     // A pure ASR bundle ships an audio-only projector, so both capabilities are
     // accepted; which one is present is reported to the caller.
-    let (vision, supports_audio) = match &cfg.mmproj {
+    let (mut vision, supports_audio) = match &cfg.mmproj {
         Some(path) => {
             let params = MtmdContextParams::default()
                 .with_flash_attn_type(match cfg.flash_attn {
@@ -1654,7 +1654,7 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
         if let Err(e) = run_generate(
             &model,
             &mut ctx,
-            &vision,
+            &mut vision,
             templates.as_ref(),
             &msgs,
             &params,
@@ -1736,7 +1736,7 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
                 } else if let Err(e) = run_generate(
                     &model,
                     &mut ctx,
-                    &vision,
+                    &mut vision,
                     templates.as_ref(),
                     &msgs,
                     &params,
@@ -1956,7 +1956,7 @@ fn trim_messages_to_ctx(
 fn run_generate<'m, 'd>(
     model: &LlamaModel,
     ctx: &mut LlamaContext<'m>,
-    vision: &Option<MtmdContext>,
+    vision: &mut Option<MtmdContext>,
     templates: Option<&ChatTemplates>,
     msgs: &[ChatMsg],
     params: &SamplerParams,
@@ -2350,7 +2350,7 @@ fn warmup_context(ctx: &mut LlamaContext, model: &LlamaModel, n_batch: usize) ->
 fn fill_prompt(
     model: &LlamaModel,
     ctx: &mut LlamaContext,
-    vision: &Option<MtmdContext>,
+    vision: &mut Option<MtmdContext>,
     templates: Option<&ChatTemplates>,
     params: &SamplerParams,
     msgs: &[ChatMsg],
@@ -2361,7 +2361,7 @@ fn fill_prompt(
     let images: usize = msgs.iter().map(ChatMsg::image_count).sum();
     let audio: usize = msgs.iter().map(ChatMsg::audio_count).sum();
     let media = images + audio;
-    let Some(vision) = vision.as_ref().filter(|_| media > 0) else {
+    let Some(vision) = vision.as_mut().filter(|_| media > 0) else {
         if media > 0 {
             return Err(InferError::MediaUnavailable { media });
         }
@@ -2402,7 +2402,7 @@ fn fill_prompt(
     let mut n_past = 0i32;
     vision
         .eval_chunks(
-            ctx.as_ptr(),
+            ctx,
             &chunks,
             0,
             0,

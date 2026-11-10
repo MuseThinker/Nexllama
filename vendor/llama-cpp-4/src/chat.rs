@@ -96,9 +96,10 @@ impl ToolChoice {
     pub fn parse_oaicompat(value: &str) -> Result<Self, ChatError> {
         let c_value = CString::new(value)?;
         let mut raw: i32 = 0;
-        let status = unsafe {
-            sys::chat_shim_tool_choice_parse_oaicompat(c_value.as_ptr(), &raw mut raw)
-        };
+        let status =
+            // SAFETY: the `CString` arguments are alive for the duration of the call, and any
+            // out-param is a stack local the shim writes through.
+            unsafe { sys::chat_shim_tool_choice_parse_oaicompat(c_value.as_ptr(), &raw mut raw) };
         check_status(status)?;
         Self::from_raw(raw).ok_or_else(|| ChatError::Failed(format!("unknown tool_choice {raw}")))
     }
@@ -153,6 +154,8 @@ impl ReasoningFormat {
 /// [`ChatError::Failed`] if it is not a schema llama.cpp can convert.
 pub fn json_schema_to_grammar(schema_json: &str, force_gbnf: bool) -> Result<String, ChatError> {
     let c_schema = CString::new(schema_json)?;
+    // SAFETY: the `CString` arguments are alive for the duration of the call, and any
+    // out-param is a stack local the shim writes through.
     read_string(|buf, len, expected| unsafe {
         sys::common_json_schema_to_grammar_c(c_schema.as_ptr(), force_gbnf, buf, len, expected)
     })
@@ -171,10 +174,14 @@ pub struct ChatTemplates {
 // mutability reachable through `&self` — `apply` and the getters only read it.
 // The shim's only mutable global is a `thread_local` error buffer.
 unsafe impl Send for ChatTemplates {}
+// SAFETY: every method that mutates this handle takes `&mut self`, so a shared
+// reference reaches only reads.
 unsafe impl Sync for ChatTemplates {}
 
 impl Drop for ChatTemplates {
     fn drop(&mut self) {
+        // SAFETY: this runs once from `Drop` on a non-null handle, and nothing reads it
+        // afterwards.
         unsafe { sys::chat_shim_templates_free(self.raw.as_ptr()) }
     }
 }
@@ -197,6 +204,8 @@ impl ChatTemplates {
     ) -> Result<Self, ChatError> {
         let c_override = template_override.map(CString::new).transpose()?;
         let override_ptr = c_override.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
+        // the library owns whatever it returns.
         let raw = unsafe { sys::chat_shim_templates_init(model.model.as_ptr(), override_ptr) };
         NonNull::new(raw)
             .map(|raw| Self { raw })
@@ -211,6 +220,9 @@ impl ChatTemplates {
     pub fn source(&self, variant: Option<&str>) -> Result<String, ChatError> {
         let c_variant = variant.map(CString::new).transpose()?;
         let variant_ptr = c_variant.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        // SAFETY: the closure hands the shim a buffer pointer together with its capacity,
+        // and the shim reports how much it needed; nothing is read back unless it
+        // reported success.
         read_string(|buf, len, expected| unsafe {
             sys::chat_shim_templates_source(self.raw.as_ptr(), variant_ptr, buf, len, expected)
         })
@@ -219,12 +231,16 @@ impl ChatTemplates {
     /// Whether the caller supplied the template rather than the model.
     #[must_use]
     pub fn was_explicit(&self) -> bool {
+        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
+        // arguments are scalars the library validates itself.
         unsafe { sys::chat_shim_templates_was_explicit(self.raw.as_ptr()) }
     }
 
     /// Whether this template understands `enable_thinking`.
     #[must_use]
     pub fn supports_enable_thinking(&self) -> bool {
+        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
+        // arguments are scalars the library validates itself.
         unsafe { sys::chat_shim_templates_support_enable_thinking(self.raw.as_ptr()) }
     }
 
@@ -238,6 +254,9 @@ impl ChatTemplates {
     ///
     /// Returns [`ChatError::Failed`] if llama.cpp could not report caps.
     pub fn caps_json(&self) -> Result<String, ChatError> {
+        // SAFETY: the closure hands the shim a buffer pointer together with its capacity,
+        // and the shim reports how much it needed; nothing is read back unless it
+        // reported success.
         read_string(|buf, len, expected| unsafe {
             sys::chat_shim_templates_get_caps(self.raw.as_ptr(), buf, len, expected)
         })
@@ -253,7 +272,11 @@ impl ChatTemplates {
         let messages = CString::new(params.messages_json.as_str())?;
         let tools = params.tools_json.as_deref().map(CString::new).transpose()?;
         let grammar = params.grammar.as_deref().map(CString::new).transpose()?;
-        let schema = params.json_schema.as_deref().map(CString::new).transpose()?;
+        let schema = params
+            .json_schema
+            .as_deref()
+            .map(CString::new)
+            .transpose()?;
         let kwargs = params
             .template_kwargs_json
             .as_deref()
@@ -285,8 +308,13 @@ impl ChatTemplates {
         // the parser pointer — for which zero is the NULL the shim also writes
         // on a size query — and the shim overwrites all of them before
         // reporting success.
+        // SAFETY: the struct is a plain-old-data `repr(C)` type with no pointer or
+        // reference fields, so an all-zero value is a valid instance; the shim
+        // fills it in immediately below.
         let mut result: sys::chat_shim_apply_result = unsafe { std::mem::zeroed() };
         let mut needed: usize = 0;
+        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
+        // arguments are scalars the library validates itself.
         let status = unsafe {
             sys::chat_shim_templates_apply(
                 self.raw.as_ptr(),
@@ -302,6 +330,8 @@ impl ChatTemplates {
         }
 
         let mut buf = vec![0u8; needed];
+        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
+        // arguments are scalars the library validates itself.
         let status = unsafe {
             sys::chat_shim_templates_apply(
                 self.raw.as_ptr(),
@@ -485,6 +515,8 @@ struct ChatParser {
 // through a `const common_peg_arena &` with all mutable state in a per-call
 // context. Nothing reachable through `&self` mutates it.
 unsafe impl Send for ChatParser {}
+// SAFETY: every method that mutates this handle takes `&mut self`, so a shared
+// reference reaches only reads.
 unsafe impl Sync for ChatParser {}
 
 impl std::fmt::Debug for ChatParser {
@@ -495,6 +527,8 @@ impl std::fmt::Debug for ChatParser {
 
 impl Drop for ChatParser {
     fn drop(&mut self) {
+        // SAFETY: this runs once from `Drop` on a non-null handle, and nothing reads it
+        // afterwards.
         unsafe { sys::chat_shim_parser_free(self.raw.as_ptr()) }
     }
 }
@@ -795,9 +829,7 @@ impl ChatParams {
         else {
             return Vec::new();
         };
-        let starts_with_space = self
-            .generation_prompt
-            .starts_with(char::is_whitespace);
+        let starts_with_space = self.generation_prompt.starts_with(char::is_whitespace);
         let mut out = Vec::with_capacity(tokens.len());
         for (i, token) in tokens.into_iter().enumerate() {
             if i == 0 && !starts_with_space {
@@ -837,6 +869,9 @@ impl ChatParams {
             format: self.format,
             is_partial,
         };
+        // SAFETY: the closure hands the shim a buffer pointer together with its capacity,
+        // and the shim reports how much it needed; nothing is read back unless it
+        // reported success.
         read_string(|buf, len, expected| unsafe {
             sys::chat_shim_parse(&raw const params, buf, len, expected)
         })
@@ -849,6 +884,9 @@ impl ChatParams {
 ///
 /// Returns [`ChatError::Failed`] if llama.cpp cannot name the format.
 pub fn format_name(format: i32) -> Result<String, ChatError> {
+    // SAFETY: the closure hands the shim a buffer pointer together with its capacity,
+    // and the shim reports how much it needed; nothing is read back unless it
+    // reported success.
     read_string(|buf, len, expected| unsafe {
         sys::chat_shim_format_name(format, buf, len, expected)
     })
@@ -866,6 +904,9 @@ pub fn format_name(format: i32) -> Result<String, ChatError> {
 /// [`ChatError::Failed`] if it is not a valid message array.
 pub fn parse_messages_oaicompat(messages_json: &str) -> Result<String, ChatError> {
     let c_messages = CString::new(messages_json)?;
+    // SAFETY: the closure hands the shim a buffer pointer together with its capacity,
+    // and the shim reports how much it needed; nothing is read back unless it
+    // reported success.
     read_string(|buf, len, expected| unsafe {
         sys::chat_shim_msgs_parse_oaicompat(c_messages.as_ptr(), buf, len, expected)
     })
@@ -880,6 +921,9 @@ pub fn parse_messages_oaicompat(messages_json: &str) -> Result<String, ChatError
 /// [`ChatError::Failed`] if it is not a valid tool array.
 pub fn parse_tools_oaicompat(tools_json: &str) -> Result<String, ChatError> {
     let c_tools = CString::new(tools_json)?;
+    // SAFETY: the closure hands the shim a buffer pointer together with its capacity,
+    // and the shim reports how much it needed; nothing is read back unless it
+    // reported success.
     read_string(|buf, len, expected| unsafe {
         sys::chat_shim_tools_parse_oaicompat(c_tools.as_ptr(), buf, len, expected)
     })
@@ -1167,12 +1211,18 @@ mod tests {
 
     #[test]
     fn tool_choice_parses_openai_values() {
-        assert_eq!(ToolChoice::parse_oaicompat("auto").unwrap(), ToolChoice::Auto);
+        assert_eq!(
+            ToolChoice::parse_oaicompat("auto").unwrap(),
+            ToolChoice::Auto
+        );
         assert_eq!(
             ToolChoice::parse_oaicompat("required").unwrap(),
             ToolChoice::Required
         );
-        assert_eq!(ToolChoice::parse_oaicompat("none").unwrap(), ToolChoice::None);
+        assert_eq!(
+            ToolChoice::parse_oaicompat("none").unwrap(),
+            ToolChoice::None
+        );
     }
 
     #[test]
@@ -1197,8 +1247,7 @@ mod tests {
 
     #[test]
     fn messages_parse_oaicompat_roundtrips_a_simple_turn() {
-        let normalised =
-            parse_messages_oaicompat(r#"[{"role":"user","content":"hi"}]"#).unwrap();
+        let normalised = parse_messages_oaicompat(r#"[{"role":"user","content":"hi"}]"#).unwrap();
         assert!(normalised.contains("user"), "got {normalised}");
         assert!(normalised.contains("hi"), "got {normalised}");
     }

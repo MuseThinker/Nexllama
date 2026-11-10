@@ -164,8 +164,8 @@ npm --prefix frontend install
 .\scripts\package.ps1                 # standard: cpu + cuda + NVIDIA runtime
 .\scripts\package.ps1 -Edition lite   # lite: leaves the runtime out
 .\scripts\package.ps1 -Edition both   # both, from one daemon build
-# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.1_x64-setup.exe
-# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.1_x64-lite-setup.exe
+# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.2_x64-setup.exe
+# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.2_x64-lite-setup.exe
 ```
 
 `-Native` bakes the build machine's instruction set in — faster CPU inference, but
