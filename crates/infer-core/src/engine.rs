@@ -1593,11 +1593,6 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
                     FlashAttn::On => LlamaFlashAttnType::Enabled,
                     FlashAttn::Off => LlamaFlashAttnType::Disabled,
                 })
-                // Long clips become several audio chunks. The default 1024 is
-                // the text budget; an audio encoder's token count can exceed it
-                // on a single 30 s window, and a chunk that does not fit fails
-                // the whole prompt.
-                .with_batch_max_tokens(4096)
                 .print_timings(false)
                 .warmup(false);
             match MtmdContext::init_from_file(path, &model, params) {
