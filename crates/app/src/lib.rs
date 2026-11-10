@@ -1035,9 +1035,12 @@ fn try_spawn_backend(
         }
         Some(files.iter().filter_map(get).collect())
     };
-    // The head is a daemon-wide flag, so it is only used when it can only mean
-    // one model.
-    let mtp_head = models.len() == 1 && files.first().is_some_and(|f| f.mtp);
+    // The head is a daemon-wide flag, so it is passed when any startup model
+    // can use it. It used to require exactly one model, which silently dropped
+    // MTP whenever an embedding model was auto-loaded beside the chat model —
+    // the very common setup. The daemon now ignores the flag for a checkpoint
+    // with no head (and for encoders), so the others are unaffected.
+    let mtp_head = files.iter().any(|f| f.mtp);
 
     for m in &models {
         cmd.arg("--model").arg(m);

@@ -322,6 +322,17 @@ async fn main() -> anyhow::Result<()> {
         cfg.model_path = model.clone().into();
         cfg.mmproj = one(&args.mmproj);
         cfg.draft_model = one(&args.draft_model);
+        // `--load-mtp` is daemon-wide, but only a generation model that
+        // actually ships the head may act on it. Without this, auto-loading an
+        // embedding model beside a chat model made every startup model ask for
+        // a head, so the flag had to be dropped for all of them — and MTP
+        // silently disappeared after a restart.
+        if cfg.load_mtp
+            && !(infer_core::model_class_of(std::path::Path::new(model)) == "llm"
+                && infer_core::has_mtp(std::path::Path::new(model)))
+        {
+            cfg.load_mtp = false;
+        }
         cfg.draft_n_max = args.draft_n_max;
         // An automatic context is sized here exactly as it is on `/admin/load`.
         // Zero must not reach llama.cpp: it reads 0 as "the model's own default",

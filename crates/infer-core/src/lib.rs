@@ -39,6 +39,13 @@ pub fn is_moe(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a checkpoint ships llama.cpp's multi-token-prediction (NextN) head.
+pub fn has_mtp(path: &std::path::Path) -> bool {
+    gguf_probe::probe(path)
+        .map(|probed| probed.has_mtp())
+        .unwrap_or(false)
+}
+
 /// Whether a projector carries an audio encoder.
 ///
 /// The text checkpoint in an ASR bundle is an ordinary LLM, so the projector is

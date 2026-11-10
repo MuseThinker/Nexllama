@@ -550,9 +550,27 @@ async function startTune(m, depth = 'quick') {
 
 async function pollTune(id) {
   while (tune.job?.id === id) {
-    const status = await daemon.tuneStatus(id);
-    tune.status = status;
-    if (status?.status?.phase !== 'running') break;
+    try {
+      const status = await daemon.tuneStatus(id);
+      tune.status = status;
+      if (status?.status?.phase !== 'running') break;
+    } catch (e) {
+      // An HTTP error is the sweep's own answer. A missing status means the
+      // daemon is not there at all — and a sweep lives in its memory, so the
+      // job is gone with it. Saying that, then trying to start the service,
+      // beats showing "port 15656 unreachable" as if the model were at fault.
+      if (typeof e?.status === 'number') {
+        tune.error = describeError(e);
+      } else {
+        tune.error = $t('models.tuneServiceLost');
+        try {
+          await daemonStart();
+        } catch {
+          /* the service panel reports why a start was refused */
+        }
+      }
+      break;
+    }
     await tuneSleep(2000);
   }
   await refresh();
