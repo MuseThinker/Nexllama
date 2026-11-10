@@ -13,9 +13,9 @@ hardware fitting, speculative decoding, prefix cache, one local/cloud endpoint.*
 ## ✨ Nexllama
 
 Nexllama is a hardware-aware all-in-one desktop inference and API gateway,
-losslessly wrapping llama.cpp. One process serves chat, embeddings, reranking and
-speech synthesis, all from the same GGUF model library and the same
-OpenAI-compatible port. Models download automatically or import in one click; there
+losslessly wrapping llama.cpp. One process serves chat, embeddings, reranking,
+speech synthesis and speech recognition, all from the same GGUF model library
+and the same OpenAI-compatible port. Models download automatically or import in one click; there
 is no manual compilation and no GPU-layer guesswork, because the hardware is
 detected and configured for you. Native support for MTP, DFlash2, EAGLE-3 and
 n-gram speculative decoding, prefix caching, a `q8_0` KV cache by default, and a
@@ -31,7 +31,7 @@ performance.
 | Feature | What it is |
 |---|---|
 | **All-in-One** | llama.cpp used as it is, behind a desktop interface instead of a command line, with the model library, the downloader and the API included. There is nothing else to install and no flags to learn. |
-| **Four workloads, one port** | Chat, embeddings, reranking and speech synthesis run from one model library and one OpenAI-compatible endpoint: `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/audio/speech`, with vision projectors on the chat path. One daemon to start, one place to watch, no per-workload server to keep in sync. |
+| **Five workloads, one port** | Chat, embeddings, reranking, speech synthesis and speech recognition run from one model library and one OpenAI-compatible endpoint: `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/audio/speech`, `/v1/audio/transcriptions`, with vision projectors on the chat path. One daemon to start, one place to watch, no per-workload server to keep in sync. |
 | **Measured tuning, not guesswork** | v0.2.1's two-tier sweep loads the checkpoint and measures what actually happens on this GPU: drafter family (none, MTP, DFlash2, EAGLE-3), draft depth 1/2/3/4/6, flash attention and safe batch shapes. Standard mode follows the drafter winner with four batch variants; deep mode crosses the top two drafter configurations, 5 sampled passes of 256 tokens each, median reported, sortable by decode/prefill/acceptance and exportable as JSON. |
 | **Fits itself to the machine** | Context is derived from VRAM and the checkpoint, never offered as a tuning knob. The KV cache defaults to `q8_0`; a dense model that does not fit offloads only the layers the free VRAM can hold, a MoE model keeps the minimum experts on the CPU plus a GPU expert cache, and a backend the machine needs but the package does not carry is downloaded from a signed manifest on demand. |
 | **Blazing-fast inference, honestly measured** | Native MTP, DFlash2, EAGLE-3 and n-gram speculative decoding behind an adaptive gate that switches drafting off the moment it stops paying, plus a prefix cache that removes repeated prefill. Tuning samples like a real reply (T=0.8, model-default thinking), so the reported speed is the speed you get, not a greedy best case. |

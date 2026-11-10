@@ -11,14 +11,14 @@
 
 ## ✨ Nexllama
 
-Nexllama 是一个对硬件有感知能力的一体化本地推理桌面与 API 网关，对 llama.cpp 只做封装、不改动内核。同一个进程同时提供对话、向量、重排与语音合成，共用一套 GGUF 模型库和同一个 OpenAI 兼容端口；模型自动下载、一键导入。不需要自己编译，也不用手工去调 GPU 卸载层数——程序会探测本机硬件并据此完成适配。原生支持 MTP、DFlash2、EAGLE-3、n-gram 投机解码与前缀缓存，KV 缓存默认 `q8_0`，并提供实测参数优化：在你这台机器上真实测试草稿器、草稿深度与批处理形状，而不是照搬经验值。面向 Agent 场景做了优化：流式输出可中断、原生工具调用、模型名容错解析。本地 GGUF 与云端大模型共用一个 API 端点，可选的算力路由默认关闭、不绑定任何厂商，同时完整保留 llama.cpp 的原生推理性能。
+Nexllama 是一个对硬件有感知能力的一体化本地推理桌面与 API 网关，对 llama.cpp 只做封装、不改动内核。同一个进程同时提供对话、向量、重排、语音合成与语音识别，共用一套 GGUF 模型库和同一个 OpenAI 兼容端口；模型自动下载、一键导入。不需要自己编译，也不用手工去调 GPU 卸载层数——程序会探测本机硬件并据此完成适配。原生支持 MTP、DFlash2、EAGLE-3、n-gram 投机解码与前缀缓存，KV 缓存默认 `q8_0`，并提供实测参数优化：在你这台机器上真实测试草稿器、草稿深度与批处理形状，而不是照搬经验值。面向 Agent 场景做了优化：流式输出可中断、原生工具调用、模型名容错解析。本地 GGUF 与云端大模型共用一个 API 端点，可选的算力路由默认关闭、不绑定任何厂商，同时完整保留 llama.cpp 的原生推理性能。
 
 ## 🚀 核心亮点
 
 | 特性 | 说明 |
 |---|---|
 | **一体化 All-in-One** | 直接使用原生 llama.cpp，只是把命令行换成了图形界面：模型库、下载器与 OpenAI 兼容 API 全部内置。装完即用，不必再配依赖，也不用记各种参数。 |
-| **四种负载，一个端口** | 对话、向量、重排、语音合成共用一套模型库和同一个 OpenAI 兼容端点：`/v1/chat/completions`、`/v1/embeddings`、`/v1/rerank`、`/v1/audio/speech`，视觉投影器走对话链路。只启动一个守护进程，只盯一处状态，不用为每种负载各维护一套服务。 |
+| **五种负载，一个端口** | 对话、向量、重排、语音合成与语音识别共用一套模型库和同一个 OpenAI 兼容端点：`/v1/chat/completions`、`/v1/embeddings`、`/v1/rerank`、`/v1/audio/speech`、`/v1/audio/transcriptions`，视觉投影器走对话链路。只启动一个守护进程，只盯一处状态，不用为每种负载各维护一套服务。 |
 | **实测参数优化，不靠猜** | v0.2.1 的两级实测会真正加载检查点，在你这张卡上测：草稿器（无、MTP、DFlash2、EAGLE-3）、草稿深度 1/2/3/4/6、flash attention 与安全批处理形状。标准模式在草稿器冠军上再交叉四种批处理；深度模式交叉前两名草稿配置，每候选 5 次 256 token 采样取中位数，报告可按解码 / Prefill / 接受率 / 综合排序，并可导出 JSON。 |
 | **自己适配机器** | 上下文由显存和模型推导，从不作为调优项；KV 缓存默认 `q8_0`。稠密模型装不下时，只把显存装得下的层卸载到 GPU；MoE 模型则把最少数量的专家层留在 CPU，并给 GPU 2 GiB 专家缓存，而不是固定搬走八层；安装包缺的后端会按签名清单按需下载。 |
 | **快得诚实** | 原生 MTP、DFlash2、EAGLE-3 与 n-gram 投机解码，自适应闸门在收益消失时立刻停用；前缀缓存消掉重复预填充。测速按真实聊天采样（T=0.8、思考模式跟随模型），报告里的速度就是实际能拿到的速度，而不是贪心解码的上限。 |
@@ -27,7 +27,7 @@ Nexllama 是一个对硬件有感知能力的一体化本地推理桌面与 API 
 
 > 仓库简介（英文 / GitHub repo description）：*Nexllama is a hardware-aware
 > all-in-one desktop inference and API gateway, losslessly wrapping llama.cpp. One
-> process serves chat, embeddings, reranking and speech synthesis from a built-in
+> process serves chat, embeddings, reranking, speech synthesis and speech recognition from a built-in
 > GGUF model library over an OpenAI-compatible API. No manual compilation or GPU
 > layer tuning: context and placement are derived from the hardware, the KV cache
 > defaults to q8_0, and a measured two-tier tuning sweep picks the drafter, draft
