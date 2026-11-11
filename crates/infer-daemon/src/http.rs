@@ -2646,7 +2646,14 @@ async fn tune_start(
             // Stage one measures with the cache width the model is already
             // using, so a drafter comparison is not secretly a cache
             // comparison; the cross stage tests the other width explicitly.
-            kv: loaded.config.cache_type_k,
+            // Flash attention off cannot carry a quantized V cache, so the
+            // engine runs f16 there whatever the setting says — the report has
+            // to name what was measured.
+            kv: if loaded.config.flash_attn == infer_core::engine::FlashAttn::Off {
+                infer_core::engine::KvCacheType::F16
+            } else {
+                loaded.config.cache_type_k
+            },
         };
         // Free the GPU before the sweep claims it: everything, not only the
         // model under test. Each released model is parked in `dormant` first —
