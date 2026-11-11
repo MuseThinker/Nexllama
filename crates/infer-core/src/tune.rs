@@ -224,17 +224,16 @@ pub fn quick_plan(caps: &TuneCapabilities) -> Vec<TuneCandidate> {
     plan
 }
 
-/// Stage two: the stage-one winner with flash attention, the KV cache type and
-/// batch alternatives.
+/// Stage two: the stage-one winner with flash attention and batch alternatives.
 ///
 /// The drafter and depth are carried over unchanged, so the comparison answers
 /// "what is the best batch shape *for this drafter*", not "what is the best
 /// batch shape for a different configuration".
 ///
-/// The cache width is a candidate here because it is not a small effect on
-/// every device: a card whose quantized-KV kernels are slow can decode almost
-/// twice as fast at f16, and a sweep that never tries it reports the slow
-/// number as the machine's best.
+/// The cache width is deliberately *not* crossed here. It is one head-to-head
+/// against the winner once the ranking is final — see `flip_kv` — because the
+/// width barely interacts with the batch shape, and crossing it would double
+/// the sweep for one answer.
 pub fn cross_plan(best: &TuneCandidate) -> Vec<TuneCandidate> {
     let name = best
         .label
@@ -242,26 +241,17 @@ pub fn cross_plan(best: &TuneCandidate) -> Vec<TuneCandidate> {
         .next()
         .unwrap_or("draft")
         .to_string();
-    let other_kv = match best.kv {
-        KvCacheType::F16 => KvCacheType::Q8_0,
-        KvCacheType::Q8_0 => KvCacheType::F16,
-    };
     let mut out = Vec::new();
-    for (fa, n_batch, n_ubatch, kv) in [
+    for (fa, n_batch, n_ubatch) in [
+        (false, best.n_batch, best.n_ubatch),
+        (true, best.n_batch, 2048),
+        (true, best.n_batch, 1024),
+        (true, 4096, 1024),
+    ] {
         // Without flash attention quantized V is unavailable, so the only
         // honest candidate there is f16.
-        (false, best.n_batch, best.n_ubatch, KvCacheType::F16),
-        (true, best.n_batch, 2048, best.kv),
-        (true, best.n_batch, 1024, best.kv),
-        (true, 4096, 1024, best.kv),
-        (true, best.n_batch, best.n_ubatch, other_kv),
-    ] {
-        let kv = if fa { kv } else { KvCacheType::F16 };
-        if fa == best.flash_attn
-            && n_batch == best.n_batch
-            && n_ubatch == best.n_ubatch
-            && kv == best.kv
-        {
+        let kv = if fa { best.kv } else { KvCacheType::F16 };
+        if fa == best.flash_attn && n_batch == best.n_batch && n_ubatch == best.n_ubatch {
             continue;
         }
         out.push(TuneCandidate {
@@ -276,6 +266,34 @@ pub fn cross_plan(best: &TuneCandidate) -> Vec<TuneCandidate> {
         });
     }
     out
+}
+
+/// The same configuration with the other cache width, for the final head-to-head.
+///
+/// On a device whose quantized-KV kernels are slow this is worth more than every
+/// batch shape combined, but it is one answer, not a dimension: the ranking is
+/// finished by the time this runs, so only the winner pays for it. Returns
+/// `None` when the width is not a choice — flash attention off cannot carry a
+/// quantized V cache.
+pub fn flip_kv(c: &TuneCandidate) -> Option<TuneCandidate> {
+    if !c.flash_attn {
+        return None;
+    }
+    let kv = match c.kv {
+        KvCacheType::F16 => KvCacheType::Q8_0,
+        KvCacheType::Q8_0 => KvCacheType::F16,
+    };
+    let name = c
+        .label
+        .split(" fa=")
+        .next()
+        .unwrap_or("draft")
+        .to_string();
+    Some(TuneCandidate {
+        label: label(&name, c.flash_attn, c.n_ubatch, c.n_batch, kv),
+        kv,
+        ..c.clone()
+    })
 }
 
 /// Deep mode: the top two drafter configurations crossed with the full batch
@@ -465,6 +483,29 @@ pub fn run_sweep(
                     );
                 }
             }
+        }
+    }
+
+    // Final head-to-head: the winner keeps its shape and only the cache width
+    // changes. One load, after the ranking is settled, because that is the only
+    // row where the answer changes what a user should run.
+    if !cancel.load(Ordering::Relaxed) {
+        let winner = measurements
+            .iter()
+            .filter(|m| m.candidate.drafter == Drafter::None || m.draft_acceptance.is_some())
+            .max_by(|a, b| a.tokens_per_second.total_cmp(&b.tokens_per_second))
+            .map(|m| m.candidate.clone());
+        if let Some(c) = winner.as_ref().and_then(flip_kv) {
+            progress(TuneProgress::Planned { total: index + 1 });
+            let _ = run_stage(
+                base,
+                std::slice::from_ref(&c),
+                cancel,
+                &mut index,
+                &mut measurements,
+                &mut skipped,
+                &mut progress,
+            );
         }
     }
 
@@ -700,25 +741,45 @@ mod tests {
         let c = caps(true, true);
         let best = candidate(&c, Drafter::Mtp, 3, true, 2048, 512, KvCacheType::Q8_0);
         let cross = cross_plan(&best);
-        // fa off, two ubatch alternatives, batch 4096, and the other cache width.
-        assert_eq!(cross.len(), 5);
+        // fa off, two ubatch alternatives and batch 4096.
+        assert_eq!(cross.len(), 4);
         assert!(cross
             .iter()
             .all(|p| p.drafter == Drafter::Mtp && p.draft_n_max == 3 && p.n_ctx == best.n_ctx));
         assert!(cross.iter().any(|p| !p.flash_attn));
         assert!(cross.iter().any(|p| p.n_ubatch == 2048));
         assert!(cross.iter().any(|p| p.n_batch == 4096));
-        // The cache width is measured, because on some devices it is worth more
-        // than every batch shape combined.
+        // The cache width is not crossed here; it is one head-to-head at the end.
         assert!(cross
             .iter()
-            .any(|p| p.flash_attn && p.kv == KvCacheType::F16));
+            .filter(|p| p.flash_attn)
+            .all(|p| p.kv == best.kv));
         // Without flash attention quantized V is not available, so no candidate
         // may claim it.
         assert!(cross
             .iter()
             .filter(|p| !p.flash_attn)
             .all(|p| p.kv == KvCacheType::F16));
+    }
+
+    #[test]
+    fn the_final_head_to_head_changes_only_the_cache_width() {
+        let c = caps(true, false);
+        let winner = candidate(&c, Drafter::Mtp, 2, true, 4096, 1024, KvCacheType::Q8_0);
+        let flipped = flip_kv(&winner).expect("flash attention on can flip the width");
+        assert_eq!(flipped.kv, KvCacheType::F16);
+        assert_eq!(flipped.flash_attn, winner.flash_attn);
+        assert_eq!(flipped.n_batch, winner.n_batch);
+        assert_eq!(flipped.n_ubatch, winner.n_ubatch);
+        assert_eq!(flipped.drafter, winner.drafter);
+        assert_eq!(flipped.draft_n_max, winner.draft_n_max);
+        assert_ne!(flipped.label, winner.label, "the row must name its width");
+        // Flipping twice lands back on the original configuration.
+        assert_eq!(flip_kv(&flipped).unwrap().kv, KvCacheType::Q8_0);
+
+        // Flash attention off has no choice to make: the engine runs f16 there.
+        let forced = candidate(&c, Drafter::Mtp, 2, false, 2048, 512, KvCacheType::F16);
+        assert!(flip_kv(&forced).is_none());
     }
 
     #[test]
