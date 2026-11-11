@@ -2643,6 +2643,10 @@ async fn tune_start(
             has_mtp: loaded.info.mtp,
             draft_model,
             draft_label,
+            // Stage one measures with the cache width the model is already
+            // using, so a drafter comparison is not secretly a cache
+            // comparison; the cross stage tests the other width explicitly.
+            kv: loaded.config.cache_type_k,
         };
         // Free the GPU before the sweep claims it: everything, not only the
         // model under test. Each released model is parked in `dormant` first —

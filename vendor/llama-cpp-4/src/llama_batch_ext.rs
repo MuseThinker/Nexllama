@@ -53,6 +53,10 @@
 //! # }
 //! ```
 
+// Every `unsafe` block below is justified in a `SAFETY:` comment; keep it that
+// way. See the note on the lint in the workspace `Cargo.toml`.
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 use std::ptr::NonNull;
 
 use llama_cpp_sys_4::{llama_pos, llama_seq_id};

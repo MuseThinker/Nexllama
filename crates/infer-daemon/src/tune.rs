@@ -245,6 +245,7 @@ mod tests {
             has_mtp: false,
             draft_model: None,
             draft_label: "draft".into(),
+            kv: infer_core::engine::KvCacheType::Q8_0,
         };
         let job = reg.start(
             "m".into(),

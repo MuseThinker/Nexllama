@@ -73,8 +73,6 @@ impl GgmlContext {
             mem_buffer: std::ptr::null_mut(),
             no_alloc,
         };
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let ctx = unsafe { llama_cpp_sys_4::ggml_init(params) };
         Self {
             ctx: NonNull::new(ctx).expect("ggml_init returned null"),
@@ -114,16 +112,12 @@ impl GgmlContext {
     /// will fit, rather than finding out by aborting.
     #[must_use]
     pub fn used_mem(&self) -> usize {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         unsafe { llama_cpp_sys_4::ggml_used_mem(self.ctx.as_ptr()) }
     }
 
     /// Total size of the pool, as passed to [`Self::new`].
     #[must_use]
     pub fn mem_size(&self) -> usize {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         unsafe { llama_cpp_sys_4::ggml_get_mem_size(self.ctx.as_ptr()) }
     }
 
@@ -150,8 +144,6 @@ impl GgmlContext {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     #[must_use]
     pub fn new_tensor_1d(&self, typ: ggml_type, ne0: i64) -> GgmlTensor {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let t = unsafe { llama_cpp_sys_4::ggml_new_tensor_1d(self.ctx.as_ptr(), typ, ne0) };
         GgmlTensor(NonNull::new(t).expect("ggml_new_tensor_1d returned null"))
     }
@@ -165,8 +157,6 @@ impl GgmlContext {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     #[must_use]
     pub fn new_tensor_2d(&self, typ: ggml_type, ne0: i64, ne1: i64) -> GgmlTensor {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let t = unsafe { llama_cpp_sys_4::ggml_new_tensor_2d(self.ctx.as_ptr(), typ, ne0, ne1) };
         GgmlTensor(NonNull::new(t).expect("ggml_new_tensor_2d returned null"))
     }
@@ -181,8 +171,6 @@ impl GgmlContext {
     #[must_use]
     pub fn new_tensor_3d(&self, typ: ggml_type, ne0: i64, ne1: i64, ne2: i64) -> GgmlTensor {
         let t =
-            // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-            // arguments are scalars the library validates itself.
             unsafe { llama_cpp_sys_4::ggml_new_tensor_3d(self.ctx.as_ptr(), typ, ne0, ne1, ne2) };
         GgmlTensor(NonNull::new(t).expect("ggml_new_tensor_3d returned null"))
     }
@@ -203,8 +191,6 @@ impl GgmlContext {
         ne2: i64,
         ne3: i64,
     ) -> GgmlTensor {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let t = unsafe {
             llama_cpp_sys_4::ggml_new_tensor_4d(self.ctx.as_ptr(), typ, ne0, ne1, ne2, ne3)
         };
@@ -220,8 +206,6 @@ impl GgmlContext {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     #[must_use]
     pub fn dup_tensor(&self, src: &GgmlTensor) -> GgmlTensor {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let t = unsafe { llama_cpp_sys_4::ggml_dup_tensor(self.ctx.as_ptr(), src.0.as_ptr()) };
         GgmlTensor(NonNull::new(t).expect("ggml_dup_tensor returned null"))
     }
@@ -235,8 +219,6 @@ impl GgmlContext {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     #[must_use]
     pub fn new_tensor(&self, typ: ggml_type, ne: &[i64]) -> GgmlTensor {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let t = unsafe {
             llama_cpp_sys_4::ggml_new_tensor(
                 self.ctx.as_ptr(),
@@ -261,8 +243,6 @@ impl GgmlContext {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     #[must_use]
     pub fn add(&self, a: &GgmlTensor, b: &GgmlTensor) -> GgmlTensor {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let t = unsafe { llama_cpp_sys_4::ggml_add(self.ctx.as_ptr(), a.0.as_ptr(), b.0.as_ptr()) };
         GgmlTensor(NonNull::new(t).expect("ggml_add returned null"))
     }
@@ -277,8 +257,6 @@ impl GgmlContext {
     #[must_use]
     pub fn mul_mat(&self, a: &GgmlTensor, b: &GgmlTensor) -> GgmlTensor {
         let t =
-            // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-            // arguments are scalars the library validates itself.
             unsafe { llama_cpp_sys_4::ggml_mul_mat(self.ctx.as_ptr(), a.0.as_ptr(), b.0.as_ptr()) };
         GgmlTensor(NonNull::new(t).expect("ggml_mul_mat returned null"))
     }
@@ -292,8 +270,6 @@ impl GgmlContext {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     #[must_use]
     pub fn scale(&self, a: &GgmlTensor, s: f32) -> GgmlTensor {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let t = unsafe { llama_cpp_sys_4::ggml_scale(self.ctx.as_ptr(), a.0.as_ptr(), s) };
         GgmlTensor(NonNull::new(t).expect("ggml_scale returned null"))
     }
@@ -307,8 +283,6 @@ impl GgmlContext {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     #[must_use]
     pub fn cast(&self, a: &GgmlTensor, typ: ggml_type) -> GgmlTensor {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let t = unsafe { llama_cpp_sys_4::ggml_cast(self.ctx.as_ptr(), a.0.as_ptr(), typ) };
         GgmlTensor(NonNull::new(t).expect("ggml_cast returned null"))
     }
@@ -322,8 +296,6 @@ impl GgmlContext {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     #[must_use]
     pub fn cont(&self, a: &GgmlTensor) -> GgmlTensor {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let t = unsafe { llama_cpp_sys_4::ggml_cont(self.ctx.as_ptr(), a.0.as_ptr()) };
         GgmlTensor(NonNull::new(t).expect("ggml_cont returned null"))
     }
@@ -337,8 +309,6 @@ impl GgmlContext {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     #[must_use]
     pub fn transpose(&self, a: &GgmlTensor) -> GgmlTensor {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let t = unsafe { llama_cpp_sys_4::ggml_transpose(self.ctx.as_ptr(), a.0.as_ptr()) };
         GgmlTensor(NonNull::new(t).expect("ggml_transpose returned null"))
     }
@@ -352,8 +322,6 @@ impl GgmlContext {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     #[must_use]
     pub fn reshape_1d(&self, a: &GgmlTensor, ne0: i64) -> GgmlTensor {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let t = unsafe { llama_cpp_sys_4::ggml_reshape_1d(self.ctx.as_ptr(), a.0.as_ptr(), ne0) };
         GgmlTensor(NonNull::new(t).expect("ggml_reshape_1d returned null"))
     }
@@ -368,8 +336,6 @@ impl GgmlContext {
     #[must_use]
     pub fn reshape_2d(&self, a: &GgmlTensor, ne0: i64, ne1: i64) -> GgmlTensor {
         let t =
-            // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-            // arguments are scalars the library validates itself.
             unsafe { llama_cpp_sys_4::ggml_reshape_2d(self.ctx.as_ptr(), a.0.as_ptr(), ne0, ne1) };
         GgmlTensor(NonNull::new(t).expect("ggml_reshape_2d returned null"))
     }
@@ -384,8 +350,6 @@ impl GgmlContext {
     #[must_use]
     pub fn view_1d(&self, a: &GgmlTensor, ne0: i64, offset: usize) -> GgmlTensor {
         let t =
-            // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-            // arguments are scalars the library validates itself.
             unsafe { llama_cpp_sys_4::ggml_view_1d(self.ctx.as_ptr(), a.0.as_ptr(), ne0, offset) };
         GgmlTensor(NonNull::new(t).expect("ggml_view_1d returned null"))
     }
@@ -401,8 +365,6 @@ impl GgmlContext {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     #[must_use]
     pub fn new_graph(&self) -> GgmlGraph {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let g = unsafe { llama_cpp_sys_4::ggml_new_graph(self.ctx.as_ptr()) };
         GgmlGraph(NonNull::new(g).expect("ggml_new_graph returned null"))
     }
@@ -412,8 +374,6 @@ impl GgmlContext {
     /// Get the first tensor in this context.
     #[must_use]
     pub fn first_tensor(&self) -> Option<GgmlTensor> {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let t = unsafe { llama_cpp_sys_4::ggml_get_first_tensor(self.ctx.as_ptr()) };
         NonNull::new(t).map(GgmlTensor)
     }
@@ -422,8 +382,6 @@ impl GgmlContext {
     #[must_use]
     pub fn next_tensor(&self, tensor: &GgmlTensor) -> Option<GgmlTensor> {
         let t =
-            // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-            // arguments are scalars the library validates itself.
             unsafe { llama_cpp_sys_4::ggml_get_next_tensor(self.ctx.as_ptr(), tensor.0.as_ptr()) };
         NonNull::new(t).map(GgmlTensor)
     }
@@ -431,8 +389,6 @@ impl GgmlContext {
 
 impl Drop for GgmlContext {
     fn drop(&mut self) {
-        // SAFETY: this runs once from `Drop` on a non-null handle, and nothing reads it
-        // afterwards.
         unsafe { llama_cpp_sys_4::ggml_free(self.ctx.as_ptr()) }
     }
 }
@@ -462,58 +418,42 @@ impl GgmlTensor {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     pub fn set_name(&self, name: &str) {
         let c_name = std::ffi::CString::new(name).expect("name contains null bytes");
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         unsafe { llama_cpp_sys_4::ggml_set_name(self.0.as_ptr(), c_name.as_ptr()) };
     }
 
     /// Get the number of elements.
     #[must_use]
     pub fn nelements(&self) -> i64 {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         unsafe { llama_cpp_sys_4::ggml_nelements(self.0.as_ptr()) }
     }
 
     /// Get the total size in bytes.
     #[must_use]
     pub fn nbytes(&self) -> usize {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         unsafe { llama_cpp_sys_4::ggml_nbytes(self.0.as_ptr()) }
     }
 
     /// Get the element size in bytes.
     #[must_use]
     pub fn element_size(&self) -> usize {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         unsafe { llama_cpp_sys_4::ggml_element_size(self.0.as_ptr()) }
     }
 
     /// Get the tensor type.
     #[must_use]
     pub fn typ(&self) -> ggml_type {
-        // SAFETY: `GgmlTensor` wraps a non-null `ggml_tensor` owned by the context that
-        // created it, and the type's docs require the tensor not to outlive that
-        // context. Reading a field is a plain load from that live allocation.
         unsafe { (*self.0.as_ptr()).type_ }
     }
 
     /// Get the tensor dimensions (ne).
     #[must_use]
     pub fn ne(&self) -> [i64; 4] {
-        // SAFETY: `GgmlTensor` wraps a non-null `ggml_tensor` owned by the context that
-        // created it, and the type's docs require the tensor not to outlive that
-        // context. Reading a field is a plain load from that live allocation.
         unsafe { (*self.0.as_ptr()).ne }
     }
 
     /// Get the tensor name.
     #[must_use]
     pub fn name(&self) -> &str {
-        // SAFETY: the pointer is non-null and points at a NUL-terminated string the
-        // library owns, which outlives the borrow taken here.
         unsafe {
             let ptr = (*self.0.as_ptr()).name.as_ptr();
             CStr::from_ptr(ptr).to_str().unwrap_or("")
@@ -558,8 +498,6 @@ impl GgmlGraph {
 
     /// Add a tensor and its dependencies to the forward computation graph.
     pub fn build_forward(&mut self, tensor: &GgmlTensor) {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         unsafe { llama_cpp_sys_4::ggml_build_forward_expand(self.0.as_ptr(), tensor.0.as_ptr()) }
     }
 
@@ -572,8 +510,6 @@ impl GgmlGraph {
     /// before returning — see [`GgmlContext::new`] for how to size the pool.
     #[must_use]
     pub fn node(&mut self, i: i32) -> GgmlTensor {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let t = unsafe { llama_cpp_sys_4::ggml_graph_node(self.0.as_ptr(), i) };
         GgmlTensor(NonNull::new(t).expect("graph_node returned null"))
     }
@@ -596,8 +532,6 @@ impl GgmlBackend {
     /// build has no CPU backend compiled in.
     #[must_use]
     pub fn cpu() -> Self {
-        // SAFETY: no borrowed pointer is involved beyond arguments alive for the call;
-        // the returned handle is checked for null before being wrapped.
         let backend = unsafe { llama_cpp_sys_4::ggml_backend_cpu_init() };
         assert!(!backend.is_null(), "ggml_backend_cpu_init returned null");
         Self { backend }
@@ -605,8 +539,6 @@ impl GgmlBackend {
 
     /// Set the number of threads for the CPU backend.
     pub fn set_n_threads(&self, n_threads: i32) {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         unsafe { llama_cpp_sys_4::ggml_backend_cpu_set_n_threads(self.backend, n_threads) }
     }
 
@@ -618,23 +550,17 @@ impl GgmlBackend {
         &self,
         ctx: &GgmlContext,
     ) -> *mut llama_cpp_sys_4::ggml_backend_buffer {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         unsafe { llama_cpp_sys_4::ggml_backend_alloc_ctx_tensors(ctx.as_ptr(), self.backend) }
     }
 
     /// Compute a graph.
     pub fn graph_compute(&self, graph: &mut GgmlGraph) {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         unsafe { llama_cpp_sys_4::ggml_backend_graph_compute(self.backend, graph.as_ptr()) };
     }
 
     /// Get the default buffer type for this backend.
     #[must_use]
     pub fn default_buffer_type(&self) -> llama_cpp_sys_4::ggml_backend_buffer_type_t {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         unsafe { llama_cpp_sys_4::ggml_backend_get_default_buffer_type(self.backend) }
     }
 
@@ -647,8 +573,6 @@ impl GgmlBackend {
 
 impl Drop for GgmlBackend {
     fn drop(&mut self) {
-        // SAFETY: this runs once from `Drop` on a non-null handle, and nothing reads it
-        // afterwards.
         unsafe { llama_cpp_sys_4::ggml_backend_free(self.backend) }
     }
 }
@@ -669,8 +593,6 @@ impl GgmlAllocr {
     /// Panics if ggml cannot allocate the graph allocator.
     #[must_use]
     pub fn new(backend: &GgmlBackend) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let alloc = unsafe { llama_cpp_sys_4::ggml_gallocr_new(backend.default_buffer_type()) };
         assert!(!alloc.is_null(), "ggml_gallocr_new returned null");
         Self { alloc }
@@ -678,16 +600,12 @@ impl GgmlAllocr {
 
     /// Allocate all tensors in a graph.
     pub fn alloc_graph(&self, graph: &mut GgmlGraph) -> bool {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         unsafe { llama_cpp_sys_4::ggml_gallocr_alloc_graph(self.alloc, graph.as_ptr()) }
     }
 }
 
 impl Drop for GgmlAllocr {
     fn drop(&mut self) {
-        // SAFETY: this runs once from `Drop` on a non-null handle, and nothing reads it
-        // afterwards.
         unsafe { llama_cpp_sys_4::ggml_gallocr_free(self.alloc) }
     }
 }
@@ -734,33 +652,24 @@ pub unsafe fn buffer_free(buffer: *mut llama_cpp_sys_4::ggml_backend_buffer) {
 /// Get the overhead in bytes for tensor metadata.
 #[must_use]
 pub fn tensor_overhead() -> usize {
-    // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-    // the library owns whatever it returns.
     unsafe { llama_cpp_sys_4::ggml_tensor_overhead() }
 }
 
 /// Get the overhead in bytes for a computation graph.
 #[must_use]
 pub fn graph_overhead() -> usize {
-    // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-    // the library owns whatever it returns.
     unsafe { llama_cpp_sys_4::ggml_graph_overhead() }
 }
 
 /// Check if a type is quantized.
 #[must_use]
 pub fn is_quantized(typ: ggml_type) -> bool {
-    // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-    // the library owns whatever it returns.
     unsafe { llama_cpp_sys_4::ggml_is_quantized(typ) }
 }
 
 /// Get the name of a ggml type.
 #[must_use]
 pub fn type_name(typ: ggml_type) -> &'static str {
-    // SAFETY: `ggml_type_name` takes a plain enum and returns a pointer to a
-    // static NUL-terminated string compiled into ggml, so it outlives any
-    // borrow. The null case is handled below rather than assumed away.
     unsafe {
         let ptr = llama_cpp_sys_4::ggml_type_name(typ);
         if ptr.is_null() {

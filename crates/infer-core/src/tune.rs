@@ -3,7 +3,7 @@
 //! Context size is *not* a candidate. It is derived from the device and the
 //! checkpoint once, by `fit::auto_ctx`, and every candidate runs at that same
 //! size. What gets measured is what actually changes speed: the drafter and its
-//! depth, flash attention, and the batch shape.
+//! depth, flash attention, the KV cache type, and the batch shape.
 //!
 //! Each candidate is loaded through the ordinary [`Engine`] path, so MTP and
 //! DFlash/EAGLE proposals are exercised exactly as they are in a real chat. The
@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
-use crate::engine::{Engine, FlashAttn, LoadConfig};
+use crate::engine::{Engine, FlashAttn, KvCacheType, LoadConfig};
 use crate::error::{InferError, Result};
 use crate::sampler::SamplerParams;
 use crate::types::{ChatMsg, GenStats};
@@ -73,6 +73,9 @@ pub struct TuneCapabilities {
     pub draft_model: Option<String>,
     /// Human-readable drafter family for report labels, e.g. "DFlash2".
     pub draft_label: String,
+    /// The KV cache type the resident instance was using. Stage one measures
+    /// with it so the drafter comparison is not confounded by cache width.
+    pub kv: KvCacheType,
 }
 
 /// One configuration the sweep measures. Every field is concrete: a candidate
@@ -87,6 +90,10 @@ pub struct TuneCandidate {
     pub n_ubatch: u32,
     /// Flash attention forced on or off.
     pub flash_attn: bool,
+    /// KV cache type for both K and V. Quantized V needs flash attention, so a
+    /// candidate with flash attention off always carries [`KvCacheType::F16`]
+    /// here —the label says what was measured, not what was asked for.
+    pub kv: KvCacheType,
     pub drafter: Drafter,
     /// Draft tokens per round. 0 for [`Drafter::None`].
     pub draft_n_max: u32,
@@ -193,33 +200,41 @@ pub enum TuneProgress {
 }
 
 /// Stage one of the sweep: the drafter family and its depth, measured at the
-/// reference batch shape. Context stays whatever `fit::auto_ctx` chose.
+/// reference batch shape. Context stays whatever `fit::auto_ctx` chose, and the
+/// KV cache stays whatever the resident instance used, so this stage answers
+/// "which drafter" without the cache width confounding it.
 ///
-/// The winner of this stage is then crossed with flash attention and the batch
-/// shape by [`cross_plan`]. That two-stage shape is deliberate: crossing every
-/// drafter with every batch setting would be 14 x 4 loads, most of which cannot
-/// beat the winner.
+/// The winner of this stage is then crossed with flash attention, the KV cache
+/// type and the batch shape by [`cross_plan`]. That two-stage shape is
+/// deliberate: crossing every drafter with every batch setting would be 14 x 4
+/// loads, most of which cannot beat the winner.
 pub fn quick_plan(caps: &TuneCapabilities) -> Vec<TuneCandidate> {
     let mut plan = Vec::new();
-    plan.push(candidate(caps, Drafter::None, 0, true, 2048, 512));
+    plan.push(candidate(caps, Drafter::None, 0, true, 2048, 512, caps.kv));
     if caps.has_mtp {
         for depth in [1, 2, 3, 4, 6] {
-            plan.push(candidate(caps, Drafter::Mtp, depth, true, 2048, 512));
+            plan.push(candidate(caps, Drafter::Mtp, depth, true, 2048, 512, caps.kv));
         }
     }
     if caps.draft_model.is_some() {
         for depth in [1, 2, 3, 4, 6] {
-            plan.push(candidate(caps, Drafter::Draft, depth, true, 2048, 512));
+            plan.push(candidate(caps, Drafter::Draft, depth, true, 2048, 512, caps.kv));
         }
     }
     plan
 }
 
-/// Stage two: the stage-one winner with flash attention and batch alternatives.
+/// Stage two: the stage-one winner with flash attention, the KV cache type and
+/// batch alternatives.
 ///
 /// The drafter and depth are carried over unchanged, so the comparison answers
 /// "what is the best batch shape *for this drafter*", not "what is the best
 /// batch shape for a different configuration".
+///
+/// The cache width is a candidate here because it is not a small effect on
+/// every device: a card whose quantized-KV kernels are slow can decode almost
+/// twice as fast at f16, and a sweep that never tries it reports the slow
+/// number as the machine's best.
 pub fn cross_plan(best: &TuneCandidate) -> Vec<TuneCandidate> {
     let name = best
         .label
@@ -227,25 +242,35 @@ pub fn cross_plan(best: &TuneCandidate) -> Vec<TuneCandidate> {
         .next()
         .unwrap_or("draft")
         .to_string();
+    let other_kv = match best.kv {
+        KvCacheType::F16 => KvCacheType::Q8_0,
+        KvCacheType::Q8_0 => KvCacheType::F16,
+    };
     let mut out = Vec::new();
-    for (fa, n_batch, n_ubatch) in [
-        (false, best.n_batch, best.n_ubatch),
-        (true, best.n_batch, 2048),
-        (true, best.n_batch, 1024),
-        (true, 4096, 1024),
+    for (fa, n_batch, n_ubatch, kv) in [
+        // Without flash attention quantized V is unavailable, so the only
+        // honest candidate there is f16.
+        (false, best.n_batch, best.n_ubatch, KvCacheType::F16),
+        (true, best.n_batch, 2048, best.kv),
+        (true, best.n_batch, 1024, best.kv),
+        (true, 4096, 1024, best.kv),
+        (true, best.n_batch, best.n_ubatch, other_kv),
     ] {
-        if fa == best.flash_attn && n_batch == best.n_batch && n_ubatch == best.n_ubatch {
+        let kv = if fa { kv } else { KvCacheType::F16 };
+        if fa == best.flash_attn
+            && n_batch == best.n_batch
+            && n_ubatch == best.n_ubatch
+            && kv == best.kv
+        {
             continue;
         }
         out.push(TuneCandidate {
-            label: format!(
-                "{name} fa={} ubatch={n_ubatch} batch={n_batch}",
-                if fa { "on" } else { "off" }
-            ),
+            label: label(&name, fa, n_ubatch, n_batch, kv),
             n_ctx: best.n_ctx,
             n_batch,
             n_ubatch,
             flash_attn: fa,
+            kv,
             drafter: best.drafter,
             draft_n_max: best.draft_n_max,
         });
@@ -254,8 +279,10 @@ pub fn cross_plan(best: &TuneCandidate) -> Vec<TuneCandidate> {
 }
 
 /// Deep mode: the top two drafter configurations crossed with the full batch
-/// matrix. Bounded on purpose — the full 11 x 12 Cartesian product is over a
-/// hundred loads for differences that are usually below the noise floor.
+/// matrix. Bounded on purpose —the full 11 x 12 Cartesian product is over a
+/// hundred loads for differences that are usually below the noise floor. The
+/// KV cache type is carried over from each winner; `cross_plan` has already
+/// decided which width that drafter prefers.
 pub fn deep_cross_plan(winners: &[TuneCandidate]) -> Vec<TuneCandidate> {
     let mut out = Vec::new();
     for base in winners.iter().take(2) {
@@ -271,19 +298,21 @@ pub fn deep_cross_plan(winners: &[TuneCandidate]) -> Vec<TuneCandidate> {
                     if n_batch == 4096 && n_ubatch > 1024 {
                         continue;
                     }
-                    if fa == base.flash_attn && n_batch == base.n_batch && n_ubatch == base.n_ubatch
+                    let kv = if fa { base.kv } else { KvCacheType::F16 };
+                    if fa == base.flash_attn
+                        && n_batch == base.n_batch
+                        && n_ubatch == base.n_ubatch
+                        && kv == base.kv
                     {
                         continue;
                     }
                     out.push(TuneCandidate {
-                        label: format!(
-                            "{name} fa={} ubatch={n_ubatch} batch={n_batch}",
-                            if fa { "on" } else { "off" }
-                        ),
+                        label: label(&name, fa, n_ubatch, n_batch, kv),
                         n_ctx: base.n_ctx,
                         n_batch,
                         n_ubatch,
                         flash_attn: fa,
+                        kv,
                         drafter: base.drafter,
                         draft_n_max: base.draft_n_max,
                     });
@@ -294,6 +323,17 @@ pub fn deep_cross_plan(winners: &[TuneCandidate]) -> Vec<TuneCandidate> {
     out
 }
 
+fn label(name: &str, fa: bool, n_ubatch: u32, n_batch: u32, kv: KvCacheType) -> String {
+    format!(
+        "{name} fa={} ubatch={n_ubatch} batch={n_batch} kv={}",
+        if fa { "on" } else { "off" },
+        match kv {
+            KvCacheType::F16 => "f16",
+            KvCacheType::Q8_0 => "q8_0",
+        }
+    )
+}
+
 fn candidate(
     caps: &TuneCapabilities,
     drafter: Drafter,
@@ -301,6 +341,7 @@ fn candidate(
     fa: bool,
     n_batch: u32,
     n_ubatch: u32,
+    kv: KvCacheType,
 ) -> TuneCandidate {
     let name = match drafter {
         Drafter::None => "draft=none".to_string(),
@@ -308,14 +349,12 @@ fn candidate(
         Drafter::Draft => format!("{} d={depth}", caps.draft_label),
     };
     TuneCandidate {
-        label: format!(
-            "{name} fa={} ubatch={n_ubatch} batch={n_batch}",
-            if fa { "on" } else { "off" }
-        ),
+        label: label(&name, fa, n_ubatch, n_batch, kv),
         n_ctx: caps.n_ctx.max(2048),
         n_batch,
         n_ubatch,
         flash_attn: fa,
+        kv,
         drafter,
         draft_n_max: depth,
     }
@@ -496,6 +535,11 @@ fn measure_candidate(
     } else {
         FlashAttn::Off
     };
+    // Flash attention off cannot carry a quantized V cache, so the candidate
+    // already carries f16 in that case; the engine would force it anyway and
+    // the report would then describe a cache it did not measure.
+    cfg.cache_type_k = candidate.kv;
+    cfg.cache_type_v = candidate.kv;
     cfg.load_mtp = candidate.drafter == Drafter::Mtp;
     cfg.mtp_n_max = if cfg.load_mtp {
         candidate.draft_n_max
@@ -627,6 +671,7 @@ mod tests {
             has_mtp,
             draft_model: draft.then(|| "dfash.gguf".into()),
             draft_label: "DFlash2".into(),
+            kv: KvCacheType::Q8_0,
         }
     }
 
@@ -653,15 +698,27 @@ mod tests {
     #[test]
     fn the_cross_stage_keeps_the_winner_drafter_and_depth() {
         let c = caps(true, true);
-        let best = candidate(&c, Drafter::Mtp, 3, true, 2048, 512);
+        let best = candidate(&c, Drafter::Mtp, 3, true, 2048, 512, KvCacheType::Q8_0);
         let cross = cross_plan(&best);
-        assert_eq!(cross.len(), 4);
+        // fa off, two ubatch alternatives, batch 4096, and the other cache width.
+        assert_eq!(cross.len(), 5);
         assert!(cross
             .iter()
             .all(|p| p.drafter == Drafter::Mtp && p.draft_n_max == 3 && p.n_ctx == best.n_ctx));
         assert!(cross.iter().any(|p| !p.flash_attn));
         assert!(cross.iter().any(|p| p.n_ubatch == 2048));
         assert!(cross.iter().any(|p| p.n_batch == 4096));
+        // The cache width is measured, because on some devices it is worth more
+        // than every batch shape combined.
+        assert!(cross
+            .iter()
+            .any(|p| p.flash_attn && p.kv == KvCacheType::F16));
+        // Without flash attention quantized V is not available, so no candidate
+        // may claim it.
+        assert!(cross
+            .iter()
+            .filter(|p| !p.flash_attn)
+            .all(|p| p.kv == KvCacheType::F16));
     }
 
     #[test]
@@ -684,8 +741,8 @@ mod tests {
     #[test]
     fn the_deep_plan_crosses_two_winners_without_the_full_product() {
         let c = caps(true, true);
-        let a = candidate(&c, Drafter::Mtp, 3, true, 2048, 512);
-        let b = candidate(&c, Drafter::Draft, 2, true, 2048, 512);
+        let a = candidate(&c, Drafter::Mtp, 3, true, 2048, 512, KvCacheType::Q8_0);
+        let b = candidate(&c, Drafter::Draft, 2, true, 2048, 512, KvCacheType::Q8_0);
         let deep = deep_cross_plan(&[a, b]);
         // 2 winners x (2 FA x 5 safe batch shapes - 1 already measured) = 18.
         assert_eq!(deep.len(), 18);

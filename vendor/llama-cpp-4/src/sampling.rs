@@ -6,16 +6,17 @@ use std::fmt::{Debug, Formatter};
 use std::ptr::NonNull;
 
 use llama_cpp_sys_4::{
-    common::common_sampler_params, llama_logit_bias, llama_sampler, llama_sampler_chain_add,
-    llama_sampler_chain_default_params, llama_sampler_chain_init, llama_sampler_chain_n,
-    llama_sampler_chain_remove, llama_sampler_clone, llama_sampler_copy, llama_sampler_free,
-    llama_sampler_get_seed, llama_sampler_init_adaptive_p, llama_sampler_init_dist,
-    llama_sampler_init_dry, llama_sampler_init_grammar, llama_sampler_init_grammar_lazy_patterns,
-    llama_sampler_init_greedy, llama_sampler_init_infill, llama_sampler_init_logit_bias,
-    llama_sampler_init_min_p, llama_sampler_init_mirostat, llama_sampler_init_mirostat_v2,
-    llama_sampler_init_penalties, llama_sampler_init_temp, llama_sampler_init_temp_ext,
-    llama_sampler_init_top_k, llama_sampler_init_top_n_sigma, llama_sampler_init_top_p,
-    llama_sampler_init_typical, llama_sampler_init_xtc, llama_sampler_name, llama_sampler_reset,
+    common::common_sampler_params, llama_logit_bias, llama_sampler,
+    llama_sampler_chain_add, llama_sampler_chain_default_params, llama_sampler_chain_init,
+    llama_sampler_chain_n, llama_sampler_chain_remove, llama_sampler_clone, llama_sampler_copy,
+    llama_sampler_free, llama_sampler_get_seed, llama_sampler_init_adaptive_p,
+    llama_sampler_init_dist, llama_sampler_init_dry, llama_sampler_init_grammar,
+    llama_sampler_init_grammar_lazy_patterns, llama_sampler_init_greedy, llama_sampler_init_infill,
+    llama_sampler_init_logit_bias, llama_sampler_init_min_p, llama_sampler_init_mirostat,
+    llama_sampler_init_mirostat_v2, llama_sampler_init_penalties, llama_sampler_init_temp,
+    llama_sampler_init_temp_ext, llama_sampler_init_top_k, llama_sampler_init_top_n_sigma,
+    llama_sampler_init_top_p, llama_sampler_init_typical, llama_sampler_init_xtc,
+    llama_sampler_name, llama_sampler_reset,
 };
 
 use crate::context::LlamaContext;
@@ -47,45 +48,6 @@ pub enum SamplerInitError {
     /// unparseable GBNF grammar looks like; it logs the parse error itself.
     #[error("llama.cpp could not build the {0} sampler (see the llama.cpp log)")]
     NullReturn(&'static str),
-    /// More distinct DRY sequence breakers than llama.cpp will accept. It
-    /// silently drops the surplus, so this is reported rather than passed on.
-    #[error("{distinct} distinct DRY sequence breakers, but llama.cpp accepts at most {max}")]
-    TooManyDrySequenceBreakers {
-        /// How many distinct breakers the caller supplied, counted the way
-        /// llama.cpp counts them.
-        distinct: usize,
-        /// The upstream limit, [`DRY_MAX_SEQ_BREAKERS`].
-        max: usize,
-    },
-}
-
-/// Longest DRY sequence breaker llama.cpp keeps; it truncates anything longer.
-///
-/// Truncation happens *before* de-duplication, so two breakers that differ only
-/// past this point count as one.
-pub const DRY_MAX_BREAKER_LEN: usize = 40;
-
-/// Most distinct DRY sequence breakers llama.cpp will process.
-///
-/// Mirrors `LLAMA_DRY_MAX_SEQ_BREAKERS`. Past this, llama.cpp logs a warning
-/// and ignores the rest — the sampler is then quietly not the one that was
-/// asked for, which is why [`LlamaSampler::try_dry`] refuses instead. Each
-/// breaker scans the whole vocabulary during init, so the cost is
-/// `O(breakers x n_vocab)`.
-pub const DRY_MAX_SEQ_BREAKERS: usize = llama_cpp_sys_4::LLAMA_DRY_MAX_SEQ_BREAKERS as usize;
-
-/// Count breakers the way llama.cpp does: truncate to [`DRY_MAX_BREAKER_LEN`]
-/// bytes, drop empties, then de-duplicate.
-fn distinct_dry_breakers(breakers: &[CString]) -> usize {
-    breakers
-        .iter()
-        .map(|b| {
-            let bytes = b.as_bytes();
-            &bytes[..bytes.len().min(DRY_MAX_BREAKER_LEN)]
-        })
-        .filter(|b| !b.is_empty())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
 }
 
 /// Convert a caller string, naming the argument so the error says which one.
@@ -175,13 +137,9 @@ impl LlamaSampler {
     /// Panics if llama.cpp returns a null pointer.
     #[must_use]
     pub fn new() -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sparams = unsafe { llama_sampler_chain_default_params() };
 
         Self {
-            // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-            // the library owns whatever it returns.
             sampler: NonNull::new(unsafe { llama_sampler_chain_init(sparams) }).unwrap(),
         }
     }
@@ -218,8 +176,6 @@ impl LlamaSampler {
         idx: i32,
     ) -> Result<LlamaToken, crate::shim::ShimError> {
         let mut status = llama_cpp_sys_4::LLAMA_SHIM_OK;
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let token = unsafe {
             llama_cpp_sys_4::common_shim_sampler_sample_raw(
                 self.sampler.as_ptr(),
@@ -255,8 +211,6 @@ impl LlamaSampler {
     /// Returns [`ShimError::Failed`](crate::shim::ShimError::Failed) when the
     /// grammar cannot accept this token — see [`Self::try_sample`].
     pub fn try_accept(&mut self, token: LlamaToken) -> Result<(), crate::shim::ShimError> {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let status = unsafe {
             llama_cpp_sys_4::common_shim_sampler_accept_raw(self.sampler.as_ptr(), token.0)
         };
@@ -298,8 +252,6 @@ impl LlamaSampler {
     /// Panics if llama.cpp returns a null pointer.
     #[must_use]
     pub fn chain(samplers: impl IntoIterator<Item = Self>, no_perf: bool) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         unsafe {
             let mut params = llama_sampler_chain_default_params();
             params.no_perf = no_perf;
@@ -387,8 +339,6 @@ impl LlamaSampler {
     /// ```
     #[must_use]
     pub fn temp(t: f32) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_temp(t) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -403,8 +353,6 @@ impl LlamaSampler {
     /// Panics if llama.cpp returns a null pointer.
     #[must_use]
     pub fn temp_ext(t: f32, delta: f32, exponent: f32) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_temp_ext(t, delta, exponent) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -442,8 +390,6 @@ impl LlamaSampler {
     /// ```
     #[must_use]
     pub fn top_k(k: i32) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_top_k(k) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -457,8 +403,6 @@ impl LlamaSampler {
     /// Panics if llama.cpp returns a null pointer.
     #[must_use]
     pub fn typical(p: f32, min_keep: usize) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_typical(p, min_keep) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -473,8 +417,6 @@ impl LlamaSampler {
     /// Panics if llama.cpp returns a null pointer.
     #[must_use]
     pub fn top_p(p: f32, min_keep: usize) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_top_p(p, min_keep) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -488,8 +430,6 @@ impl LlamaSampler {
     /// Panics if llama.cpp returns a null pointer.
     #[must_use]
     pub fn min_p(p: f32, min_keep: usize) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_min_p(p, min_keep) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -503,8 +443,6 @@ impl LlamaSampler {
     /// Panics if llama.cpp returns a null pointer.
     #[must_use]
     pub fn xtc(p: f32, t: f32, min_keep: usize, seed: u32) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_xtc(p, t, min_keep, seed) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -587,8 +525,6 @@ impl LlamaSampler {
         let mut seq_breaker_pointers: Vec<*const c_char> =
             seq_breakers.iter().map(|s| s.as_ptr()).collect();
 
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe {
             llama_sampler_init_dry(
                 model.get_vocab().vocab.as_ref(),
@@ -604,71 +540,6 @@ impl LlamaSampler {
         Self {
             sampler: NonNull::new(sampler).unwrap(),
         }
-    }
-
-    /// [`Self::dry`], but reporting the two things it cannot.
-    ///
-    /// `dry` panics on a breaker containing an interior NUL, and — worse —
-    /// cannot react at all when there are too many breakers: llama.cpp keeps
-    /// the first [`DRY_MAX_SEQ_BREAKERS`] distinct ones, logs a warning, and
-    /// returns a perfectly valid sampler that simply is not the one you asked
-    /// for. Prefer this whenever the breakers come from configuration or user
-    /// input rather than from literals.
-    ///
-    /// # Errors
-    ///
-    /// - [`SamplerInitError::InteriorNul`] if a breaker contains a NUL byte.
-    /// - [`SamplerInitError::TooManyDrySequenceBreakers`] if more than
-    ///   [`DRY_MAX_SEQ_BREAKERS`] remain after llama.cpp's own truncation to
-    ///   [`DRY_MAX_BREAKER_LEN`] bytes and de-duplication.
-    /// - [`SamplerInitError::NullReturn`] if llama.cpp returns null.
-    pub fn try_dry(
-        &self,
-        model: &LlamaModel,
-        multiplier: f32,
-        base: f32,
-        allowed_length: i32,
-        penalty_last_n: i32,
-        seq_breakers: impl IntoIterator<Item = impl AsRef<[u8]>>,
-    ) -> Result<Self, SamplerInitError> {
-        let seq_breakers: Vec<CString> = seq_breakers
-            .into_iter()
-            .map(|s| {
-                CString::new(s.as_ref()).map_err(|source| SamplerInitError::InteriorNul {
-                    field: "sequence breaker",
-                    source,
-                })
-            })
-            .collect::<Result<_, _>>()?;
-
-        let distinct = distinct_dry_breakers(&seq_breakers);
-        if distinct > DRY_MAX_SEQ_BREAKERS {
-            return Err(SamplerInitError::TooManyDrySequenceBreakers {
-                distinct,
-                max: DRY_MAX_SEQ_BREAKERS,
-            });
-        }
-
-        let mut seq_breaker_pointers: Vec<*const c_char> =
-            seq_breakers.iter().map(|s| s.as_ptr()).collect();
-
-        // SAFETY: the vocab outlives the call, and the pointer array is valid
-        // for `len` entries whose backing `CString`s are still alive here.
-        let sampler = unsafe {
-            llama_sampler_init_dry(
-                model.get_vocab().vocab.as_ref(),
-                multiplier,
-                base,
-                allowed_length,
-                penalty_last_n,
-                seq_breaker_pointers.as_mut_ptr(),
-                seq_breaker_pointers.len(),
-            )
-        };
-
-        NonNull::new(sampler)
-            .map(|sampler| Self { sampler })
-            .ok_or(SamplerInitError::NullReturn("dry"))
     }
 
     /// Penalizes tokens for being present in the context.
@@ -696,8 +567,6 @@ impl LlamaSampler {
         penalty_freq: f32,
         penalty_present: f32,
     ) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe {
             llama_sampler_init_penalties(
                 n_vocab,
@@ -767,8 +636,6 @@ impl LlamaSampler {
     ///   it affects the performance of the algorithm.
     #[must_use]
     pub fn mirostat(n_vocab: i32, seed: u32, tau: f32, eta: f32, m: i32) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_mirostat(n_vocab, seed, tau, eta, m) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -791,8 +658,6 @@ impl LlamaSampler {
     ///   updated more quickly, while a smaller learning rate will result in slower updates.
     #[must_use]
     pub fn mirostat_v2(seed: u32, tau: f32, eta: f32) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_mirostat_v2(seed, tau, eta) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -806,8 +671,6 @@ impl LlamaSampler {
     /// Panics if llama.cpp returns a null pointer.
     #[must_use]
     pub fn dist(seed: u32) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_dist(seed) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -841,8 +704,6 @@ impl LlamaSampler {
     /// ```
     #[must_use]
     pub fn greedy() -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_greedy() };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -858,8 +719,6 @@ impl LlamaSampler {
     /// Panics if llama.cpp returns a null pointer.
     #[must_use]
     pub fn top_n_sigma(n: f32) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_top_n_sigma(n) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -878,8 +737,6 @@ impl LlamaSampler {
     /// - `seed`: Random seed.
     #[must_use]
     pub fn adaptive_p(target: f32, decay: f32, seed: u32) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_adaptive_p(target, decay, seed) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -908,8 +765,6 @@ impl LlamaSampler {
             })
             .collect();
 
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe {
             llama_sampler_init_logit_bias(n_vocab, logit_biases.len() as i32, logit_biases.as_ptr())
         };
@@ -927,8 +782,6 @@ impl LlamaSampler {
     /// Panics if llama.cpp returns a null pointer.
     #[must_use]
     pub fn infill(model: &LlamaModel) -> Self {
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe { llama_sampler_init_infill(model.get_vocab().vocab.as_ref()) };
         Self {
             sampler: NonNull::new(sampler).unwrap(),
@@ -940,8 +793,6 @@ impl LlamaSampler {
     /// Returns `LLAMA_DEFAULT_SEED` if the sampler is not seeded.
     #[must_use]
     pub fn get_seed(&self) -> u32 {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         unsafe { llama_sampler_get_seed(self.sampler.as_ptr()) }
     }
 
@@ -963,11 +814,7 @@ impl LlamaSampler {
     /// Panics if the name is not valid UTF-8.
     #[must_use]
     pub fn name(&self) -> String {
-        // SAFETY: the pointer is non-null and points at a NUL-terminated string the
-        // library owns, which outlives the borrow taken here.
         let c_str = unsafe { llama_sampler_name(self.sampler.as_ptr()) };
-        // SAFETY: the pointer is non-null and points at a NUL-terminated string the
-        // library owns, which outlives the borrow taken here.
         let c_str = unsafe { std::ffi::CStr::from_ptr(c_str) };
         c_str
             .to_str()
@@ -977,8 +824,6 @@ impl LlamaSampler {
 
     /// Reset the sampler state (e.g. grammar, repetition penalties).
     pub fn reset(&mut self) {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         unsafe { llama_sampler_reset(self.sampler.as_ptr()) }
     }
 
@@ -987,8 +832,6 @@ impl LlamaSampler {
     /// Returns 0 if this sampler is not a chain.
     #[must_use]
     pub fn chain_n(&self) -> i32 {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         unsafe { llama_sampler_chain_n(self.sampler.as_ptr()) }
     }
 
@@ -1001,8 +844,6 @@ impl LlamaSampler {
     /// Panics if `i` is out of range or if llama.cpp returns a null pointer.
     #[must_use]
     pub fn chain_remove(&mut self, i: i32) -> Self {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let sampler = unsafe { llama_sampler_chain_remove(self.sampler.as_ptr(), i) };
         Self {
             sampler: NonNull::new(sampler).expect("chain_remove returned null"),
@@ -1090,8 +931,6 @@ impl LlamaSampler {
     /// Panics if llama.cpp returns a null pointer.
     #[must_use]
     pub fn clone_sampler(&self) -> Self {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         let sampler = unsafe { llama_sampler_clone(self.sampler.as_ptr()) };
         Self {
             sampler: NonNull::new(sampler).expect("sampler_clone returned null"),
@@ -1114,30 +953,22 @@ impl LlamaSampler {
     /// caller's contract. A sampler produced by `src.clone_sampler()` always
     /// satisfies it.
     pub fn copy_state_from(&mut self, src: &Self) {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         unsafe { llama_sampler_copy(src.sampler.as_ptr(), self.sampler.as_ptr()) }
     }
 
     /// Print sampler performance data.
     pub fn perf_print(&self) {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         unsafe { llama_cpp_sys_4::llama_perf_sampler_print(self.sampler.as_ptr()) }
     }
 
     /// Reset sampler performance counters.
     pub fn perf_reset(&mut self) {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         unsafe { llama_cpp_sys_4::llama_perf_sampler_reset(self.sampler.as_ptr()) }
     }
 
     /// Get sampler performance data.
     #[must_use]
     pub fn perf_data(&self) -> llama_cpp_sys_4::llama_perf_sampler_data {
-        // SAFETY: the handle is non-null and kept alive by this borrow, and the remaining
-        // arguments are scalars the library validates itself.
         unsafe { llama_cpp_sys_4::llama_perf_sampler(self.sampler.as_ptr()) }
     }
 
@@ -1204,8 +1035,6 @@ impl LlamaSampler {
     pub fn common() -> Self {
         let params = common_sampler_params::default();
 
-        // SAFETY: the arguments are either scalars or pointers that outlive the call, and
-        // the library owns whatever it returns.
         let sampler = unsafe {
             let mut sparams = llama_sampler_chain_default_params();
             sparams.no_perf = false;
@@ -1233,8 +1062,6 @@ impl LlamaSampler {
 
 impl Drop for LlamaSampler {
     fn drop(&mut self) {
-        // SAFETY: this runs once from `Drop` on a non-null handle, and nothing reads it
-        // afterwards.
         unsafe {
             llama_sampler_free(self.sampler.as_ptr());
         }

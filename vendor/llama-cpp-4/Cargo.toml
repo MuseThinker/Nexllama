@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.88"
 name = "llama-cpp-4"
-version = "0.11.0"
+version = "0.9.0"
 authors = ["Eugene Hauptmann"]
 build = false
 autolib = false
@@ -143,7 +143,7 @@ harness = false
 version = "0.7.12"
 
 [dependencies.llama-cpp-sys-4]
-version = "0.11.0"
+version = "0.9.0"
 
 [dependencies.thiserror]
 version = "2.0.18"
