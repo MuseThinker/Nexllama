@@ -68,7 +68,8 @@ const dict = {
     'models.tune': '参数优化',
     'models.tuneTitle': '参数优化',
     'models.tuneConfig': '配置',
-    'models.tuneConfirm': '将卸载 {model} 并独占显卡做参数测量，期间该模型不可用。继续？',
+    'models.tuneConfirm':
+      '将卸载 {model} 和其他所有已加载模型，让测量独占显卡；它们会休眠，测量结束后按需自动加载。期间模型不可用，继续？',
     'models.tuneClose': '收起',
     'models.tuneAppliedState': '已采用',
     'models.loadedState': '已加载',
@@ -362,7 +363,8 @@ const dict = {
     'models.tune': 'Tune',
     'models.tuneTitle': 'Parameter tuning',
     'models.tuneConfig': 'Config',
-    'models.tuneConfirm': 'This unloads {model} and measures on the GPU alone; the model is unavailable meanwhile. Continue?',
+    'models.tuneConfirm':
+      'This unloads {model} and every other loaded model so the sweep owns the GPU. They go dormant and load again on demand once it finishes. Continue?',
     'models.tuneClose': 'Close',
     'models.tuneAppliedState': 'Applied',
     'models.loadedState': 'Loaded',

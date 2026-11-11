@@ -1281,6 +1281,18 @@ async fn load(
             req.model
         )));
     }
+    // The sweep released every other model to get the card to itself, so a
+    // load that arrives mid-sweep would hand back the VRAM the sweep just
+    // reclaimed and make the remaining candidates measure contention instead
+    // of speed. The released models are dormant, not gone: they load again
+    // the moment the sweep finishes.
+    if let Some(active) = state.tunes.running_model() {
+        return Err(ApiError::BadRequest(format!(
+            "a measured-tuning sweep is running for \"{active}\" and the GPU stays reserved for \
+             it; its report will be at GET /admin/tune, and other models load again once it \
+             finishes"
+        )));
+    }
     let mut cfg;
     {
         let guard = state.inner.lock().await;
@@ -2548,10 +2560,14 @@ async fn unload(
 
 /// Start a measured-tuning sweep.
 ///
-/// The resident instance is unloaded first — the sweep loads the checkpoint
-/// itself, and holding it twice on one GPU is how OOM happens. The dormant
-/// entry survives, so confirming a winner afterwards is an ordinary load, and
-/// a request that arrives mid-sweep reloads from it too.
+/// Every resident model is unloaded first, not just the one being tuned: the
+/// sweep loads the checkpoint itself, and anything else still holding VRAM —
+/// the speech model left over from dictation, an embedding model, a TTS
+/// worker — would shrink the room the candidates get and turn the report into
+/// a measurement of contention. Holding the tuned checkpoint twice on one GPU
+/// is how OOM happens. The dormant entries survive, so confirming a winner
+/// afterwards is an ordinary load, and a request that arrives after the sweep
+/// reloads from them too.
 #[derive(Deserialize)]
 struct TuneRequest {
     /// The resident model id to tune.
@@ -2571,12 +2587,12 @@ async fn tune_start(
             "tune depth \"{depth}\" is not implemented; use \"quick\" or \"deep\""
         )));
     }
-    let (base, caps) = {
+    let (base, caps, released, released_weights) = {
         let mut guard = state.inner.lock().await;
-        if state.tunes.running_for_model(&req.model) {
+        if let Some(active) = state.tunes.running_model() {
             return Err(ApiError::BadRequest(format!(
-                "a tuning sweep is already running for model \"{}\"",
-                req.model
+                "a tuning sweep is already running for \"{active}\"; one sweep at a time, \
+                 because each one measures the GPU on its own"
             )));
         }
         let loaded = guard.models.get(&req.model).ok_or(ApiError::NotLoaded)?;
@@ -2628,15 +2644,31 @@ async fn tune_start(
             draft_model,
             draft_label,
         };
-        // Free the GPU before the sweep claims it. Drop happens off the async
-        // context: freeing weights is real work, same as in `unload`.
-        let resident = guard.models.remove(&req.model);
+        // Free the GPU before the sweep claims it: everything, not only the
+        // model under test.
+        let mut resident: Vec<Loaded> = guard.models.remove(&req.model).into_iter().collect();
+        let mut released: Vec<String> = Vec::new();
+        for (id, loaded) in guard.models.drain() {
+            released.push(id);
+            resident.push(loaded);
+        }
+        // The TTS worker owns its weights, so it is stopped (below) rather
+        // than dropped; its parked entry stays dormant like the others.
+        let speech: Vec<(String, TtsModel)> = guard.tts.drain().collect();
+        released.extend(speech.iter().map(|(id, _)| id.clone()));
         if guard.default_model.as_deref() == Some(req.model.as_str()) {
             guard.default_model = None;
         }
-        let _ = tokio::task::spawn_blocking(move || drop(resident)).await;
-        (base, caps)
+        let speech: Vec<TtsModel> = speech.into_iter().map(|(_, t)| t).collect();
+        (base, caps, released, (resident, speech))
     };
+    let (resident, speech) = released_weights;
+    if !speech.is_empty() {
+        state.tts_worker.stop().await;
+    }
+    // Freeing weights is real work, so it stays off the async context, same
+    // as in `unload`.
+    let _ = tokio::task::spawn_blocking(move || drop(resident)).await;
     let plan = infer_core::tune::quick_plan(&caps);
     let planned = plan.len();
     let job = state.tunes.start(req.model.clone(), base, plan, depth);
@@ -2645,6 +2677,7 @@ async fn tune_start(
         "model": req.model,
         "depth": depth,
         "planned": planned,
+        "released": released,
         "report": format!("GET /admin/tune/{}", job.id),
         "cancel": format!("POST /admin/tune/{}/cancel", job.id),
     })))

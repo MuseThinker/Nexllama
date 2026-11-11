@@ -538,7 +538,8 @@ async function startTune(m, depth = 'quick') {
     await ensureDaemon();
     const job = await daemon.tuneStart(m.id, depth);
     tune.job = job;
-    // The daemon unloaded the resident instance before the sweep started.
+    // The daemon released every resident model before the sweep started, so
+    // the list now shows what is dormant rather than loaded.
     await refresh();
     await pollTune(job.id);
   } catch (e) {

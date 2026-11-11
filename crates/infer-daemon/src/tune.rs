@@ -181,17 +181,24 @@ impl TuneRegistry {
         jobs
     }
 
-    /// Whether a sweep is running for this model. Loading the same checkpoint
-    /// mid-sweep would fight the sweep for VRAM, which is why the load path
-    /// asks this first.
-    pub fn running_for_model(&self, model_id: &str) -> bool {
-        self.jobs.lock().expect("registry mutex").values().any(|j| {
-            j.model_id == model_id
-                && matches!(
+    /// The model whose sweep currently owns the GPU, if any.
+    ///
+    /// A sweep measures one model's decode loop on a card it has to itself, so
+    /// the load path refuses every load while one runs: a second resident model
+    /// would take VRAM back and turn the remaining candidates into a
+    /// measurement of contention.
+    pub fn running_model(&self) -> Option<String> {
+        self.jobs
+            .lock()
+            .expect("registry mutex")
+            .values()
+            .find(|j| {
+                matches!(
                     &*j.status.lock().expect("status mutex"),
                     TuneStatus::Running { .. }
                 )
-        })
+            })
+            .map(|j| j.model_id.clone())
     }
 
     /// Whether a sweep is running against this checkpoint file, whichever id
@@ -255,7 +262,7 @@ mod tests {
                 reg.running_for_path(std::path::Path::new("does-not-exist.gguf")),
                 running
             );
-            assert_eq!(reg.running_for_model("m"), running);
+            assert_eq!(reg.running_model().as_deref(), running.then_some("m"));
             if !running {
                 break;
             }
