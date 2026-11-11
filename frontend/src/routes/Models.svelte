@@ -592,6 +592,9 @@ function applyTune(c) {
   adv.nBatch = c.n_batch;
   adv.nUbatch = c.n_ubatch;
   adv.flashAttn = c.flash_attn ? 'on' : 'off';
+  // The cache width is a measured result too: a sweep that found f16 faster
+  // than q8_0 is worthless if adopting the row leaves the old width in place.
+  if (c.kv) adv.kvCache = c.kv === 'f16' ? 'f16' : 'q8_0';
   adv.draftNMax = c.draft_n_max;
   const id = tune.job?.model;
   if (id) {
