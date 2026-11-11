@@ -2645,10 +2645,23 @@ async fn tune_start(
             draft_label,
         };
         // Free the GPU before the sweep claims it: everything, not only the
-        // model under test.
-        let mut resident: Vec<Loaded> = guard.models.remove(&req.model).into_iter().collect();
+        // model under test. Each released model is parked in `dormant` first —
+        // a successful load takes an id *out* of `dormant`, so dropping the
+        // weights alone would forget the model instead of parking it, and the
+        // next request would have nothing to reload from.
         let mut released: Vec<String> = Vec::new();
-        for (id, loaded) in guard.models.drain() {
+        let mut resident: Vec<Loaded> = Vec::new();
+        if let Some(loaded) = guard.models.remove(&req.model) {
+            guard
+                .dormant
+                .insert(loaded.id.clone(), Dormant::from_loaded(&loaded));
+            resident.push(loaded);
+        }
+        let drained: Vec<(String, Loaded)> = guard.models.drain().collect();
+        for (id, loaded) in drained {
+            guard
+                .dormant
+                .insert(id.clone(), Dormant::from_loaded(&loaded));
             released.push(id);
             resident.push(loaded);
         }
