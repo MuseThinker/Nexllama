@@ -32,7 +32,7 @@ performance.
 |---|---|
 | **All-in-One** | llama.cpp used as it is, behind a desktop interface instead of a command line, with the model library, the downloader and the API included. There is nothing else to install and no flags to learn. |
 | **Five workloads, one port** | Chat, embeddings, reranking, speech synthesis and speech recognition run from one model library and one OpenAI-compatible endpoint: `/v1/chat/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/audio/speech`, `/v1/audio/transcriptions`, with vision projectors on the chat path. One daemon to start, one place to watch, no per-workload server to keep in sync. |
-| **Measured tuning, not guesswork** | v0.2.1's two-tier sweep loads the checkpoint and measures what actually happens on this GPU: drafter family (none, MTP, DFlash2, EAGLE-3), draft depth 1/2/3/4/6, flash attention and safe batch shapes. Standard mode follows the drafter winner with four batch variants; deep mode crosses the top two drafter configurations, 5 sampled passes of 256 tokens each, median reported, sortable by decode/prefill/acceptance and exportable as JSON. |
+| **Measured tuning, not guesswork** | The two-tier sweep loads the checkpoint and measures what actually happens on this GPU: drafter family (none, MTP, DFlash2, EAGLE-3), draft depth 1/2/3/4/6, flash attention and safe batch shapes. Standard mode follows the drafter winner with four batch variants; deep mode crosses the top two drafter configurations, 5 sampled passes of 256 tokens each, median reported, sortable by decode/prefill/acceptance and exportable as JSON. |
 | **Fits itself to the machine** | Context is derived from VRAM and the checkpoint, never offered as a tuning knob. The KV cache defaults to `q8_0`; a dense model that does not fit offloads only the layers the free VRAM can hold, a MoE model keeps the minimum experts on the CPU plus a GPU expert cache, and a backend the machine needs but the package does not carry is downloaded from a signed manifest on demand. |
 | **Blazing-fast inference, honestly measured** | Native MTP, DFlash2, EAGLE-3 and n-gram speculative decoding behind an adaptive gate that switches drafting off the moment it stops paying, plus a prefix cache that removes repeated prefill. Tuning samples like a real reply (T=0.8, model-default thinking), so the reported speed is the speed you get, not a greedy best case. |
 | **Built for agents** | An OpenAI-compatible endpoint that OpenClaw, Hermes and SDK clients drive unchanged, native tool calling, streaming that can be cancelled, model names that still resolve when slightly stale, and failures reported with the facts needed to act on them. |
@@ -60,15 +60,15 @@ Two installers, and the difference is one thing: whether NVIDIA's runtime comes 
 
 | Installer | Size | Which machine |
 |---|---|---|
-| **Standard** [`Nexllama_0.2.1_x64-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.1/Nexllama_0.2.1_x64-setup.exe) | ~497 MB | **The one to download.** It carries a portable CPU build and NVIDIA's CUDA runtime (`cudart64`, `cublas64`, `cublasLt64`), so it needs nothing installed beforehand. A new machine, a laptop, or one you are not sure about belongs here: an NVIDIA card runs on the GPU and anything else falls back to the CPU. |
-| **Lite** [`Nexllama_0.2.1_x64-lite-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.1/Nexllama_0.2.1_x64-lite-setup.exe) | ~145 MB | Only for a machine that **already has the CUDA runtime** — usually a development box. It leaves out those three NVIDIA libraries, one of which (`cublasLt64_13.dll`) is 428 MB on its own. **A new computer, or one where CUDA was never installed, should use the standard installer**: without the runtime the CUDA backend cannot load, and the app falls back to the CPU — it works, but far more slowly. |
+| **Standard** [`Nexllama_0.2.2_x64-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.2/Nexllama_0.2.2_x64-setup.exe) | ~497 MB | **The one to download.** It carries a portable CPU build and NVIDIA's CUDA runtime (`cudart64`, `cublas64`, `cublasLt64`), so it needs nothing installed beforehand. A new machine, a laptop, or one you are not sure about belongs here: an NVIDIA card runs on the GPU and anything else falls back to the CPU. |
+| **Lite** [`Nexllama_0.2.2_x64-lite-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.2/Nexllama_0.2.2_x64-lite-setup.exe) | ~145 MB | Only for a machine that **already has the CUDA runtime** — usually a development box. It leaves out those three NVIDIA libraries, one of which (`cublasLt64_13.dll`) is 428 MB on its own. **A new computer, or one where CUDA was never installed, should use the standard installer**: without the runtime the CUDA backend cannot load, and the app falls back to the CPU — it works, but far more slowly. |
 
 Both installers share a product name, install location and startup entry, so
 installing one over the other replaces it instead of leaving two copies behind.
 
 The installers are not code-signed. Windows may show an unknown publisher warning;
 choose **More info → Run anyway**. Verify the download against
-[`SHA256SUMS.txt`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.1/SHA256SUMS.txt).
+[`SHA256SUMS.txt`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.2/SHA256SUMS.txt).
 
 Run the installer and open Nexllama. The app picks a backend for the machine at first
 launch and starts the daemon on `http://127.0.0.1:15656`.
