@@ -45,6 +45,12 @@ pub const MEASURE_REPS: usize = 5;
 /// The prompt is padded to roughly this many tokens by repeating [`PROMPT_SEED`].
 pub const PREFILL_TARGET: usize = 256;
 
+/// How many tokens [`PROMPT_SEED`] costs. The padding below divides by this, so
+/// the prompt lands near [`PREFILL_TARGET`] instead of a multiple of it — the
+/// seed is 23 tokens on a Qwen tokenizer, and dividing the target by a guessed
+/// 10 built a 585-token prompt while the report claimed 256.
+const PROMPT_SEED_TOKENS: usize = 23;
+
 /// Tokens generated during the untimed warm-up.
 const WARMUP_TOKENS: usize = 16;
 
@@ -677,7 +683,7 @@ fn run_stat(stats: &GenStats) -> RunStat {
 /// A fixed, prose prompt. The exact words do not matter; repeating the seed to
 /// about [`PREFILL_TARGET`] tokens makes prefill cost comparable across runs.
 fn prompt() -> Vec<ChatMsg> {
-    let seed = PROMPT_SEED.repeat((PREFILL_TARGET / 10).max(1));
+    let seed = PROMPT_SEED.repeat((PREFILL_TARGET / PROMPT_SEED_TOKENS).max(1));
     vec![ChatMsg::new("user", seed)]
 }
 
