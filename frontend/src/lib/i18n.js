@@ -89,7 +89,7 @@ const dict = {
     'models.tuneServiceLost':
       '调优过程中推理服务退出，本次报告已丢失；已尝试重新启动服务，请重新运行优化。',
     'models.tuneProtocol':
-      '测速协议：T=0.8, top-k 40, top-p 0.95, min-p 0.05，思考模式跟随模型，{prompt} 提示 + {gen} 生成 × {reps} 次取中位数',
+      '测速协议：T=0.8, top-k 40, top-p 0.95, min-p 0.05，思考模式跟随模型，{prompt} 提示 + {gen} 生成 × {reps} 次取中位数（{prompts} 段文本轮换）',
     'models.tuneAccept': '接受率',
     'models.tuneMode': '优化模式',
     'models.tuneQuick': '标准优化',
@@ -384,7 +384,7 @@ const dict = {
     'models.tuneServiceLost':
       'The inference service stopped during the sweep, and its report is lost. Nexllama tried to restart it; run the sweep again.',
     'models.tuneProtocol':
-      'Measured with T=0.8, top-k 40, top-p 0.95, min-p 0.05, thinking at the model default: {prompt} prompt + {gen} generated, median of {reps} runs',
+      'Measured with T=0.8, top-k 40, top-p 0.95, min-p 0.05, thinking at the model default: {prompt} prompt + {gen} generated, median of {reps} runs over {prompts} rotating texts',
     'models.tuneAccept': 'Acceptance',
     'models.tuneMode': 'Mode',
     'models.tuneQuick': 'Standard tuning',

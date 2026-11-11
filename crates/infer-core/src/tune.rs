@@ -42,20 +42,33 @@ pub const MEASURE_GEN_TOKENS: usize = 256;
 /// Timed passes per candidate. Three gives a median that survives one outlier.
 pub const MEASURE_REPS: usize = 5;
 
-/// The prompt is padded to roughly this many tokens by repeating [`PROMPT_SEED`].
+/// The prompt is padded to roughly this many tokens by repeating a seed.
 pub const PREFILL_TARGET: usize = 256;
 
-/// How many tokens [`PROMPT_SEED`] costs. The padding below divides by this, so
-/// the prompt lands near [`PREFILL_TARGET`] instead of a multiple of it — the
-/// seed is 23 tokens on a Qwen tokenizer, and dividing the target by a guessed
-/// 10 built a 585-token prompt while the report claimed 256.
+/// How many tokens one repetition of a seed costs, on a Qwen tokenizer. The
+/// padding divides by this so the prompt lands near [`PREFILL_TARGET`] instead
+/// of a multiple of it — dividing by a guessed 10 built a 585-token prompt
+/// while the report claimed 256.
 const PROMPT_SEED_TOKENS: usize = 23;
 
 /// Tokens generated during the untimed warm-up.
 const WARMUP_TOKENS: usize = 16;
 
-const PROMPT_SEED: &str = "The history of the sea is long and full of tales. \
-Please continue, at length, with what came next: ";
+/// Three kinds of text, rotated across the timed passes.
+///
+/// One fixed prompt is not a protocol, it is a coin flip: acceptance depends on
+/// what the model is writing, so a single seed decides whether the second draft
+/// survives. A narrative continuation and a procedural list accept at different
+/// rates, and a sweep that measures only one of them can crown a depth that
+/// loses in real chat.
+const PROMPT_SEEDS: [&str; 3] = [
+    "The history of the sea is long and full of tales. \
+     Please continue, at length, with what came next: ",
+    "A user asks for a plan and the assistant answers with numbered steps. \
+     First, second, third, and then the closing note: ",
+    "The function reads the file, checks the header, and returns the record. \
+     Reading the implementation from the top, the next line is: ",
+];
 
 /// Which drafter a candidate uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -162,6 +175,8 @@ pub struct TuneProtocol {
     /// `thinking` was left at the model's own default, not forced either way.
     pub thinking: &'static str,
     pub prompt_tokens: usize,
+    /// How many distinct prompt texts the passes rotated through.
+    pub prompts: usize,
     pub gen_tokens: usize,
     pub reps: usize,
 }
@@ -175,6 +190,7 @@ impl TuneProtocol {
             min_p: 0.05,
             thinking: "model default",
             prompt_tokens: PREFILL_TARGET,
+            prompts: PROMPT_SEEDS.len(),
             gen_tokens: MEASURE_GEN_TOKENS,
             reps: MEASURE_REPS,
         }
@@ -274,21 +290,28 @@ pub fn cross_plan(best: &TuneCandidate) -> Vec<TuneCandidate> {
     out
 }
 
-/// The same configuration with the other cache width, for the final head-to-head.
+/// The one configuration the ranking cannot have measured, for a final
+/// head-to-head.
 ///
-/// On a device whose quantized-KV kernels are slow this is worth more than every
-/// batch shape combined, but it is one answer, not a dimension: the ranking is
-/// finished by the time this runs, so only the winner pays for it. Returns
-/// `None` when the width is not a choice — flash attention off cannot carry a
-/// quantized V cache.
-pub fn flip_kv(c: &TuneCandidate) -> Option<TuneCandidate> {
-    if !c.flash_attn {
+/// With flash attention on, the missing row is the same shape at the other cache
+/// width: on a device whose quantized-KV kernels are slow it is worth more than
+/// every batch shape combined. With flash attention off the width is not a
+/// choice (quantized V is unavailable), so the missing row is the same shape
+/// with flash attention *on* at f16 — the pair that decides whether attention
+/// itself is worth it. Either way it is one load, after the ranking is settled,
+/// so only the winner pays for it.
+pub fn final_candidate(c: &TuneCandidate) -> Option<TuneCandidate> {
+    let kv = if c.flash_attn {
+        match c.kv {
+            KvCacheType::F16 => KvCacheType::Q8_0,
+            KvCacheType::Q8_0 => KvCacheType::F16,
+        }
+    } else {
+        KvCacheType::F16
+    };
+    if c.flash_attn && kv == c.kv {
         return None;
     }
-    let kv = match c.kv {
-        KvCacheType::F16 => KvCacheType::Q8_0,
-        KvCacheType::Q8_0 => KvCacheType::F16,
-    };
     let name = c
         .label
         .split(" fa=")
@@ -296,7 +319,8 @@ pub fn flip_kv(c: &TuneCandidate) -> Option<TuneCandidate> {
         .unwrap_or("draft")
         .to_string();
     Some(TuneCandidate {
-        label: label(&name, c.flash_attn, c.n_ubatch, c.n_batch, kv),
+        label: label(&name, true, c.n_ubatch, c.n_batch, kv),
+        flash_attn: true,
         kv,
         ..c.clone()
     })
@@ -493,15 +517,16 @@ pub fn run_sweep(
     }
 
     // Final head-to-head: the winner keeps its shape and only the cache width
-    // changes. One load, after the ranking is settled, because that is the only
-    // row where the answer changes what a user should run.
+    // (or, when the width is forced, flash attention) changes. One load, after
+    // the ranking is settled, because that is the only row where the answer
+    // changes what a user should run.
     if !cancel.load(Ordering::Relaxed) {
         let winner = measurements
             .iter()
             .filter(|m| m.candidate.drafter == Drafter::None || m.draft_acceptance.is_some())
             .max_by(|a, b| a.tokens_per_second.total_cmp(&b.tokens_per_second))
             .map(|m| m.candidate.clone());
-        if let Some(c) = winner.as_ref().and_then(flip_kv) {
+        if let Some(c) = winner.as_ref().and_then(final_candidate) {
             progress(TuneProgress::Planned { total: index + 1 });
             let _ = run_stage(
                 base,
@@ -608,7 +633,6 @@ fn measure_candidate(
     cfg.adaptive_draft = false;
 
     let engine = Engine::load(cfg, |_| {})?;
-    let prompt = prompt();
     let params = |max_tokens: usize, seed: u32| SamplerParams {
         // Match a real chat reply. Greedy decoding hid the cost of a speculative
         // round: at temperature 0 the drafter imitates the argmax the target
@@ -635,20 +659,21 @@ fn measure_candidate(
 
     // Warm-up: one-time driver, allocator, and graph costs must not land on a
     // timed pass.
-    let _ = engine.generate(&prompt, &params(WARMUP_TOKENS, 1), |_| true)?;
+    let _ = engine.generate(&prompt(0), &params(WARMUP_TOKENS, 1), |_| true)?;
 
     let mut runs = Vec::with_capacity(MEASURE_REPS);
     for rep in 0..MEASURE_REPS {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        // A different seed per pass samples a different reply, so the median
-        // covers the spread a user will actually see instead of timing the
-        // same 256 tokens five times.
-        let stats =
-            engine.generate(&prompt, &params(MEASURE_GEN_TOKENS, 1 + rep as u32), |_| {
-                true
-            })?;
+        // A different seed per pass samples a different reply, and the seed
+        // rotates too, so the median covers both the spread a user sees between
+        // replies and the spread between kinds of text.
+        let stats = engine.generate(
+            &prompt(rep),
+            &params(MEASURE_GEN_TOKENS, 1 + rep as u32),
+            |_| true,
+        )?;
         runs.push(run_stat(&stats));
     }
     if runs.is_empty() {
@@ -680,10 +705,12 @@ fn run_stat(stats: &GenStats) -> RunStat {
     }
 }
 
-/// A fixed, prose prompt. The exact words do not matter; repeating the seed to
+/// A fixed, prose prompt. The exact words do not matter; repeating a seed to
 /// about [`PREFILL_TARGET`] tokens makes prefill cost comparable across runs.
-fn prompt() -> Vec<ChatMsg> {
-    let seed = PROMPT_SEED.repeat((PREFILL_TARGET / PROMPT_SEED_TOKENS).max(1));
+/// The seed rotates with the pass so the median is not one text's opinion.
+fn prompt(rep: usize) -> Vec<ChatMsg> {
+    let seed = PROMPT_SEEDS[rep % PROMPT_SEEDS.len()]
+        .repeat((PREFILL_TARGET / PROMPT_SEED_TOKENS).max(1));
     vec![ChatMsg::new("user", seed)]
 }
 
@@ -769,10 +796,10 @@ mod tests {
     }
 
     #[test]
-    fn the_final_head_to_head_changes_only_the_cache_width() {
+    fn the_final_head_to_head_changes_one_thing() {
         let c = caps(true, false);
         let winner = candidate(&c, Drafter::Mtp, 2, true, 4096, 1024, KvCacheType::Q8_0);
-        let flipped = flip_kv(&winner).expect("flash attention on can flip the width");
+        let flipped = final_candidate(&winner).expect("flash attention on can flip the width");
         assert_eq!(flipped.kv, KvCacheType::F16);
         assert_eq!(flipped.flash_attn, winner.flash_attn);
         assert_eq!(flipped.n_batch, winner.n_batch);
@@ -781,11 +808,21 @@ mod tests {
         assert_eq!(flipped.draft_n_max, winner.draft_n_max);
         assert_ne!(flipped.label, winner.label, "the row must name its width");
         // Flipping twice lands back on the original configuration.
-        assert_eq!(flip_kv(&flipped).unwrap().kv, KvCacheType::Q8_0);
+        assert_eq!(
+            final_candidate(&flipped).unwrap().kv,
+            KvCacheType::Q8_0
+        );
 
-        // Flash attention off has no choice to make: the engine runs f16 there.
+        // Flash attention off has no width to flip, so the missing comparison is
+        // the same shape with attention on at f16 — the pair that decides
+        // whether attention itself is worth it.
         let forced = candidate(&c, Drafter::Mtp, 2, false, 2048, 512, KvCacheType::F16);
-        assert!(flip_kv(&forced).is_none());
+        let alt = final_candidate(&forced).expect("fa off still has a pair to measure");
+        assert!(alt.flash_attn);
+        assert_eq!(alt.kv, KvCacheType::F16);
+        assert_eq!(alt.n_batch, forced.n_batch);
+        assert_eq!(alt.n_ubatch, forced.n_ubatch);
+        assert_eq!(alt.draft_n_max, forced.draft_n_max);
     }
 
     #[test]
