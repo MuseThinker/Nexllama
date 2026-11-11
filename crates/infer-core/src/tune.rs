@@ -235,12 +235,28 @@ pub fn quick_plan(caps: &TuneCapabilities) -> Vec<TuneCandidate> {
     plan.push(candidate(caps, Drafter::None, 0, true, 2048, 512, caps.kv));
     if caps.has_mtp {
         for depth in [1, 2, 3, 4, 6] {
-            plan.push(candidate(caps, Drafter::Mtp, depth, true, 2048, 512, caps.kv));
+            plan.push(candidate(
+                caps,
+                Drafter::Mtp,
+                depth,
+                true,
+                2048,
+                512,
+                caps.kv,
+            ));
         }
     }
     if caps.draft_model.is_some() {
         for depth in [1, 2, 3, 4, 6] {
-            plan.push(candidate(caps, Drafter::Draft, depth, true, 2048, 512, caps.kv));
+            plan.push(candidate(
+                caps,
+                Drafter::Draft,
+                depth,
+                true,
+                2048,
+                512,
+                caps.kv,
+            ));
         }
     }
     plan
@@ -312,12 +328,7 @@ pub fn final_candidate(c: &TuneCandidate) -> Option<TuneCandidate> {
     if c.flash_attn && kv == c.kv {
         return None;
     }
-    let name = c
-        .label
-        .split(" fa=")
-        .next()
-        .unwrap_or("draft")
-        .to_string();
+    let name = c.label.split(" fa=").next().unwrap_or("draft").to_string();
     Some(TuneCandidate {
         label: label(&name, true, c.n_ubatch, c.n_batch, kv),
         flash_attn: true,
@@ -709,8 +720,8 @@ fn run_stat(stats: &GenStats) -> RunStat {
 /// about [`PREFILL_TARGET`] tokens makes prefill cost comparable across runs.
 /// The seed rotates with the pass so the median is not one text's opinion.
 fn prompt(rep: usize) -> Vec<ChatMsg> {
-    let seed = PROMPT_SEEDS[rep % PROMPT_SEEDS.len()]
-        .repeat((PREFILL_TARGET / PROMPT_SEED_TOKENS).max(1));
+    let seed =
+        PROMPT_SEEDS[rep % PROMPT_SEEDS.len()].repeat((PREFILL_TARGET / PROMPT_SEED_TOKENS).max(1));
     vec![ChatMsg::new("user", seed)]
 }
 
@@ -808,10 +819,7 @@ mod tests {
         assert_eq!(flipped.draft_n_max, winner.draft_n_max);
         assert_ne!(flipped.label, winner.label, "the row must name its width");
         // Flipping twice lands back on the original configuration.
-        assert_eq!(
-            final_candidate(&flipped).unwrap().kv,
-            KvCacheType::Q8_0
-        );
+        assert_eq!(final_candidate(&flipped).unwrap().kv, KvCacheType::Q8_0);
 
         // Flash attention off has no width to flip, so the missing comparison is
         // the same shape with attention on at f16 — the pair that decides

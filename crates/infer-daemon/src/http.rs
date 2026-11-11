@@ -677,6 +677,9 @@ fn slot_of(info: &infer_core::EngineInfo) -> ModelSlot {
     match info.model_class.as_str() {
         "embedding" => ModelSlot::Embedding,
         "rerank" => ModelSlot::Rerank,
+        // A speech bundle is filed as `asr` even when it was loaded without its
+        // encoder, so it takes the audio slot instead of the chat one.
+        "asr" => ModelSlot::Audio,
         _ if info.audio && !info.vision => ModelSlot::Audio,
         _ if info.vision => ModelSlot::Vision,
         _ => ModelSlot::Chat,
@@ -1481,11 +1484,19 @@ async fn load(
             })
             .collect();
     }
+    // A speech bundle without its encoder is not a smaller version of itself:
+    // it is a text model that invents transcripts, and it looks like one to
+    // every rule that keeps speech models out of chat. The caller left the
+    // projector out, not the bundle.
+    let mut auto_projector: Option<std::path::PathBuf> = None;
     if let Some(v) = req.mmproj.as_ref() {
         if !Path::new(v).exists() {
             return Err(ApiError::NotFound(format!("mmproj not found: {v}")));
         }
         cfg.mmproj = Some(v.clone().into());
+    } else if let Some(projector) = infer_core::audio_projector_beside(Path::new(&req.model)) {
+        cfg.mmproj = Some(projector.clone());
+        auto_projector = Some(projector);
     }
     // A separate checkpoint that drafts for this model — DFlash or EAGLE-3. It
     // is the other half of speculative decoding: `load_mtp` uses heads bundled
@@ -1511,6 +1522,12 @@ async fn load(
     }
 
     let mut notes: Vec<String> = Vec::new();
+    if let Some(projector) = auto_projector {
+        notes.push(format!(
+            "attached the audio projector beside the checkpoint: {}",
+            projector.display()
+        ));
+    }
     if load_mtp {
         notes.push(
             "the model's bundled MTP head is loaded; turn on speculative decoding per \
@@ -2599,7 +2616,7 @@ async fn tune_start(
         if loaded.info.model_class != "llm" {
             return Err(ApiError::BadRequest(format!(
                 "model \"{}\" cannot be tuned for chat speed; only a chat model has a decode loop",
-                loaded.info.model_class
+                req.model
             )));
         }
         // A speech bundle is an LLM by class, but the sweep would strip its
@@ -3097,19 +3114,11 @@ async fn chat_engine(
     let mut guard = state.inner.lock().await;
     // Encoder models decode nothing: their tokens are probabilities, not a
     // continuation. Failing fast says so, instead of streaming word salad.
-    let class = guard
-        .models
-        .get(&id)
-        .map(|l| l.info.model_class.clone())
-        .unwrap_or_default();
-    if class != "llm" {
-        return Err(ApiError::NotFound(format!(
-            "{id} is a {class} model — it cannot generate text; load a chat model (class llm)",
-        )));
-    }
     // A speech-recognition bundle is an LLM, but its only useful input is audio.
     // Text chat through it produces invented transcripts, so point the caller at
-    // the endpoint that does the job.
+    // the endpoint that does the job. This comes before the class check: the
+    // bundle is filed as `asr` either way, and "use the audio endpoint" is the
+    // answer the caller can act on.
     if guard
         .models
         .get(&id)
@@ -3117,6 +3126,16 @@ async fn chat_engine(
     {
         return Err(ApiError::BadRequest(format!(
             "{id} is a speech model; POST audio to /v1/audio/transcriptions instead"
+        )));
+    }
+    let class = guard
+        .models
+        .get(&id)
+        .map(|l| l.info.model_class.clone())
+        .unwrap_or_default();
+    if class != "llm" {
+        return Err(ApiError::NotFound(format!(
+            "{id} is not a chat model (class {class}) — it cannot generate text; load a chat model (class llm)",
         )));
     }
     let (engine, thinking) = {
@@ -3434,6 +3453,18 @@ fn require_model(guard: &DaemonState, requested: Option<&str>, class: &str) -> A
     if let Some(id) = guard.resolve_class(requested, class) {
         return Ok(id);
     }
+    // The caller named a model that exists but is not of this kind. Return it
+    // anyway: every caller checks the class itself and can say what the model
+    // is and where it belongs, which is more use than "not found" for a model
+    // that is sitting right there.
+    if let Some(id) = requested.filter(|id| !id.trim().is_empty()) {
+        if guard.models.contains_key(id)
+            || guard.dormant.contains_key(id)
+            || guard.tts.contains_key(id)
+        {
+            return Ok(id.to_string());
+        }
+    }
     if guard.models.is_empty() && guard.dormant.is_empty() && guard.tts.is_empty() {
         return Err(ApiError::NotLoaded);
     }
@@ -3569,7 +3600,7 @@ async fn rerank(
             .unwrap_or_default();
         if class != "rerank" {
             return Err(ApiError::NotFound(format!(
-                "{id} is a {class} model — load a reranker (class rerank) to rank documents",
+                "{id} is not a reranker (class {class}) — load one (class rerank) to rank documents",
             )));
         }
         let handle = guard
@@ -3679,7 +3710,7 @@ async fn embed_engine(
         .unwrap_or_default();
     if class != "embedding" {
         return Err(ApiError::NotFound(format!(
-            "{id} is a {class} model — load an embedding model (class embedding) to embed",
+            "{id} is not an embedding model (class {class}) — load one (class embedding) to embed",
         )));
     }
     let engine = guard

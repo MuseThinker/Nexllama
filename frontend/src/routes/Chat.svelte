@@ -314,7 +314,7 @@ async function refreshModels() {
     // nonsense, so it is served by /v1/audio/transcriptions instead.
     const chatty = (s.models ?? []).filter(
       (m) =>
-        !['embedding', 'rerank', 'tts'].includes(m.info?.model_class) &&
+        !['embedding', 'rerank', 'tts', 'asr'].includes(m.info?.model_class) &&
         !(m.info?.audio && !m.info?.vision),
     );
     apiOnly = (s.models ?? []).length - chatty.length;

@@ -8,8 +8,8 @@ pub mod tune;
 pub mod types;
 
 pub use engine::{
-    AsrOptions, AsrResult, EmbedResult, Engine, EngineHandle, EngineInfo, FlashAttn, KvCacheType,
-    LoadConfig, LoadEvent, LoadMode, LoraAdapter, RerankResult,
+    audio_projector_beside, AsrOptions, AsrResult, EmbedResult, Engine, EngineHandle, EngineInfo,
+    FlashAttn, KvCacheType, LoadConfig, LoadEvent, LoadMode, LoraAdapter, RerankResult,
 };
 pub use error::{InferError, Result};
 pub use fit::{FitReport, ModelFootprint};

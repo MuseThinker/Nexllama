@@ -1426,7 +1426,7 @@ async function saveCloud(silent) {
             <span class="file-name">
               {m.id}
               {#if m.info?.vision}<span class="badge">vision</span>{/if}
-              {#if m.info?.audio}<span class="badge api">ASR</span>{/if}
+              {#if m.info?.audio || m.info?.model_class === 'asr'}<span class="badge api">ASR</span>{/if}
               {#if m.draft_model}
                 <span class="badge" title={m.draft_model}>{kindOf(m.draft_model)}</span>
               {:else if m.load_mtp && m.info?.mtp}

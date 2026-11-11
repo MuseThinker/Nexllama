@@ -1243,6 +1243,18 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
         .as_ref()
         .map(gguf_probe::Probe::classify)
         .unwrap_or(gguf_probe::ModelClass::Llm);
+    // A speech bundle's text weights are an ordinary LLM, so a load that omits
+    // the audio projector produces an instance that reports "chat model" — and
+    // every rule that keeps speech models out of chat and out of the speed
+    // sweep is keyed on the instance, so it would be offered for both. The
+    // bundle is what it is: look beside the checkpoint, and file it as speech
+    // either way.
+    let audio_beside = audio_projector_beside(&cfg.model_path);
+    let class_name = if audio_beside.is_some() {
+        "asr"
+    } else {
+        class.as_str()
+    };
 
     // The model's chat templates, parsed once and kept for the worker's life —
     // parsing them is not free. They are what lets a request turn reasoning on or
@@ -1688,7 +1700,7 @@ fn worker(cfg: LoadConfig, ready: Sender<LoadEvent>, rx: Receiver<Command>) {
         vision: vision.as_ref().is_some_and(|c| c.supports_vision()),
         audio: supports_audio,
         mmproj_path: cfg.mmproj.clone(),
-        model_class: class.as_str().to_string(),
+        model_class: class_name.to_string(),
         // What an embedding or rank call actually returns: a pooled embedding
         // is `n_embd_out` wide and a rank head `n_cls_out`, so reporting the
         // model's internal `n_embd` would disagree with the vectors served.
@@ -1815,6 +1827,37 @@ fn sequence_floats(model: &LlamaModel, pooling: LlamaPoolingType) -> usize {
         _ => usize::try_from(model.n_embd_out()).unwrap_or(0),
     };
     n.max(1)
+}
+
+/// The audio-only projector sitting beside a checkpoint, if there is exactly one.
+///
+/// A speech bundle is weights plus an audio encoder, and the encoder is what
+/// makes the bundle a speech model: without it the text weights look like any
+/// other chat model. Two projectors in one folder cannot be attributed to this
+/// checkpoint, so the answer is `None` rather than a guess.
+pub fn audio_projector_beside(model_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = model_path.parent()?;
+    let mut found: Option<std::path::PathBuf> = None;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+            continue;
+        }
+        let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+        if !(name.contains("mmproj") || name.contains("projector")) {
+            continue;
+        }
+        let Ok(probe) = gguf_probe::probe(&path) else {
+            continue;
+        };
+        if probe.audio_encoder && !probe.vision_encoder {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(path);
+        }
+    }
+    found
 }
 
 /// Read sequence 0's pooled output, sized for this context's pooling type.
