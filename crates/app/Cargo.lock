@@ -1516,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "gguf-probe"
-version = "0.2.3"
+version = "0.2.2"
 
 [[package]]
 name = "gio"
@@ -1999,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "infer-hub"
-version = "0.2.3"
+version = "0.2.2"
 dependencies = [
  "futures-util",
  "reqwest 0.12.28",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "model-index"
-version = "0.2.3"
+version = "0.2.2"
 dependencies = [
  "gguf-probe",
  "serde_json",
@@ -2517,7 +2517,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nexllama-app"
-version = "0.2.3"
+version = "0.2.2"
 dependencies = [
  "ed25519-dalek",
  "gguf-probe",
