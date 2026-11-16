@@ -1322,6 +1322,7 @@ async function saveCloud(silent) {
 
     <details class="advanced">
       <summary>{$t('models.advanced')}</summary>
+      <p class="muted">{$t('models.advancedHint')}</p>
       <div class="grid">
         <label class="field">
           <span>{$t('models.gpuLayers')}</span>
@@ -1433,6 +1434,11 @@ async function saveCloud(silent) {
                 <span class="badge">MTP</span>
               {/if}
               {#if m.mmproj}<span class="badge" title={m.mmproj}>mmproj</span>{/if}
+              {#if m.prefix_cache === false}
+                <span class="badge warn" title={$t('models.prefixOffHint')}>
+                  {$t('models.prefixOff')}
+                </span>
+              {/if}
               {#if m.n_cpu_moe > 0}
                 <span class="badge" title={$t('models.cpuExperts', { n: m.n_cpu_moe })}>
                   CPU {m.n_cpu_moe}L

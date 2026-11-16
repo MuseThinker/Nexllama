@@ -120,6 +120,16 @@ const dict = {
     'models.drafterHint':
       '起草方式。自动：内置 MTP 头优先，另有 DFlash/EAGLE 外挂文件时用外挂；无草稿：只加载原模型，不挂 MTP/DFlash；视觉投影器（如有）不受影响。引擎只认一个草稿器。',
     'models.advanced': '高级参数',
+    'models.advancedHint':
+      '这里的设置在下次加载模型时生效；已经在运行的模型不会自动应用。',
+    'models.prefixOff': '前缀未复用',
+    'models.prefixOffHint':
+      '当前实例没有启用已编码前缀复用，每轮都会重新 prefill 整段对话。钩选「复用已编码前缀」后重新加载模型即可。',
+    'models.advancedHint':
+      'These settings apply the next time the model is loaded; a model that is already running keeps its current ones.',
+    'models.prefixOff': 'prefix off',
+    'models.prefixOffHint':
+      'This instance is not reusing encoded prefixes, so every turn re-prefills the whole conversation. Tick "Reuse encoded prefix" and load the model again.',
     'models.thinking': '思考模式',
     'models.thinkingOn': '思考',
     'models.thinkingOff': '非思考',
@@ -288,7 +298,23 @@ const dict = {
     'settings.bindNeedsKey':
       '监听所有网卡（0.0.0.0）需要访问令牌。请先点「生成」创建令牌，再选择 0.0.0.0；当前仍保持 127.0.0.1。',
     'settings.exposedKey': '其他设备调用示例：',
-    'settings.networkRestart': '修改监听地址、端口或访问令牌后，需重启服务生效。',
+    'settings.hfSource': '模型下载源',
+    'settings.hfAuto': '自动（官方优先，连不上就切镜像）',
+    'settings.hfMirror': 'HF-Mirror（国内镜像）',
+    'settings.hfUpstream': 'HuggingFace 官方',
+    'settings.hfCustom': '自定义地址',
+    'settings.hfEndpoint': '自定义地址',
+    'settings.hfHint':
+      '自动模式先连 huggingface.co，连不上或中途断开时改用 hf-mirror.com。如果官方能连但下载很慢，直接选 HF-Mirror。',
+    'settings.hfSource': 'Model download source',
+    'settings.hfAuto': 'Auto (official first, mirror if it fails)',
+    'settings.hfMirror': 'HF-Mirror',
+    'settings.hfUpstream': 'HuggingFace official',
+    'settings.hfCustom': 'Custom endpoint',
+    'settings.hfEndpoint': 'Custom endpoint',
+    'settings.hfHint':
+      'Auto connects to huggingface.co first and switches to hf-mirror.com when that fails or drops. If the official host connects but downloads crawl, pick HF-Mirror directly.',
+    'settings.networkRestart': '修改监听地址、端口、访问令牌或下载源后，需重启服务生效。',
     'settings.update': '更新',
     'settings.current': '当前',
     'settings.latest': '最新',
@@ -584,7 +610,7 @@ const dict = {
       'Listening on every interface (0.0.0.0) needs an access token. Generate one first, then pick 0.0.0.0; it stays on 127.0.0.1 for now.',
     'settings.exposedKey': 'Call it from another device:',
     'settings.networkRestart':
-      'Changes to the bind address, port or access token take effect after a restart.',
+      'Changes to the bind address, port, access token or download source take effect after a restart.',
     'settings.update': 'Update',
     'settings.current': 'Current',
     'settings.latest': 'Latest',

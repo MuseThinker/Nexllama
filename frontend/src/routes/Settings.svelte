@@ -36,6 +36,11 @@ const defaults = {
   // The port the daemon listens on. Changing it needs a daemon restart, which
   // the Restart button in the Network card performs.
   port: 15656,
+  // Where model downloads come from. `auto` prefers huggingface.co and falls
+  // back to the mirror when the connection fails; `mirror` and `upstream` pin
+  // one host; `custom` uses `hfEndpoint` as given.
+  hfSource: 'auto',
+  hfEndpoint: '',
   apiKey: '',
 };
 
@@ -181,6 +186,8 @@ const OWNED = [
   'updatePublicKey',
   'bindHost',
   'port',
+  'hfSource',
+  'hfEndpoint',
   'apiKey',
 ];
 
@@ -494,6 +501,27 @@ onMount(() => {
         </p>
       {/if}
     {/if}
+    <label class="field">
+      <span>{$t('settings.hfSource')}</span>
+      <select bind:value={settings.hfSource}>
+        <option value="auto">{$t('settings.hfAuto')}</option>
+        <option value="mirror">{$t('settings.hfMirror')}</option>
+        <option value="upstream">{$t('settings.hfUpstream')}</option>
+        <option value="custom">{$t('settings.hfCustom')}</option>
+      </select>
+    </label>
+    {#if settings.hfSource === 'custom'}
+      <label class="field">
+        <span>{$t('settings.hfEndpoint')}</span>
+        <input
+          type="url"
+          bind:value={settings.hfEndpoint}
+          placeholder="https://hf-mirror.com"
+          spellcheck="false"
+        />
+      </label>
+    {/if}
+    <p class="muted">{$t('settings.hfHint')}</p>
     <div class="restart-row">
       <p class="muted">{$t('settings.networkRestart')}</p>
       <button

@@ -216,6 +216,31 @@ fn settings_api_key(settings: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The hub endpoint the daemon should use, if the user pinned one.
+///
+/// `auto` returns `None` on purpose: the hub client's own probe already prefers
+/// the official host and falls back when it cannot connect. A pinned choice has
+/// to be expressed as `HF_ENDPOINT` because that is the one override the client
+/// honours outright — and it is the only way to pick the mirror when the
+/// official host answers a TCP probe but cannot carry the transfer.
+fn hf_endpoint(settings: &serde_json::Value) -> Option<String> {
+    let source = settings
+        .get("hfSource")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto");
+    let custom = settings
+        .get("hfEndpoint")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match source {
+        "mirror" => Some("https://hf-mirror.com".to_string()),
+        "upstream" => Some("https://huggingface.co".to_string()),
+        "custom" => custom.map(|s| s.trim_end_matches('/').to_string()),
+        _ => None,
+    }
+}
+
 /// Credential-store account for a cloud provider's key.
 ///
 /// One entry per provider, so removing a provider does not disturb the others.
@@ -995,6 +1020,13 @@ fn try_spawn_backend(
     // and this is the one value here worth keeping out of them.
     if let Some(key) = api_key(settings) {
         cmd.env("NEXLLAMA_API_KEY", key);
+    }
+    // Where the hub client downloads from. `auto` leaves the variable unset so
+    // the client keeps its own probe (official first, mirror when the
+    // connection fails); the other choices pin one host, which is the only way
+    // to prefer the mirror when the official host connects but transfers crawl.
+    if let Some(endpoint) = hf_endpoint(settings) {
+        cmd.env("HF_ENDPOINT", endpoint);
     }
     // Speculative decoding learns which n-grams tend to be followed by what;
     // keeping that next to the settings means drafts survive a restart.
@@ -2478,6 +2510,38 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// `auto` must leave the variable unset so the hub client keeps its own
+    /// probe; the pinned choices have to become `HF_ENDPOINT`, because that is
+    /// the only override the client honours outright.
+    #[test]
+    fn hf_endpoint_follows_the_chosen_source() {
+        let auto = serde_json::json!({ "hfSource": "auto" });
+        assert_eq!(hf_endpoint(&auto), None);
+
+        let mirror = serde_json::json!({ "hfSource": "mirror" });
+        assert_eq!(hf_endpoint(&mirror).as_deref(), Some("https://hf-mirror.com"));
+
+        let upstream = serde_json::json!({ "hfSource": "upstream" });
+        assert_eq!(
+            hf_endpoint(&upstream).as_deref(),
+            Some("https://huggingface.co")
+        );
+
+        let custom = serde_json::json!({
+            "hfSource": "custom",
+            "hfEndpoint": " https://hf.example.cn/ ",
+        });
+        assert_eq!(
+            hf_endpoint(&custom).as_deref(),
+            Some("https://hf.example.cn")
+        );
+
+        // A custom source with no address falls back to the probe rather than
+        // pinning an empty host.
+        let blank = serde_json::json!({ "hfSource": "custom", "hfEndpoint": "  " });
+        assert_eq!(hf_endpoint(&blank), None);
     }
 
     /// The models folder is often one model's own folder: weights with a

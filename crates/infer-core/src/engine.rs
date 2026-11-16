@@ -14,7 +14,7 @@ use llama_cpp_4::eagle::{Eagle3Session, Eagle3SessionConfig};
 use llama_cpp_4::model::params::LlamaLoadMode;
 use llama_cpp_4::model::LlamaLoraAdapter;
 use llama_cpp_4::mtmd::{
-    MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunks, MtmdInputText,
+    MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunkType, MtmdInputChunks, MtmdInputText,
 };
 use llama_cpp_4::mtp::{MtpSession, MtpSessionConfig};
 use llama_cpp_4::ngram::ngram_simple_draft;
@@ -2441,6 +2441,23 @@ fn fill_prompt(
     vision
         .tokenize(&text, &bitmap_refs, &mut chunks)
         .map_err(|e| InferError::Vision(format!("tokenize prompt: {e}")))?;
+
+    // The media path encodes the whole prompt in one pass — text, then the
+    // image or audio embeddings — so the budget has to cover both. Running out
+    // of room inside the image is what `eval_chunks` reports as a bare "code 1",
+    // which reads like a broken encoder rather than a full context.
+    let needed = chunks.n_tokens();
+    if needed + 1 > n_ctx {
+        let media_tokens: usize = (0..chunks.len())
+            .filter_map(|i| chunks.get(i))
+            .filter(|c| c.chunk_type() != MtmdInputChunkType::Text)
+            .map(|c| c.n_tokens())
+            .sum();
+        return Err(InferError::Vision(format!(
+            "this prompt needs {needed} tokens and the context is {n_ctx}: the attachment alone is \
+             {media_tokens}. Start a new chat, raise the context, or send a smaller image."
+        )));
+    }
 
     let mut n_past = 0i32;
     vision

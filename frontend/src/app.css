@@ -1169,6 +1169,12 @@ a.link:hover {
   color: var(--fg);
 }
 
+/* A setting that is on in the file but not in the running model. */
+.badge.warn {
+  border-color: #b8792a;
+  color: #d99a4a;
+}
+
 .progress {
   margin-top: 10px;
   height: 6px;
