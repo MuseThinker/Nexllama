@@ -47,6 +47,21 @@ if (-not $Backends -or $Backends.Count -eq 0) {
 $cudaDir = Join-Path $root "crates\app\backends\cuda"
 $bundleDir = Join-Path $root "crates\app\target\release\bundle\nsis"
 
+# `tauri.conf.json` bundles `backends/**/*`, so anything left in that folder ships
+# whether or not this run built it. A backend staged by an earlier build would
+# then travel with older code under a newer version number, which is invisible to
+# everyone until it misbehaves on the one GPU family that uses it. Anything not
+# part of this build is removed rather than shipped stale.
+$staged = Join-Path $root "crates\app\backends"
+if (Test-Path -LiteralPath $staged) {
+    foreach ($dir in Get-ChildItem $staged -Directory) {
+        if ($Backends -notcontains $dir.Name) {
+            Write-Host "note: removing stale backend staging '$($dir.Name)' (not part of this build)"
+            Remove-Item -LiteralPath $dir.FullName -Recurse -Force
+        }
+    }
+}
+
 # The NVIDIA runtime the lite edition leaves out. Named by pattern because the
 # toolkit's version suffix moves; `cublasLt64_*.dll` is 428 MB on its own, which
 # is what makes the difference between the two installers worth offering.
