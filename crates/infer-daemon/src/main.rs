@@ -2,6 +2,7 @@ mod cloud;
 mod http;
 mod hub;
 mod lifecycle;
+mod server_mode;
 mod state;
 mod tts;
 mod tune;
@@ -83,6 +84,24 @@ struct Args {
     /// missing, speech falls back to one `llama-tts` process per request.
     #[arg(long = "tts-worker-bin")]
     tts_worker_bin: Option<PathBuf>,
+
+    /// Serve chat through a `llama-server` child process instead of this
+    /// process's own decode loop.
+    ///
+    /// The in-process engine answers one request at a time; `llama-server` does
+    /// continuous batching with `--parallel` slots, which is what several people
+    /// sharing one card need. Point this at `llama-server.exe`; `/admin/server`
+    /// starts and stops it, and `/v1/*` is forwarded to it while it runs.
+    #[arg(long = "server-exe")]
+    server_exe: Option<PathBuf>,
+
+    /// Slots the managed `llama-server` serves at once.
+    ///
+    /// The context is divided between them: `-c 32768 -np 8` gives each
+    /// conversation 4k. Four is the measured sweet spot on a 24 GB card; see
+    /// `docs/benchmarks/concurrency.md`.
+    #[arg(long = "server-parallel", default_value_t = 4)]
+    server_parallel: u32,
 
     /// Layers to offload to the GPU (999 = all).
     #[arg(long, default_value_t = 999)]
@@ -304,7 +323,8 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(Duration::from_secs(args.keep_alive_secs), base.clone())
         .with_models_dir(args.models_dir.clone())
         .with_tts_bin(resolve_tts_bin(args.tts_bin.clone()))
-        .with_tts_worker_bin(resolve_tts_worker_bin(args.tts_worker_bin.clone()));
+        .with_tts_worker_bin(resolve_tts_worker_bin(args.tts_worker_bin.clone()))
+        .with_server(args.server_exe.clone(), args.server_parallel);
 
     let mut first = true;
     for (i, model) in args.model.iter().enumerate() {

@@ -122,6 +122,10 @@ pub fn router(
         .route("/admin/providers/test", post(test_provider))
         // The `auto` alias's preference: local-first (default) or cloud-first.
         .route("/admin/routing", get(get_routing).post(set_routing))
+        // The hosted llama-server: start, stop, and what is running.
+        .route("/admin/server", get(server_status))
+        .route("/admin/server/start", post(server_start))
+        .route("/admin/server/stop", post(server_stop))
         .route_layer(middleware::from_fn_with_state(api_key, require_key));
 
     let api = Router::new()
@@ -146,6 +150,12 @@ pub fn router(
         // 2 MB default — below a real audio upload, and `Multipart` is an
         // extractor. Both limits have to be raised.
         .layer(axum::extract::DefaultBodyLimit::max(limits::BODY_BYTES))
+        // A hosted llama-server takes `/v1/*` while it runs; everything else
+        // (admin, the UI, speech) stays with this process.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            forward_to_server,
+        ))
         .with_state(state)
 }
 
@@ -4028,6 +4038,212 @@ async fn chat(
     Ok(Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hosted llama-server
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ServerStartRequest {
+    /// Checkpoint to serve.
+    model: String,
+    #[serde(default)]
+    mmproj: Option<String>,
+    /// Context for the whole pool; 0 or absent keeps the daemon's base config.
+    #[serde(default)]
+    n_ctx: Option<u32>,
+    /// Slots to serve at once; absent uses `--server-parallel`.
+    #[serde(default)]
+    parallel: Option<u32>,
+}
+
+/// A port nothing is listening on, in the ephemeral range.
+///
+/// The child is told to bind it; the window between this check and the bind is
+/// small, and the alternative — a fixed port — collides with whatever else the
+/// machine runs.
+fn free_port() -> Result<u16, ApiError> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| ApiError::Model(format!("could not reserve a port: {e}")))?;
+    listener
+        .local_addr()
+        .map(|a| a.port())
+        .map_err(|e| ApiError::Model(format!("could not read the reserved port: {e}")))
+}
+
+async fn server_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mut guard = state.server.lock().await;
+    let mut running = serde_json::Value::Null;
+    if let Some(p) = guard.as_mut() {
+        if p.is_alive() {
+            running = json!({
+                "id": p.model_id,
+                "model": p.model_path.display().to_string(),
+                "port": p.port(),
+                "parallel": p.parallel,
+                "n_ctx": p.n_ctx,
+                "n_gpu_layers": p.n_gpu_layers,
+                "base": p.base(),
+            });
+        } else {
+            // A child that exited on its own is not "running"; drop it so the
+            // next request is not forwarded to a dead port.
+            *guard = None;
+        }
+    }
+    Json(json!({
+        "available": state.server_exe.is_some(),
+        "exe": state.server_exe.as_ref().map(|p| p.display().to_string()),
+        "parallel": state.server_parallel,
+        "running": running,
+    }))
+}
+
+async fn server_start(
+    State(state): State<AppState>,
+    Json(req): Json<ServerStartRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(exe) = state.server_exe.clone() else {
+        return Err(ApiError::BadRequest(
+            "this daemon was not started with --server-exe, so it cannot host a llama-server"
+                .into(),
+        ));
+    };
+    if !Path::new(&req.model).is_file() {
+        return Err(ApiError::NotFound(format!(
+            "model not found: {}",
+            req.model
+        )));
+    }
+    {
+        let mut guard = state.server.lock().await;
+        if let Some(p) = guard.as_mut() {
+            if p.is_alive() {
+                return Err(ApiError::BadRequest(
+                    "a llama-server is already running; stop it first".into(),
+                ));
+            }
+            *guard = None;
+        }
+    }
+
+    let mut cfg = {
+        let guard = state.inner.lock().await;
+        guard.base_cfg.clone()
+    };
+    cfg.model_path = req.model.clone().into();
+    cfg.mmproj = req.mmproj.map(Into::into);
+    if let Some(ctx) = req.n_ctx.filter(|v| *v > 0) {
+        cfg.n_ctx = ctx;
+    }
+    // `n_ctx = 0` means "size it from the machine", which this daemon does when
+    // it builds a context. The server needs a number, so fall back to the
+    // checkpoint's own training context capped at a sane pool.
+    if cfg.n_ctx == 0 {
+        cfg.n_ctx = 32768;
+    }
+    let parallel = req.parallel.unwrap_or(state.server_parallel).max(1);
+    let id = Path::new(&req.model)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model")
+        .to_string();
+    let port = free_port()?;
+    let proc = crate::server_mode::ServerProc::spawn(&exe, &cfg, id.clone(), port, parallel)
+        .await
+        .map_err(ApiError::Model)?;
+    let out = json!({
+        "id": proc.model_id,
+        "model": proc.model_path.display().to_string(),
+        "port": proc.port(),
+        "parallel": proc.parallel,
+        "n_ctx": proc.n_ctx,
+        "n_gpu_layers": proc.n_gpu_layers,
+        "base": proc.base(),
+    });
+    *state.server.lock().await = Some(proc);
+    Ok(Json(json!({ "status": "ok", "server": out })))
+}
+
+async fn server_stop(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let stopped = state.server.lock().await.take().is_some();
+    Json(json!({ "status": "ok", "stopped": stopped }))
+}
+
+/// Send `/v1/*` to the hosted server while one is running.
+///
+/// The daemon keeps its own admin surface, speech, and UI; only the inference
+/// endpoints move. Forwarding the raw request instead of re-serialising a typed
+/// one keeps every field a client sends — including ones this daemon does not
+/// model — intact.
+async fn forward_to_server(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if !req.uri().path().starts_with("/v1/") {
+        return next.run(req).await;
+    }
+    let base = {
+        let mut guard = state.server.lock().await;
+        let mut base = None;
+        if let Some(p) = guard.as_mut() {
+            if p.is_alive() {
+                base = Some(p.base());
+            }
+        }
+        base
+    };
+    let Some(base) = base else {
+        return next.run(req).await;
+    };
+    match proxy_to(&state, req, &base).await {
+        Ok(resp) => resp,
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("llama-server: {e}")).into_response(),
+    }
+}
+
+async fn proxy_to(state: &AppState, req: Request, base: &str) -> Result<Response, String> {
+    let (parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, limits::BODY_BYTES)
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/v1/models");
+    let url = format!("{base}{path}");
+
+    let mut outbound = state.client.request(parts.method.clone(), &url);
+    for (name, value) in parts.headers.iter() {
+        // Hop-by-hop headers describe the connection to *this* server.
+        if matches!(
+            name.as_str(),
+            "host" | "content-length" | "connection" | "transfer-encoding"
+        ) {
+            continue;
+        }
+        outbound = outbound.header(name, value);
+    }
+    let resp = outbound
+        .body(bytes)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let status = resp.status();
+    let mut builder = Response::builder().status(status);
+    for (name, value) in resp.headers().iter() {
+        if matches!(
+            name.as_str(),
+            "content-length" | "transfer-encoding" | "connection"
+        ) {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    let stream = resp.bytes_stream();
+    builder
+        .body(axum::body::Body::from_stream(stream))
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

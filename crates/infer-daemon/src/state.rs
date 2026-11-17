@@ -356,6 +356,17 @@ pub struct AppState {
     /// Measured-tuning jobs. Outside `inner` because a sweep runs on its own
     /// thread and never touches the model lock; only its own status changes.
     pub tunes: Arc<crate::tune::TuneRegistry>,
+    /// The `llama-server` executable this daemon may host, when it was given
+    /// one. `None` means every request is answered by this process.
+    pub server_exe: Option<PathBuf>,
+    /// Slots the hosted server serves at once.
+    pub server_parallel: u32,
+    /// The hosted server, when one is running.
+    ///
+    /// Behind its own lock rather than `inner`: a chat request only needs to
+    /// know *whether* it is up and where, and must not wait for a model load to
+    /// find that out.
+    pub server: Arc<tokio::sync::Mutex<Option<crate::server_mode::ServerProc>>>,
 }
 
 impl AppState {
@@ -380,6 +391,9 @@ impl AppState {
             tts_lock: Arc::new(tokio::sync::Mutex::new(())),
             hub: Arc::new(crate::hub::HubState::new()),
             tunes: Arc::new(crate::tune::TuneRegistry::default()),
+            server_exe: None,
+            server_parallel: 4,
+            server: Arc::new(tokio::sync::Mutex::new(None)),
             inner: Arc::new(Mutex::new(DaemonState {
                 models: HashMap::new(),
                 tts: HashMap::new(),
@@ -407,6 +421,16 @@ impl AppState {
     /// Point the resident speech worker at a particular executable.
     pub fn with_tts_worker_bin(mut self, bin: Option<PathBuf>) -> Self {
         self.tts_worker = Arc::new(crate::tts::TtsWorker::new(bin));
+        self
+    }
+
+    /// Allow hosting a `llama-server` child process for multi-user serving.
+    ///
+    /// `None` keeps every request on this process's own decode loop, which is
+    /// the desktop shape: one caller at a time.
+    pub fn with_server(mut self, exe: Option<PathBuf>, parallel: u32) -> Self {
+        self.server_exe = exe;
+        self.server_parallel = parallel.max(1);
         self
     }
 
