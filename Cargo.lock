@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "gguf-probe"
-version = "0.2.2"
+version = "0.2.3"
 
 [[package]]
 name = "glob"
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "infer-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "gguf-probe",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "infer-daemon"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "infer-hub"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "model-index"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "gguf-probe",
  "serde_json",
