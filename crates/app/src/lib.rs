@@ -265,6 +265,17 @@ fn normalize_endpoint(raw: &str) -> Option<String> {
     Some(candidate)
 }
 
+/// The `llama-server` this install would host, for the settings page.
+///
+/// `None` means server mode cannot start at all: no packaged binary beside the
+/// daemon and no `serverExe` in settings. The daemon has the same rule, so the
+/// two never disagree about whether the switch is usable.
+fn server_exe_path(app: &tauri::AppHandle, backend: &str) -> Option<String> {
+    let settings = load_settings(app);
+    let bin = daemon_binary(app, backend).ok()?;
+    server_exe(&bin, &settings).map(|p| p.display().to_string())
+}
+
 /// The `llama-server` this daemon should host, if any.
 ///
 /// A packaged backend keeps one beside the daemon; `serverExe` overrides it for
@@ -866,15 +877,21 @@ fn backend_info(app: tauri::AppHandle) -> serde_json::Value {
         .and_then(|v| v.as_str())
         .unwrap_or("auto")
         .to_string();
+    let backend = resolve_backend(&app, &requested);
+    let server_exe = server_exe_path(&app, &backend);
     serde_json::json!({
         "preferred": preferred_backend(),
         "requested": requested,
-        "resolved": resolve_backend(&app, &requested),
+        "resolved": backend,
         "available": available_backends(&app),
         "gpus": gpu_names(),
         // The backend this machine's GPU wants, installed or not — what the UI
         // offers to download when it is missing.
         "gpu_backend": desired_gpu_backend(),
+        // The `llama-server` this install could host, if any. Server mode is a
+        // switch that does nothing without one, so the settings page says so
+        // instead of leaving it silently on.
+        "server_exe": server_exe,
     })
 }
 

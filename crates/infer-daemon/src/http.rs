@@ -1687,7 +1687,9 @@ async fn load(
             "id": id,
             "info": entry["info"],
             "notes": notes,
-            "server": entry,
+            // The port and slot count, not the whole model entry: the app reads
+            // this to show where the server is listening.
+            "server": entry["server"],
         })));
     }
 

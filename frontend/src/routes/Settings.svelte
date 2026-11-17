@@ -556,6 +556,9 @@ onMount(() => {
         />
       </label>
       <p class="muted">{$t('settings.serverModeNote')}</p>
+      {#if hasTauri && backendInfo && !backendInfo.server_exe && !settings.serverExe?.trim()}
+        <p class="warn">{$t('settings.serverNoExe')}</p>
+      {/if}
     {/if}
     <div class="restart-row">
       <p class="muted">{$t('settings.networkRestart')}</p>
