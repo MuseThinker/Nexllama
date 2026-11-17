@@ -233,12 +233,36 @@ fn hf_endpoint(settings: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    match source {
-        "mirror" => Some("https://hf-mirror.com".to_string()),
-        "upstream" => Some("https://huggingface.co".to_string()),
-        "custom" => custom.map(|s| s.trim_end_matches('/').to_string()),
-        _ => None,
+    let raw = match source {
+        "mirror" => "https://hf-mirror.com",
+        "upstream" => "https://huggingface.co",
+        "custom" => custom?,
+        _ => return None,
+    };
+    normalize_endpoint(raw)
+}
+
+/// Turn what a person types into something `HF_ENDPOINT` can carry.
+///
+/// `hf-mirror.com` is what people type; `https://hf-mirror.com` is what the hub
+/// client needs. A value that is not an http(s) URL with a host is dropped here
+/// rather than handed to the daemon, where every request would fail with a
+/// message about the wrong thing.
+fn normalize_endpoint(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
     }
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let url = reqwest::Url::parse(&candidate).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// Credential-store account for a cloud provider's key.
@@ -2538,10 +2562,24 @@ mod tests {
             Some("https://hf.example.cn")
         );
 
+        // A bare host is what people type; the scheme is added for them.
+        let bare = serde_json::json!({ "hfSource": "custom", "hfEndpoint": "hf-mirror.com" });
+        assert_eq!(
+            hf_endpoint(&bare).as_deref(),
+            Some("https://hf-mirror.com")
+        );
+
         // A custom source with no address falls back to the probe rather than
         // pinning an empty host.
         let blank = serde_json::json!({ "hfSource": "custom", "hfEndpoint": "  " });
         assert_eq!(hf_endpoint(&blank), None);
+
+        // Neither a non-http scheme nor something that is not a URL may be
+        // handed to the daemon: every request would fail on it.
+        let ftp = serde_json::json!({ "hfSource": "custom", "hfEndpoint": "ftp://mirror.example" });
+        assert_eq!(hf_endpoint(&ftp), None);
+        let junk = serde_json::json!({ "hfSource": "custom", "hfEndpoint": "not a url" });
+        assert_eq!(hf_endpoint(&junk), None);
     }
 
     /// The models folder is often one model's own folder: weights with a

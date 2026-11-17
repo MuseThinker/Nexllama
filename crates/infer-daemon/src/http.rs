@@ -3111,25 +3111,39 @@ async fn chat_engine(
         let guard = state.inner.lock().await;
         require_model(&guard, requested, "llm")?
     };
+    // Reject a model that is the wrong kind *before* loading it. Naming an
+    // embedding model in a chat request should not pull it onto the card just
+    // to be refused afterwards.
+    {
+        let guard = state.inner.lock().await;
+        let info = guard
+            .models
+            .get(&id)
+            .map(|l| &l.info)
+            .or_else(|| guard.dormant.get(&id).map(|d| &d.info));
+        if let Some(info) = info {
+            // A speech-recognition bundle is an LLM, but its only useful input
+            // is audio. Text chat through it produces invented transcripts, so
+            // point the caller at the endpoint that does the job.
+            if matches!(slot_of(info), ModelSlot::Audio) {
+                return Err(ApiError::BadRequest(format!(
+                    "{id} is a speech model; POST audio to /v1/audio/transcriptions instead"
+                )));
+            }
+            if info.model_class != "llm" {
+                return Err(ApiError::NotFound(format!(
+                    "{id} is not a chat model (class {}) — it cannot generate text; load a chat \
+                     model (class llm)",
+                    info.model_class
+                )));
+            }
+        }
+    }
     ensure_ready(state, &id).await?;
 
     let mut guard = state.inner.lock().await;
-    // Encoder models decode nothing: their tokens are probabilities, not a
-    // continuation. Failing fast says so, instead of streaming word salad.
-    // A speech-recognition bundle is an LLM, but its only useful input is audio.
-    // Text chat through it produces invented transcripts, so point the caller at
-    // the endpoint that does the job. This comes before the class check: the
-    // bundle is filed as `asr` either way, and "use the audio endpoint" is the
-    // answer the caller can act on.
-    if guard
-        .models
-        .get(&id)
-        .is_some_and(|l| matches!(slot_of(&l.info), ModelSlot::Audio))
-    {
-        return Err(ApiError::BadRequest(format!(
-            "{id} is a speech model; POST audio to /v1/audio/transcriptions instead"
-        )));
-    }
+    // The kind was checked before the model was loaded; this is the check that
+    // the loaded instance agrees with it.
     let class = guard
         .models
         .get(&id)
@@ -3591,6 +3605,22 @@ async fn rerank(
         let guard = state.inner.lock().await;
         require_model(&guard, req.model.as_deref(), "rerank")?
     };
+    // The kind is known before the model is loaded, and a model of another kind
+    // should not be pulled onto the card only to be refused afterwards.
+    {
+        let guard = state.inner.lock().await;
+        let class = guard
+            .models
+            .get(&id)
+            .map(|l| l.info.model_class.clone())
+            .or_else(|| guard.dormant.get(&id).map(|d| d.info.model_class.clone()))
+            .unwrap_or_default();
+        if class != "rerank" {
+            return Err(ApiError::NotFound(format!(
+                "{id} is not a reranker (class {class}) — load one (class rerank) to rank documents",
+            )));
+        }
+    }
     ensure_ready(&state, &id).await?;
 
     let (handle, model_id, active) = {
@@ -3702,6 +3732,22 @@ async fn embed_engine(
         let guard = state.inner.lock().await;
         require_model(&guard, requested, "embedding")?
     };
+    // Same as the reranker: a model of another kind is refused before it is
+    // loaded, not after.
+    {
+        let guard = state.inner.lock().await;
+        let class = guard
+            .models
+            .get(&id)
+            .map(|l| l.info.model_class.clone())
+            .or_else(|| guard.dormant.get(&id).map(|d| d.info.model_class.clone()))
+            .unwrap_or_default();
+        if class != "embedding" {
+            return Err(ApiError::NotFound(format!(
+                "{id} is not an embedding model (class {class}) — load one (class embedding) to embed",
+            )));
+        }
+    }
     ensure_ready(state, &id).await?;
 
     let mut guard = state.inner.lock().await;

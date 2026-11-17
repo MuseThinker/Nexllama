@@ -401,6 +401,31 @@ impl SpecGate {
 mod spec_tests {
     use super::*;
 
+    /// A projector belongs to the model whose name it shares. The two markers
+    /// are dropped, and the size part is ignored, so a quant suffix or a
+    /// different quantisation on the projector still matches.
+    #[test]
+    fn projector_families_are_matched_by_name() {
+        let family_of = |name: &str| family(std::path::Path::new(name));
+        assert_eq!(
+            family_of("mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"),
+            family_of("Qwen3-ASR-1.7B-Q8_0.gguf")
+        );
+        assert_eq!(
+            family_of("mmproj-Qwen3.8-27B-Q8_0.gguf"),
+            family_of("Qwen3.8-27B-UD-IQ4_XS.gguf")
+        );
+        assert_ne!(
+            family_of("mmproj-Qwen3.8-27B-Q8_0.gguf"),
+            family_of("Qwen3-ASR-1.7B-Q8_0.gguf")
+        );
+        // A projector that says nothing about its model matches nothing.
+        assert_ne!(
+            family_of("mmproj-F16.gguf"),
+            family_of("Qwen3-ASR-1.7B-Q8_0.gguf")
+        );
+    }
+
     #[test]
     fn asr_output_splits_the_language_header() {
         assert_eq!(
@@ -1835,29 +1860,80 @@ fn sequence_floats(model: &LlamaModel, pooling: LlamaPoolingType) -> usize {
 /// makes the bundle a speech model: without it the text weights look like any
 /// other chat model. Two projectors in one folder cannot be attributed to this
 /// checkpoint, so the answer is `None` rather than a guess.
+///
+/// A folder that holds one model and one projector is unambiguous, and that is
+/// the usual shape of a speech bundle. A folder that holds more has to be
+/// matched by name — a projector for `Qwen3-ASR` does not belong to
+/// `Qwen3.8-27B` — and a projector whose name says nothing about its model is
+/// left alone rather than attached to the wrong weights.
 pub fn audio_projector_beside(model_path: &std::path::Path) -> Option<std::path::PathBuf> {
     let dir = model_path.parent()?;
-    let mut found: Option<std::path::PathBuf> = None;
+    let mut projectors: Vec<std::path::PathBuf> = Vec::new();
+    let mut mains = 0usize;
     for entry in std::fs::read_dir(dir).ok()? {
         let path = entry.ok()?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
             continue;
         }
         let name = path.file_name()?.to_str()?.to_ascii_lowercase();
-        if !(name.contains("mmproj") || name.contains("projector")) {
-            continue;
+        if name.contains("mmproj") || name.contains("projector") {
+            projectors.push(path);
+        } else if !(name.contains("draft")
+            || name.contains("eagle")
+            || name.contains("mtp")
+            || name.contains("dflash")
+            || name.contains("lora")
+            || name.contains("adapter")
+            || name.contains("vocoder"))
+        {
+            mains += 1;
         }
-        let Ok(probe) = gguf_probe::probe(&path) else {
+    }
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for path in &projectors {
+        let Ok(probe) = gguf_probe::probe(path) else {
             continue;
         };
         if probe.audio_encoder && !probe.vision_encoder {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(path);
+            candidates.push(path.clone());
         }
     }
-    found
+    if candidates.len() != 1 {
+        // No audio projector, or more than one and therefore no way to say
+        // which model each belongs to.
+        return None;
+    }
+    let candidate = &candidates[0];
+    if projectors.len() == 1 && mains == 1 {
+        return Some(candidate.clone());
+    }
+    // More than one file that could be a projector, or more than one model:
+    // the names have to agree.
+    if family(model_path) == family(candidate) {
+        Some(candidate.clone())
+    } else {
+        None
+    }
+}
+
+/// The model family a file name belongs to: its first two name parts, with the
+/// projector markers dropped.
+///
+/// `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf` and `Qwen3-ASR-1.7B-Q8_0.gguf` are the
+/// same family; `mmproj-Qwen3.8-27B-Q8_0.gguf` and `Qwen3-ASR-1.7B-Q8_0.gguf`
+/// are not.
+fn family(path: &std::path::Path) -> String {
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let name = name.replace("mmproj", " ").replace("projector", " ");
+    name.split(['-', '_', '.', ' '])
+        .filter(|part| !part.is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// Read sequence 0's pooled output, sized for this context's pooling type.
@@ -2446,7 +2522,11 @@ fn fill_prompt(
     // image or audio embeddings — so the budget has to cover both. Running out
     // of room inside the image is what `eval_chunks` reports as a bare "code 1",
     // which reads like a broken encoder rather than a full context.
-    let needed = chunks.n_tokens();
+    //
+    // Positions, not tokens, are what the context is counted in: an M-RoPE
+    // vision model can place one token at more than one position, so the larger
+    // of the two is the honest requirement.
+    let needed = chunks.n_tokens().max(chunks.n_pos().max(0) as usize);
     if needed + 1 > n_ctx {
         let media_tokens: usize = (0..chunks.len())
             .filter_map(|i| chunks.get(i))
