@@ -55,6 +55,9 @@ function local() {
 let settings = $state(local());
 let saved = $state(false);
 let error = $state('');
+// Set when the settings file could not be read: the page must not write its
+// own (possibly stale) copy back over a file it never saw.
+let loadFailed = $state(false);
 let daemonInfo = $state({ running: false, binary: null, port: 15656, backend: 'cpu' });
 let daemonBusy = $state(false);
 let backendInfo = $state(null);
@@ -195,11 +198,9 @@ const OWNED = [
 async function settingsPayload() {
   let base = {};
   if (hasTauri) {
-    try {
-      base = (await invoke('get_settings')) ?? {};
-    } catch {
-      /* fall through to this page's values alone */
-    }
+    // A failure here must stop the write: falling through with `{}` would send
+    // only this page's fields and delete every other key in the file.
+    base = (await invoke('get_settings')) ?? {};
   }
   const payload = { ...base };
   for (const key of OWNED) {
@@ -307,7 +308,11 @@ async function load() {
       const s = await invoke('get_settings');
       if (s && Object.keys(s).length > 0) settings = { ...defaults, ...s };
     } catch (e) {
+      // The file could not be read. Keep showing what this page last had, but
+      // do not let the auto-save write it back: that is how a momentary lock
+      // turned into "my bind address reset itself".
       error = String(e);
+      loadFailed = true;
     }
   }
   autoStart = settings.autoStartDaemon;
@@ -399,6 +404,8 @@ $effect(() => {
   // Reading the launch-at-login entry back changed these fields; that is the
   // installer being told what it already decided, not a user edit to save.
   if (syncingAutostart) return;
+  // The file was unreadable, so there is nothing trustworthy to layer onto.
+  if (loadFailed) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => persist(), 600);
 });

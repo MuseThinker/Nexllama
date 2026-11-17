@@ -1436,34 +1436,28 @@ fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("settings.json"))
 }
 
-fn load_settings(app: &tauri::AppHandle) -> serde_json::Value {
-    let path = match settings_path(app) {
-        Ok(p) => p,
-        Err(_) => return serde_json::json!({}),
-    };
-    // Every failure used to collapse into "no settings": a half-written file, a
-    // permission problem and a first run all looked the same, and the UI would
-    // then write the defaults straight back over whatever was really there.
+/// Read the settings file, telling "not there yet" apart from "could not read it".
+///
+/// The difference matters to a caller that is about to write the whole file
+/// back: a first run has no settings and defaults are right, while a file that
+/// was merely locked for a moment has all of them, and writing defaults over it
+/// silently resets the user's network, models and download source.
+fn read_settings(app: &tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let path = settings_path(app)?;
     match std::fs::read_to_string(&path) {
-        Ok(s) => match serde_json::from_str(&s) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!(
-                    "nexllama: settings at {} are not valid JSON: {e}",
-                    path.display()
-                );
-                serde_json::json!({})
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => {
-            eprintln!(
-                "nexllama: could not read settings at {}: {e}",
-                path.display()
-            );
-            serde_json::json!({})
-        }
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| format!("settings at {} are not valid JSON: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+        Err(e) => Err(format!("could not read settings at {}: {e}", path.display())),
     }
+}
+
+/// The same read, for callers that cannot do anything about a failure.
+fn load_settings(app: &tauri::AppHandle) -> serde_json::Value {
+    read_settings(app).unwrap_or_else(|e| {
+        eprintln!("nexllama: {e}");
+        serde_json::json!({})
+    })
 }
 
 /// Write the settings file atomically.
@@ -1488,7 +1482,9 @@ fn write_settings(app: &tauri::AppHandle, settings: &serde_json::Value) -> Resul
 
 #[tauri::command]
 fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    let mut settings = load_settings(&app);
+    // Strict on purpose: the page reads this before writing the file back, so a
+    // failure here has to reach the page instead of looking like "no settings".
+    let mut settings = read_settings(&app)?;
     // The token is not in the file, but the UI still has to show and copy it.
     if let Some(obj) = settings.as_object_mut() {
         obj.insert(

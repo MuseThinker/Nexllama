@@ -34,6 +34,10 @@ const advDefaults = {
   // Reuse the KV of a shared prefix across turns. On by default (verified by
   // prefix_check); ignored while a drafter is loaded.
   prefixCache: true,
+  // Reload a resident model by itself when a load setting changes and the model
+  // is idle. Off by default: a reload stops the model for the better part of a
+  // minute, so it is a choice, not a surprise.
+  autoApplyLoad: false,
   // Let a reasoning model think before answering. On by default; off makes the
   // reply start on the answer. A per-model setting, applied to every chat with
   // this model unless a request names its own.
@@ -549,6 +553,34 @@ function reloadModel(m) {
     mtp: m.info?.mtp === true,
   });
 }
+
+// Auto-apply, when the user asked for it.
+//
+// The rules are deliberately conservative: never while a reply is streaming,
+// never while the page is busy with another load, and only once per distinct
+// change set — a reload that fails (out of memory, say) must not turn into a
+// loop that keeps trying.
+let autoApplyTimer;
+let autoApplied = '';
+
+$effect(() => {
+  if (adv.autoApplyLoad !== true) return;
+  if (busy !== '' || tune.busy) return;
+  for (const m of status.models ?? []) {
+    if (m.cloud || m.loaded === false || !m.config) continue;
+    const pending = pendingLoadChanges(m);
+    if (pending.length === 0) continue;
+    // A model that answered a request in the last few seconds is in use; a
+    // reload would cut the next turn off mid-flight.
+    if ((m.idle_secs ?? 0) < 5) return;
+    const signature = `${m.id}:${pending.join(',')}`;
+    if (signature === autoApplied) return;
+    autoApplied = signature;
+    clearTimeout(autoApplyTimer);
+    autoApplyTimer = setTimeout(() => reloadModel(m), 1200);
+    return;
+  }
+});
 
 /// Remember the local models that are loaded, so a restart (or an update) brings
 /// the same ones back up. Clearing the last one clears the list.
@@ -1485,6 +1517,10 @@ async function saveCloud(silent) {
         <label class="checkline" title={$t('settings.prefixCacheHint')}>
           <input type="checkbox" bind:checked={adv.prefixCache} />
           <span>{$t('settings.prefixCache')}</span>
+        </label>
+        <label class="checkline" title={$t('models.autoApplyHint')}>
+          <input type="checkbox" bind:checked={adv.autoApplyLoad} />
+          <span>{$t('models.autoApply')}</span>
         </label>
       </div>
     </details>

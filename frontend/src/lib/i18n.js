@@ -122,6 +122,12 @@ const dict = {
     'models.advanced': '高级参数',
     'models.advancedHint':
       '这里的设置在下次加载模型时生效；已经在运行的模型不会自动应用。',
+    'models.autoApply': '改动后自动重新加载',
+    'models.autoApplyHint':
+      '开启后，加载类设置变更且模型空闲 5 秒以上时，自动按新设置重新加载。正在生成回复时不会打断。',
+    'models.autoApply': 'Reload automatically when these change',
+    'models.autoApplyHint':
+      'When a load setting changes and the model has been idle for five seconds, reload it with the new settings. A reply that is streaming is never interrupted.',
     'models.pendingApply': '待应用',
     'models.reload': '重新加载',
     'models.pendingApply': 'changes pending',
