@@ -66,6 +66,15 @@ scripts\package.ps1 -Edition full|lite|both    # default full
   so they are built against a baseline, not the build host's ISA.
 - Default backends are `cpu` + `cuda`, plus `vulkan` **when a Vulkan SDK is
   found**. When none is found the AMD/Intel path silently uses CPU.
+- A backend folder left by an earlier build is **deleted** before packaging:
+  `tauri.conf.json` bundles `backends/**/*`, so a stale one would ship old code
+  under a new version number.
+- Two environment variables are needed on this machine and are not set for you:
+  `LIBCLANG_PATH` (bindgen; `C:\Program Files\LLVM\bin` does not exist here, use
+  the Python `clang\native` folder) and `TAURI_SIGNING_PRIVATE_KEY` (updater
+  signature, `~/.tauri/nexllama.key`, empty password). Without the first the
+  daemon build fails in `llama-cpp-sys`; without the second `tauri build` fails
+  after makensis has already written the installer.
 
 ## Vulkan SDK (for the `vulkan` backend)
 

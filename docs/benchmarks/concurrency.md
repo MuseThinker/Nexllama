@@ -65,6 +65,23 @@ people at a time, or **eight slots without it** when more people share the
 machine and the aggregate matters more than any one reply. Above eight slots the
 VRAM budget (21.4 GB with MTP at eight) leaves nothing for the desktop.
 
+## Turning it on in the app
+
+Settings → **Server mode** (服务端模式) starts the daemon with a `llama-server` it
+hosts itself:
+
+- It needs a `llama-server.exe`. The installer does not bundle one; the setting
+  takes a path, and a build placed beside the backend's `infer-daemon.exe` is
+  found without one. When neither exists the page says so and the switch has no
+  effect.
+- **Concurrent slots** is `--parallel`. The context setting is the whole pool,
+  so each conversation gets it divided by the slot count.
+- The switch applies on the next daemon start, so restart the service after
+  changing it. Loading a model then starts the server, and `/admin/status` lists
+  it with its port and slot count; unloading stops it and frees the card.
+- Loading a speech, embedding or reranking model is refused while server mode is
+  on: one `llama-server` serves one chat model at a time.
+
 ## Reproducing it
 
 ```powershell

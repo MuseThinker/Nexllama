@@ -505,6 +505,10 @@ genuine ambiguity is refused, and the error names the candidates:
 - **GPU configuration without guesswork.** Settings reports the detected adapter, the
   backend that would be selected and the backend in use, and installs a missing backend
   on request.
+- **Server mode for several people at once.** The daemon can host a `llama-server` and
+  answer concurrent requests from several slots instead of queueing them; the slot count
+  is set in Settings. It needs a `llama-server.exe`, which the installer does not bundle
+  yet, so the setting takes a path — or finds one placed beside the backend.
 
 ---
 
