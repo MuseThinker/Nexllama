@@ -128,6 +128,8 @@ const dict = {
     'models.autoApply': 'Reload automatically when these change',
     'models.autoApplyHint':
       'When a load setting changes and the model has been idle for five seconds, reload it with the new settings. A reply that is streaming is never interrupted.',
+    'models.serverBadge': '服务端',
+    'models.serverBadge': 'server',
     'models.pendingApply': '待应用',
     'models.reload': '重新加载',
     'models.pendingApply': 'changes pending',
@@ -314,6 +316,20 @@ const dict = {
     'settings.hfUpstream': 'HuggingFace 官方',
     'settings.hfCustom': '自定义地址',
     'settings.hfEndpoint': '自定义地址',
+    'settings.serverMode': '服务端模式（多人并发）',
+    'settings.serverModeHint':
+      '让服务托管一个 llama-server，用多个槽位同时服务多人。需要 llama-server.exe；改完需重启服务。',
+    'settings.serverParallel': '并发槽位',
+    'settings.serverExe': 'llama-server 路径',
+    'settings.serverModeNote':
+      '槽位越多，每人分到的速度越低、总吞吐越高。本机 24 GB 卡实测四个槽位是平衡点（见 docs/benchmarks/concurrency.md）。',
+    'settings.serverMode': 'Server mode (several people at once)',
+    'settings.serverModeHint':
+      'Host a llama-server and serve several people from multiple slots. Needs llama-server.exe; restart the service after changing this.',
+    'settings.serverParallel': 'Concurrent slots',
+    'settings.serverExe': 'llama-server path',
+    'settings.serverModeNote':
+      'More slots means a slower reply each and more throughput overall. On a 24 GB card four slots is the balance point (see docs/benchmarks/concurrency.md).',
     'settings.hfHint':
       '自动模式先连 huggingface.co，连不上或中途断开时改用 hf-mirror.com。如果官方能连但下载很慢，直接选 HF-Mirror。',
     'settings.hfSource': 'Model download source',

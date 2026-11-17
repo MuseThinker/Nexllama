@@ -26,7 +26,16 @@ pub struct ServerProc {
     pub parallel: u32,
     pub n_ctx: u32,
     pub n_gpu_layers: u32,
+    /// Projector this server was started with, so the model entry can say
+    /// whether it can see or hear.
+    pub mmproj: Option<PathBuf>,
 }
+
+/// The daemon keeps this in shared state, so it has to cross threads.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<ServerProc>();
+};
 
 impl ServerProc {
     /// Start a server for `cfg` on `port` and wait until it answers `/health`.
@@ -64,6 +73,7 @@ impl ServerProc {
             parallel,
             n_ctx: cfg.n_ctx,
             n_gpu_layers: cfg.n_gpu_layers,
+            mmproj: cfg.mmproj.clone(),
         };
         proc.wait_ready().await?;
         Ok(proc)

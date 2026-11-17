@@ -1545,6 +1545,11 @@ async function saveCloud(silent) {
                 <span class="badge">MTP</span>
               {/if}
               {#if m.mmproj}<span class="badge" title={m.mmproj}>mmproj</span>{/if}
+              {#if m.server}
+                <span class="badge api" title={m.server.base}>
+                  {$t('models.serverBadge')} :{m.server.port} × {m.server.parallel}
+                </span>
+              {/if}
               {#if m.prefix_cache === false}
                 <span class="badge warn" title={$t('models.prefixOffHint')}>
                   {$t('models.prefixOff')}
@@ -1582,7 +1587,7 @@ async function saveCloud(silent) {
                 {$t('models.reload')}
               </button>
             {/if}
-            {#if m.info?.model_class === 'llm' && !(m.info?.audio && !m.info?.vision)}
+            {#if m.info?.model_class === 'llm' && !(m.info?.audio && !m.info?.vision) && !m.server}
               <button
                 class="ghost"
                 onclick={(e) => toggleTuneMenu(e, m)}

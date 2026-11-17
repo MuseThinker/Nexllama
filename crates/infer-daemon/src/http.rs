@@ -455,6 +455,54 @@ async fn health(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
+/// A hosted llama-server, shaped like a resident model.
+///
+/// The status list, the chat picker and the model card all read the same shape,
+/// so a server that answers the same API needs no special case in the UI.
+fn server_entry(p: &crate::server_mode::ServerProc) -> serde_json::Value {
+    let class = infer_core::model_class_of(&p.model_path);
+    let (vision, audio) = match p.mmproj.as_deref() {
+        Some(mmproj) => (
+            infer_core::mmproj_has_vision(mmproj),
+            infer_core::mmproj_has_audio(mmproj),
+        ),
+        None => (false, false),
+    };
+    json!({
+        "id": p.model_id,
+        "path": p.model_path,
+        "info": {
+            "model_class": class,
+            "vision": vision,
+            "audio": audio,
+            "mtp": infer_core::has_mtp(&p.model_path),
+            "n_ctx": p.n_ctx,
+            "n_ctx_train": p.n_ctx,
+            "pooling": "none",
+            "mmproj_path": p.mmproj.as_ref().map(|m| m.display().to_string()),
+            "description": p.model_id,
+        },
+        "n_gpu_layers": p.n_gpu_layers,
+        "n_ctx": p.n_ctx,
+        "n_cpu_moe": 0,
+        "moe_cache_mib": 0,
+        "prefix_cache": false,
+        "load_mtp": false,
+        "mmproj": p.mmproj.as_ref().map(|m| m.display().to_string()),
+        "draft_model": serde_json::Value::Null,
+        "loras": [],
+        "loaded_secs_ago": 0,
+        "idle_secs": 0,
+        "perf": serde_json::Value::Null,
+        "loaded": true,
+        "server": {
+            "port": p.port(),
+            "parallel": p.parallel,
+            "base": p.base(),
+        },
+    })
+}
+
 async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let guard = state.inner.lock().await;
     let mut models: Vec<serde_json::Value> = guard
@@ -548,25 +596,46 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
     // set so the UI can tell them from the local ones. The `auto` alias is
     // deliberately *not* here: it is an API-side routing policy, not a model to
     // pick from the library or the chat dropdown.
-    let providers = state
-        .cloud
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for p in providers.iter() {
-        for m in &p.models {
-            models.push(json!({
-                "id": format!("{}/{}", p.id, m),
-                "info": { "model_class": "llm" },
-                "cloud": true,
-                "provider": p.name,
-                "loaded": true,
-            }));
+    //
+    // Scoped: this is a `std` read guard, which is not `Send`, and the hosted
+    // server's lock below is awaited.
+    {
+        let providers = state
+            .cloud
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for p in providers.iter() {
+            for m in &p.models {
+                models.push(json!({
+                    "id": format!("{}/{}", p.id, m),
+                    "info": { "model_class": "llm" },
+                    "cloud": true,
+                    "provider": p.name,
+                    "loaded": true,
+                }));
+            }
+        }
+    }
+    // The hosted server is listed with the same shape, but its lock must not be
+    // taken while the model lock is held: that guard is not `Send`, and holding
+    // it across an await would also block every request behind this one.
+    let default_model = guard.default_model.clone();
+    let keep_alive_secs = guard.keep_alive.as_secs();
+    drop(guard);
+    {
+        let mut server = state.server.lock().await;
+        if let Some(p) = server.as_mut() {
+            if p.is_alive() {
+                models.push(server_entry(p));
+            } else {
+                *server = None;
+            }
         }
     }
     Json(json!({
         "models": models,
-        "default_model": guard.default_model,
-        "keep_alive_secs": guard.keep_alive.as_secs(),
+        "default_model": default_model,
+        "keep_alive_secs": keep_alive_secs,
     }))
 }
 
@@ -1591,6 +1660,37 @@ async fn load(
         let _ = tokio::task::spawn_blocking(move || drop(old)).await;
     }
 
+    // Server mode: this daemon hosts a llama-server instead of decoding here.
+    // Same request and the same response shape, so the UI needs no second path.
+    if let Some(exe) = state.server_exe.clone() {
+        if inbound_class != "llm" {
+            return Err(ApiError::BadRequest(
+                "server mode serves one chat model at a time; stop it before loading a speech, \
+                 embedding or reranking model"
+                    .into(),
+            ));
+        }
+        let port = free_port()?;
+        let proc = crate::server_mode::ServerProc::spawn(
+            &exe,
+            &cfg,
+            id.clone(),
+            port,
+            state.server_parallel,
+        )
+        .await
+        .map_err(ApiError::Model)?;
+        let entry = server_entry(&proc);
+        *state.server.lock().await = Some(proc);
+        return Ok(Json(json!({
+            "status": "ok",
+            "id": id,
+            "info": entry["info"],
+            "notes": notes,
+            "server": entry,
+        })));
+    }
+
     // Measured before anything is displaced: refusing a load must not cost the
     // caller the model that is already serving. A measurement that fails is
     // advisory too — `fit.rs` documents "never refuses a model on its own" and
@@ -2584,6 +2684,22 @@ async fn unload(
         }
     };
     let n = removed.len() + forgotten.len() + speech.len();
+    // A hosted llama-server answers the same unload: naming it (or asking for
+    // everything) stops the child, which is what frees the card.
+    let stopped_server = {
+        let mut server = state.server.lock().await;
+        let matches = match server.as_ref() {
+            Some(p) => req.model.as_deref().is_none_or(|id| id == p.model_id),
+            None => false,
+        };
+        if matches {
+            *server = None;
+            true
+        } else {
+            false
+        }
+    };
+    let n = n + usize::from(stopped_server);
     // The worker owns the TTS weights; killing it is what frees that VRAM.
     if !speech.is_empty() {
         state.tts_worker.stop().await;

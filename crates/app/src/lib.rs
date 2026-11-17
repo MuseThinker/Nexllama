@@ -265,6 +265,28 @@ fn normalize_endpoint(raw: &str) -> Option<String> {
     Some(candidate)
 }
 
+/// The `llama-server` this daemon should host, if any.
+///
+/// A packaged backend keeps one beside the daemon; `serverExe` overrides it for
+/// a build that does not ship the binary. Neither present means server mode
+/// cannot start, and the daemon says so over `/admin/server` rather than
+/// pretending the model is the problem.
+fn server_exe(daemon: &Path, settings: &serde_json::Value) -> Option<PathBuf> {
+    if let Some(path) = settings
+        .get("serverExe")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let beside = daemon.parent()?.join("llama-server.exe");
+    beside.is_file().then_some(beside)
+}
+
 /// Credential-store account for a cloud provider's key.
 ///
 /// One entry per provider, so removing a provider does not disturb the others.
@@ -998,6 +1020,26 @@ fn try_spawn_backend(
     let workdir = bin.parent().map(|p| p.to_path_buf());
 
     let mut cmd = Command::new(&bin);
+
+    // Server mode: host a llama-server beside the daemon so several people can
+    // be served at once. The binary is looked for in the backend folder first
+    // (where a packaged build would put it) and in settings second, so a
+    // development build can point at the one it compiled.
+    if settings
+        .get("serverMode")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        if let Some(server) = server_exe(&bin, settings) {
+            cmd.arg("--server-exe").arg(server);
+            let parallel = settings
+                .get("serverParallel")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4)
+                .clamp(1, 32);
+            cmd.arg("--server-parallel").arg(parallel.to_string());
+        }
+    }
     if let Some(dir) = workdir {
         cmd.current_dir(dir);
     }

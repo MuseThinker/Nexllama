@@ -57,6 +57,16 @@ pub fn mmproj_has_audio(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this projector can see, read from its header.
+///
+/// The counterpart of [`mmproj_has_audio`]: a bundle is described by the file
+/// beside it, not by the model weights, and that is true before any load.
+pub fn mmproj_has_vision(path: &std::path::Path) -> bool {
+    gguf_probe::probe(path)
+        .map(|probed| probed.vision_encoder)
+        .unwrap_or(false)
+}
+
 /// Transformer layer count, when the GGUF header states it.
 pub fn layer_count(path: &std::path::Path) -> Option<u32> {
     gguf_probe::probe(path)

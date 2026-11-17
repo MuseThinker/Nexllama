@@ -41,6 +41,11 @@ const defaults = {
   // one host; `custom` uses `hfEndpoint` as given.
   hfSource: 'auto',
   hfEndpoint: '',
+  // Host a llama-server beside the daemon so several people can be served at
+  // once. Off by default: it changes how every chat request is answered.
+  serverMode: false,
+  serverParallel: 4,
+  serverExe: '',
   apiKey: '',
 };
 
@@ -191,6 +196,9 @@ const OWNED = [
   'port',
   'hfSource',
   'hfEndpoint',
+  'serverMode',
+  'serverParallel',
+  'serverExe',
   'apiKey',
 ];
 
@@ -529,6 +537,26 @@ onMount(() => {
       </label>
     {/if}
     <p class="muted">{$t('settings.hfHint')}</p>
+    <label class="checkline" title={$t('settings.serverModeHint')}>
+      <input type="checkbox" bind:checked={settings.serverMode} />
+      <span>{$t('settings.serverMode')}</span>
+    </label>
+    {#if settings.serverMode}
+      <label class="field">
+        <span>{$t('settings.serverParallel')}</span>
+        <input type="number" min="1" max="32" bind:value={settings.serverParallel} />
+      </label>
+      <label class="field">
+        <span>{$t('settings.serverExe')}</span>
+        <input
+          type="text"
+          bind:value={settings.serverExe}
+          placeholder="llama-server.exe"
+          spellcheck="false"
+        />
+      </label>
+      <p class="muted">{$t('settings.serverModeNote')}</p>
+    {/if}
     <div class="restart-row">
       <p class="muted">{$t('settings.networkRestart')}</p>
       <button
