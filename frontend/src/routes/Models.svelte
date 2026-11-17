@@ -475,6 +475,81 @@ async function loadBundle(b) {
   }
 }
 
+// What a load bakes in. Everything else on this page is per request, so a
+// change to it needs no reload.
+const LOAD_FIELDS = [
+  ['nGpuLayers', 'n_gpu_layers', Number],
+  ['nCtx', 'n_ctx', Number],
+  ['nBatch', 'n_batch', Number],
+  ['nUbatch', 'n_ubatch', Number],
+  ['mainGpu', 'main_gpu', Number],
+  ['threads', 'n_threads', (v) => Number(v) || null],
+  ['threadsBatch', 'n_threads_batch', (v) => Number(v) || null],
+  ['loadMode', 'load_mode', String],
+  ['useMlock', 'use_mlock', (v) => v === true],
+  ['flashAttn', 'flash_attn', String],
+  ['kvCache', 'cache_type_k', String],
+  ['offloadKqv', 'offload_kqv', (v) => v !== false],
+  ['ropeFreqBase', 'rope_freq_base', Number],
+  ['ropeFreqScale', 'rope_freq_scale', Number],
+  ['prefixCache', 'prefix_cache', (v) => v !== false],
+];
+
+// So the marker can name what is waiting instead of only counting it.
+const LOAD_LABELS = {
+  nGpuLayers: 'models.gpuLayers',
+  nCtx: 'models.context',
+  nBatch: 'settings.nBatch',
+  nUbatch: 'settings.nUbatch',
+  mainGpu: 'settings.mainGpu',
+  threads: 'settings.threads',
+  threadsBatch: 'settings.threadsBatch',
+  loadMode: 'settings.loadMode',
+  useMlock: 'settings.useMlock',
+  flashAttn: 'settings.flashAttn',
+  kvCache: 'settings.kvCache',
+  offloadKqv: 'settings.offloadKqv',
+  ropeFreqBase: 'settings.ropeFreqBase',
+  ropeFreqScale: 'settings.ropeFreqScale',
+  prefixCache: 'settings.prefixCache',
+};
+
+/// The settings that differ between this page and the running instance.
+///
+/// The daemon reports what it loaded; a change to any of these takes effect on
+/// the next load only. Naming them on the card is what turns "I changed it and
+/// nothing happened" into one click.
+function pendingLoadChanges(m) {
+  const cfg = m?.config;
+  if (!cfg) return [];
+  const out = [];
+  for (const [ui, key, norm] of LOAD_FIELDS) {
+    // 0 asks the daemon to size the context, so the value it resolved to is
+    // not something the user changed.
+    if (ui === 'nCtx' && !Number(adv.nCtx)) continue;
+    const mine = norm(adv[ui]);
+    const theirs = cfg[key];
+    const differs =
+      typeof mine === 'number' || typeof theirs === 'number'
+        ? Number(mine) !== Number(theirs)
+        : mine !== theirs;
+    if (differs) out.push($t(LOAD_LABELS[ui]));
+  }
+  return out;
+}
+
+/// Reload a resident model with the settings currently on this page.
+function reloadModel(m) {
+  if (!m?.path) return;
+  loadBundle({
+    name: m.id,
+    main: m.path,
+    projector: m.mmproj ?? null,
+    draft: m.draft_model ?? null,
+    mtp: m.info?.mtp === true,
+  });
+}
+
 /// Remember the local models that are loaded, so a restart (or an update) brings
 /// the same ones back up. Clearing the last one clears the list.
 async function persistAutoLoad() {
@@ -1360,7 +1435,7 @@ async function saveCloud(silent) {
             <option value="none">none</option>
             <option value="mlock">mlock</option>
             <option value="mmap_mlock">mmap_mlock</option>
-            <option value="dio">dio</option>
+            <option value="direct_io">dio</option>
           </select>
         </label>
         <label class="field">
@@ -1439,6 +1514,11 @@ async function saveCloud(silent) {
                   {$t('models.prefixOff')}
                 </span>
               {/if}
+              {#if pendingLoadChanges(m).length > 0}
+                <span class="badge warn" title={pendingLoadChanges(m).join(' · ')}>
+                  {$t('models.pendingApply')}
+                </span>
+              {/if}
               {#if m.n_cpu_moe > 0}
                 <span class="badge" title={$t('models.cpuExperts', { n: m.n_cpu_moe })}>
                   CPU {m.n_cpu_moe}L
@@ -1461,6 +1541,11 @@ async function saveCloud(silent) {
                 ctx {m.n_ctx} · GPU {m.n_gpu_layers} · {$t('models.idle')} {m.idle_secs}s
               {/if}
             </span>
+            {#if pendingLoadChanges(m).length > 0}
+              <button class="ghost" onclick={() => reloadModel(m)} disabled={busy !== ''}>
+                {$t('models.reload')}
+              </button>
+            {/if}
             {#if m.info?.model_class === 'llm' && !(m.info?.audio && !m.info?.vision)}
               <button
                 class="ghost"

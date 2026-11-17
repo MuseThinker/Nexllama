@@ -472,6 +472,10 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
                 "n_cpu_moe": l.config.n_cpu_moe,
                 "moe_cache_mib": l.config.moe_cache_mib,
                 "prefix_cache": l.config.prefix_cache,
+                // The whole load configuration, in the same vocabulary the load
+                // endpoint accepts, so a client can tell what is running from
+                // what the settings page would load next.
+                "config": l.config,
                 "load_mtp": l.load_mtp,
                 "mmproj": l.mmproj,
                 "draft_model": l.draft_model,
@@ -495,6 +499,7 @@ async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
             "n_cpu_moe": d.config.n_cpu_moe,
             "moe_cache_mib": d.config.moe_cache_mib,
             "prefix_cache": d.config.prefix_cache,
+            "config": d.config,
             "load_mtp": d.load_mtp,
             "mmproj": d.mmproj,
             "draft_model": d.draft_model,

@@ -122,6 +122,10 @@ const dict = {
     'models.advanced': '高级参数',
     'models.advancedHint':
       '这里的设置在下次加载模型时生效；已经在运行的模型不会自动应用。',
+    'models.pendingApply': '待应用',
+    'models.reload': '重新加载',
+    'models.pendingApply': 'changes pending',
+    'models.reload': 'Reload',
     'models.prefixOff': '前缀未复用',
     'models.prefixOffHint':
       '当前实例没有启用已编码前缀复用，每轮都会重新 prefill 整段对话。钩选「复用已编码前缀」后重新加载模型即可。',
