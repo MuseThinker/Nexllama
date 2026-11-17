@@ -47,12 +47,12 @@ Nexllama 是一个能自动适配硬件的一体化本地推理桌面与 API 网
 
 | 安装包 | 体积 | 适用机器 |
 |---|---|---|
-| **标准版** [`Nexllama_0.2.2_x64-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.2/Nexllama_0.2.2_x64-setup.exe) | ~497 MB | **首选。** 自带可移植的 CPU 后端和 NVIDIA CUDA 运行库（`cudart64`、`cublas64`、`cublasLt64`），不需要预装任何东西。有 N 卡就走 GPU，没有就自动用 CPU——新机器、笔记本、不确定装没装 CUDA 的机器，都选它。 |
-| **精简版** [`Nexllama_0.2.2_x64-lite-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.2/Nexllama_0.2.2_x64-lite-setup.exe) | ~145 MB | 只适合**已经装好 CUDA 运行库**的机器，通常是开发机。它省掉三个 NVIDIA DLL，其中 `cublasLt64_13.dll` 单个就有 428 MB。**新机器或没装过 CUDA 的机器请用标准版**：缺运行库时 CUDA 后端起不来，只能退回 CPU（能用，但慢得多）。 |
+| **标准版** [`Nexllama_0.2.3_x64-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.3/Nexllama_0.2.3_x64-setup.exe) | ~497 MB | **首选。** 自带可移植的 CPU 后端和 NVIDIA CUDA 运行库（`cudart64`、`cublas64`、`cublasLt64`），不需要预装任何东西。有 N 卡就走 GPU，没有就自动用 CPU——新机器、笔记本、不确定装没装 CUDA 的机器，都选它。 |
+| **精简版** [`Nexllama_0.2.3_x64-lite-setup.exe`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.3/Nexllama_0.2.3_x64-lite-setup.exe) | ~145 MB | 只适合**已经装好 CUDA 运行库**的机器，通常是开发机。它省掉三个 NVIDIA DLL，其中 `cublasLt64_13.dll` 单个就有 428 MB。**新机器或没装过 CUDA 的机器请用标准版**：缺运行库时 CUDA 后端起不来，只能退回 CPU（能用，但慢得多）。 |
 
 两个安装包的产品名、安装目录与开机启动项一致，装另一个会直接覆盖，不会留下两份。
 
-安装包没有代码签名，Windows 可能提示“未知发布者”。请点 **更多信息 → 仍要运行**，并用 [`SHA256SUMS.txt`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.2/SHA256SUMS.txt) 校验下载内容。
+安装包没有代码签名，Windows 可能提示“未知发布者”。请点 **更多信息 → 仍要运行**，并用 [`SHA256SUMS.txt`](https://github.com/MuseThinker/Nexllama/releases/download/v0.2.3/SHA256SUMS.txt) 校验下载内容。
 
 运行安装程序，打开 Nexllama。首次启动时，应用会根据本机硬件选择后端，并在 `http://127.0.0.1:15656` 启动守护进程。
 
@@ -128,8 +128,8 @@ npm --prefix frontend install
 .\scripts\package.ps1                 # 标准版：cpu + cuda + 英伟达运行库
 .\scripts\package.ps1 -Edition lite   # 精简版：不打包英伟达运行库
 .\scripts\package.ps1 -Edition both   # 两者都出，只编译一次守护进程
-# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.2_x64-setup.exe
-# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.2_x64-lite-setup.exe
+# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.3_x64-setup.exe
+# -> crates\app\target\release\bundle\nsis\Nexllama_0.2.3_x64-lite-setup.exe
 ```
 
 `-Native` 会把构建机的指令集编进去——CPU 推理更快，但产物只能在同款或同代 CPU 上运行。个人自用无所谓，要发给别人就别加。
