@@ -56,6 +56,23 @@ impl ServerProc {
         cmd.args(server_args(cfg, port, parallel))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // A packaged server lives in `<backend>/server/` with its own llama and
+        // ggml DLLs, while the CUDA runtime sits one level up in `<backend>/`.
+        // Windows only searches the executable's own directory, so the parent is
+        // added to PATH or the CUDA build cannot find cudart/cublas.
+        if let Some(dir) = exe.parent() {
+            let mut dirs: Vec<PathBuf> = vec![dir.to_path_buf()];
+            if let Some(parent) = dir.parent() {
+                dirs.push(parent.to_path_buf());
+            }
+            if let Some(existing) = std::env::var_os("PATH") {
+                dirs.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(joined) = std::env::join_paths(dirs) {
+                cmd.env("PATH", joined);
+            }
+            cmd.current_dir(dir);
+        }
         // No console window: this is spawned by a service, not by a shell.
         #[cfg(windows)]
         {

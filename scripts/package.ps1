@@ -137,6 +137,32 @@ function Publish-Installer {
     Write-Host "installer: $($final.FullName) ($([math]::Round($final.Length/1MB,2)) MiB)"
 }
 
+# `llama-server` is a separate build from the same llama.cpp tree (see AGENTS.md):
+# the crate's copy has tools/server stripped, so it cannot come out of the daemon
+# build. It is far too big to keep in the repository, so packaging picks it up
+# from $env:NEXLLAMA_LLAMA_SERVER_DIR\<backend> when that is set. Without it the
+# installer still works, and Settings says server mode has no binary rather than
+# leaving a switch that silently does nothing.
+function Restore-ServerStage {
+    param([string]$Backend)
+    $dst = Join-Path $root "crates\app\backends\$Backend\server"
+    $srcRoot = $env:NEXLLAMA_LLAMA_SERVER_DIR
+    if (-not $srcRoot) {
+        Write-Host "warning: NEXLLAMA_LLAMA_SERVER_DIR is not set - server mode will be unavailable in this build"
+        return
+    }
+    $src = Join-Path $srcRoot $Backend
+    if (-not (Test-Path -LiteralPath (Join-Path $src "llama-server.exe"))) {
+        Write-Host "warning: no llama-server.exe under $src - server mode will be unavailable in this build"
+        return
+    }
+    if (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Copy-Item -Path (Join-Path $src "*") -Destination $dst -Recurse -Force
+    $mb = [math]::Round(((Get-ChildItem -LiteralPath $dst -File | Measure-Object Length -Sum).Sum / 1MB), 1)
+    Write-Host "server: staged llama-server for $Backend ($mb MiB)"
+}
+
 # One daemon build per backend. The lite edition only changes what is *staged*
 # beside it, so both editions come out of this same build.
 foreach ($backend in $Backends) {
@@ -145,6 +171,8 @@ foreach ($backend in $Backends) {
     if (-not $Debug) { $daemonArgs.Release = $true }
     & (Join-Path $PSScriptRoot "build-daemon.ps1") @daemonArgs
     if ($LASTEXITCODE -ne 0) { throw "daemon build failed for $backend" }
+    # build-daemon.ps1 recreates the folder, so this has to run after it.
+    Restore-ServerStage -Backend $backend
 }
 
 # build-daemon.ps1 sets CARGO_TARGET_DIR per backend; clear it so the desktop app
@@ -174,6 +202,8 @@ foreach ($want in $editions) {
             Write-Host "== edition: full (restaging the cuda runtime)"
             & (Join-Path $PSScriptRoot "build-daemon.ps1") -Backend cuda -Release:(-not $Debug) -Native:$Native
             if ($LASTEXITCODE -ne 0) { throw "daemon restage failed for cuda" }
+            # Restaging wipes the folder, including the server stage.
+            Restore-ServerStage -Backend cuda
         } else {
             Write-Host "== edition: full"
         }

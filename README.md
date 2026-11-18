@@ -507,8 +507,8 @@ genuine ambiguity is refused, and the error names the candidates:
   on request.
 - **Server mode for several people at once.** The daemon can host a `llama-server` and
   answer concurrent requests from several slots instead of queueing them; the slot count
-  is set in Settings. It needs a `llama-server.exe`, which the installer does not bundle
-  yet, so the setting takes a path — or finds one placed beside the backend.
+  is set in Settings. The installer ships one for the CPU and CUDA backends; a build of
+  your own can be pointed at in Settings instead.
 
 ---
 

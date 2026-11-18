@@ -110,6 +110,43 @@ installed GPU driver and is not redistributed. If the SDK directory is cleared,
 it must be reassembled from Vulkan-Headers, SPIRV-Headers, and MSYS2
 `shaderc`/`glslang`/`spirv-tools` packages.
 
+## Server mode (`llama-server`)
+
+The daemon can host a `llama-server` child and forward `/v1/*` to it, which is
+what several people sharing one card need. The binary is **not** built by the
+daemon build: `llama-cpp-sys-4` ships a llama.cpp copy with `tools/server`
+stripped, so it comes from the full tree at the commit the crate pins.
+
+```powershell
+# Build both variants from the full source tree (see docs/benchmarks/concurrency.md
+# for where the tree comes from). GGML_NATIVE=OFF matters: the CPU fallback inside
+# a CUDA build must not be compiled for the build host's ISA.
+cmake -S <llama.cpp> -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release `
+    -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=ON -DGGML_CUDA=OFF `
+    -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=OFF `
+    -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_CURL=OFF
+cmake --build build-cpu --target llama-server -j 20
+```
+
+`llama-server` is a shared-library build, so the exe is a thin launcher: it needs
+its own `llama*.dll` / `ggml*.dll` / `mtmd*.dll`. Those go into
+`crates/app/backends/<backend>/server/` — **never** flat in the backend folder,
+where they would collide with the daemon's copies of the same names (different
+CMake runs). The daemon adds the parent folder to the child's `PATH` so the CUDA
+runtime in `<backend>/` resolves.
+
+Packaging picks the stage up from a directory tree:
+
+```powershell
+scripts\stage-llama-server.ps1 -Backend cuda -From <llama.cpp>\build-cuda\bin
+$env:NEXLLAMA_LLAMA_SERVER_DIR = "D:\builds\llama-server"   # cpu\ and cuda\ inside
+scripts\package.ps1 -Edition both
+```
+
+`package.ps1` warns when the variable is unset: the installer then ships without
+server mode, and Settings reports that no binary was found instead of leaving a
+switch that does nothing.
+
 ## Never commit
 
 `crates/app/backends/`, `target/`, `frontend/dist/`, `models/`, and any

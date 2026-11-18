@@ -317,9 +317,9 @@ const dict = {
     'settings.hfCustom': '自定义地址',
     'settings.hfEndpoint': '自定义地址',
     'settings.serverNoExe':
-      '未找到 llama-server.exe：这个安装包没有附带，请在上面填路径，或把它放进后端目录。',
+      '未找到 llama-server.exe：请确认后端目录下的 server 文件夹完整，或在上面填写路径。',
     'settings.serverNoExe':
-      'No llama-server.exe found: this installer does not include one. Set the path above, or put the binary in the backend folder.',
+      'No llama-server.exe found: check that the server folder beside the backend is intact, or set the path above.',
     'settings.serverMode': '服务端模式（多人并发）',
     'settings.serverModeHint':
       '让服务托管一个 llama-server，用多个槽位同时服务多人。需要 llama-server.exe；改完需重启服务。',

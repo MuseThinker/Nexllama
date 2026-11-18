@@ -278,10 +278,12 @@ fn server_exe_path(app: &tauri::AppHandle, backend: &str) -> Option<String> {
 
 /// The `llama-server` this daemon should host, if any.
 ///
-/// A packaged backend keeps one beside the daemon; `serverExe` overrides it for
-/// a build that does not ship the binary. Neither present means server mode
-/// cannot start, and the daemon says so over `/admin/server` rather than
-/// pretending the model is the problem.
+/// A packaged backend keeps one in a `server` folder beside the daemon, with its
+/// own copies of the llama/ggml libraries: shipping it flat would mean the
+/// server and the daemon overwrite each other's DLLs, and they are built by
+/// different CMake runs. `serverExe` overrides both for a build that ships
+/// neither. Nothing found means server mode cannot start, and the daemon says so
+/// over `/admin/server` rather than pretending the model is the problem.
 fn server_exe(daemon: &Path, settings: &serde_json::Value) -> Option<PathBuf> {
     if let Some(path) = settings
         .get("serverExe")
@@ -294,8 +296,10 @@ fn server_exe(daemon: &Path, settings: &serde_json::Value) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let beside = daemon.parent()?.join("llama-server.exe");
-    beside.is_file().then_some(beside)
+    let dir = daemon.parent()?;
+    [dir.join("server").join("llama-server.exe"), dir.join("llama-server.exe")]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
 }
 
 /// Credential-store account for a cloud provider's key.
@@ -2774,6 +2778,42 @@ mod tests {
         assert_eq!(cloud_secret("probe-test").as_deref(), Some("hello-123"));
         store_cloud_secret("probe-test", "").expect("clear");
         assert!(cloud_secret("probe-test").is_none());
+    }
+
+    /// The server binary is looked for in the packaged layout first: a `server`
+    /// folder beside the daemon, then flat beside it, and only then whatever the
+    /// user pointed at in settings.
+    #[test]
+    fn the_server_binary_is_found_in_the_packaged_layout() {
+        let root = std::env::temp_dir().join(format!("nexllama-server-exe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let backend = root.join("cuda");
+        std::fs::create_dir_all(backend.join("server")).expect("mkdir");
+        std::fs::write(backend.join("infer-daemon.exe"), b"stub").expect("daemon");
+        let nested = backend.join("server").join("llama-server.exe");
+        std::fs::write(&nested, b"stub").expect("server");
+
+        let daemon = backend.join("infer-daemon.exe");
+        let none = serde_json::json!({});
+        assert_eq!(server_exe(&daemon, &none).as_deref(), Some(nested.as_path()));
+
+        // A flat copy is still accepted, for a hand-assembled build.
+        std::fs::remove_dir_all(backend.join("server")).expect("rm");
+        let flat = backend.join("llama-server.exe");
+        std::fs::write(&flat, b"stub").expect("flat");
+        assert_eq!(server_exe(&daemon, &none).as_deref(), Some(flat.as_path()));
+
+        // Settings win over both, when the path exists.
+        let custom = root.join("my-server.exe");
+        std::fs::write(&custom, b"stub").expect("custom");
+        let pointed = serde_json::json!({ "serverExe": custom.display().to_string() });
+        assert_eq!(server_exe(&daemon, &pointed).as_deref(), Some(custom.as_path()));
+
+        // Nothing installed, nothing pointed at: no server, and the UI says so.
+        let _ = std::fs::remove_file(&flat);
+        let _ = std::fs::remove_file(&custom);
+        assert!(server_exe(&daemon, &none).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A port the app cannot interpret must not leave it unable to reach its own

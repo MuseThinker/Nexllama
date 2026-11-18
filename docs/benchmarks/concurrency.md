@@ -70,9 +70,9 @@ VRAM budget (21.4 GB with MTP at eight) leaves nothing for the desktop.
 Settings → **Server mode** (服务端模式) starts the daemon with a `llama-server` it
 hosts itself:
 
-- It needs a `llama-server.exe`. The installer does not bundle one; the setting
-  takes a path, and a build placed beside the backend's `infer-daemon.exe` is
-  found without one. When neither exists the page says so and the switch has no
+- It needs a `llama-server.exe`. The installer ships one for the CPU and CUDA
+  backends, in `backends/<backend>/server/`; the setting still takes a path for a
+  build of your own. When neither is found the page says so and the switch has no
   effect.
 - **Concurrent slots** is `--parallel`. The context setting is the whole pool,
   so each conversation gets it divided by the slot count.
