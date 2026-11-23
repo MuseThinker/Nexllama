@@ -126,6 +126,15 @@ pub fn router(
         .route("/admin/server", get(server_status))
         .route("/admin/server/start", post(server_start))
         .route("/admin/server/stop", post(server_stop))
+        // Forwarding sits *inside* the key check. As an outer layer it proxied
+        // `/v1/*` before `require_key` ran, so a hosted llama-server answered
+        // anyone who could reach the port — the one thing the token exists to
+        // prevent. `route_layer` applies the last call outermost, so the token
+        // is checked first and only then is the request handed over.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            forward_to_server,
+        ))
         .route_layer(middleware::from_fn_with_state(api_key, require_key));
 
     let api = Router::new()
@@ -150,12 +159,6 @@ pub fn router(
         // 2 MB default — below a real audio upload, and `Multipart` is an
         // extractor. Both limits have to be raised.
         .layer(axum::extract::DefaultBodyLimit::max(limits::BODY_BYTES))
-        // A hosted llama-server takes `/v1/*` while it runs; everything else
-        // (admin, the UI, speech) stays with this process.
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            forward_to_server,
-        ))
         .with_state(state)
 }
 
@@ -318,6 +321,13 @@ async fn require_key(State(key): State<ApiKey>, request: Request, next: Next) ->
     let Some(expected) = key else {
         return next.run(request).await;
     };
+
+    // A CORS preflight never carries credentials, and it has to reach the CORS
+    // layer to be answered. Rejecting it here would break every cross-origin
+    // browser client that does send a token on the real request.
+    if request.method() == Method::OPTIONS {
+        return next.run(request).await;
+    }
 
     let presented = request
         .headers()
@@ -4442,6 +4452,72 @@ mod tests {
         assert_eq!(
             status_of(Some("secret"), "/v1/models", None).await,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// Server mode must not be a hole in the token check.
+    ///
+    /// Forwarding `/v1/*` used to be the outermost layer, so it proxied to the
+    /// hosted `llama-server` before `require_key` ran — a daemon listening on
+    /// 0.0.0.0 answered anyone who could reach the port, which is exactly what
+    /// the token exists to prevent. The stand-in upstream here answers 200 for
+    /// every path, so a 401 can only come from the key check.
+    #[tokio::test]
+    async fn server_mode_still_requires_the_token() {
+        use crate::server_mode::ServerProc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a stand-in upstream");
+        let port = listener.local_addr().expect("addr").port();
+        let upstream = Router::new().fallback(|| async { Json(json!({ "ok": true })) });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+
+        // Any child that stays alive for the length of the test will do: the
+        // only thing the middleware asks is `is_alive()`.
+        #[cfg(windows)]
+        let child = std::process::Command::new("cmd")
+            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("dummy child");
+        #[cfg(unix)]
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("dummy child");
+
+        let state = AppState::new(Duration::from_secs(0), LoadConfig::new(""));
+        *state.server.lock().await = Some(ServerProc::for_test(child, port));
+        let app = router(state, Some(Arc::new("secret".to_string())), Vec::new(), None);
+
+        let unauth = app
+            .clone()
+            .oneshot(probe("/v1/models", None))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            unauth,
+            StatusCode::UNAUTHORIZED,
+            "server mode must not bypass the token"
+        );
+
+        let authed = app
+            .clone()
+            .oneshot(probe("/v1/models", Some("secret")))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            authed,
+            StatusCode::OK,
+            "with the token, the request must still reach the hosted server"
         );
     }
 

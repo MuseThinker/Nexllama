@@ -142,6 +142,24 @@ impl Drop for ServerProc {
     }
 }
 
+#[cfg(test)]
+impl ServerProc {
+    /// A stand-in for a running server, so the HTTP layer can be tested without
+    /// a real `llama-server` on the other end.
+    pub(crate) fn for_test(child: Child, port: u16) -> Self {
+        Self {
+            child,
+            port,
+            model_id: "test-model".into(),
+            model_path: PathBuf::from("C:/models/test.gguf"),
+            parallel: 1,
+            n_ctx: 2048,
+            n_gpu_layers: 0,
+            mmproj: None,
+        }
+    }
+}
+
 /// Translate a load configuration into `llama-server` arguments.
 ///
 /// Every flag here is one the tuning sweep also measures, so a translation that
