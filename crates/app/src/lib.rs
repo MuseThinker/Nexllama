@@ -1108,6 +1108,16 @@ fn try_spawn_backend(
     if let Some(key) = api_key(settings) {
         cmd.env("NEXLLAMA_API_KEY", key);
     }
+    // A token guards the network, not this machine: loopback callers (including
+    // `host.docker.internal`, which Docker Desktop proxies over loopback) are
+    // answered without it. This switch puts the machine behind the token too.
+    if settings
+        .get("localTokenRequired")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        cmd.arg("--require-token-local");
+    }
     // Where the hub client downloads from. `auto` leaves the variable unset so
     // the client keeps its own probe (official first, mirror when the
     // connection fails); the other choices pin one host, which is the only way

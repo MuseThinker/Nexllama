@@ -367,6 +367,13 @@ pub struct AppState {
     /// know *whether* it is up and where, and must not wait for a model load to
     /// find that out.
     pub server: Arc<tokio::sync::Mutex<Option<crate::server_mode::ServerProc>>>,
+    /// Whether a loopback caller must present the token too.
+    ///
+    /// Off by default: the token exists to keep the *network* out, and a local
+    /// process that can already read the model files is not the threat it
+    /// guards against. `host.docker.internal` counts as local, because Docker
+    /// Desktop proxies container traffic over loopback.
+    pub require_token_local: bool,
 }
 
 impl AppState {
@@ -394,6 +401,7 @@ impl AppState {
             server_exe: None,
             server_parallel: 4,
             server: Arc::new(tokio::sync::Mutex::new(None)),
+            require_token_local: false,
             inner: Arc::new(Mutex::new(DaemonState {
                 models: HashMap::new(),
                 tts: HashMap::new(),
@@ -431,6 +439,12 @@ impl AppState {
     pub fn with_server(mut self, exe: Option<PathBuf>, parallel: u32) -> Self {
         self.server_exe = exe;
         self.server_parallel = parallel.max(1);
+        self
+    }
+
+    /// Make loopback callers present the token as well.
+    pub fn with_require_token_local(mut self, required: bool) -> Self {
+        self.require_token_local = required;
         self
     }
 

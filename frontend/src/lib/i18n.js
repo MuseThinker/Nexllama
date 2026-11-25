@@ -303,6 +303,12 @@ const dict = {
     'settings.copy': '复制',
     'settings.copied': '已复制',
     'settings.clear': '清除',
+    'settings.localToken': '本机调用也校验令牌',
+    'settings.localTokenHint':
+      '默认令牌只保护网络：本机与 host.docker.internal 的调用不需要令牌。勾选后本机也必须带令牌。',
+    'settings.localToken': 'Require the token locally too',
+    'settings.localTokenHint':
+      'By default the token guards the network only: calls from this machine and from host.docker.internal do not need it. Tick this to require it there as well.',
     'settings.apiKeyHint':
       '客户端需带请求头 Authorization: Bearer <令牌>。留空则不校验；重新生成后，已连接的客户端需同步更新。',
     'settings.exposedNoKey':

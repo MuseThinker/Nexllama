@@ -400,6 +400,8 @@ can load models and spend GPU time on them. Pass --api-key <token>, bind to
 
 `--allow-unauthenticated` 是给那些自己会做认证的容器或反向代理用的；把 `--api-key ""` 传空是错误，而不是悄悄关掉认证的办法。应用把 token 存在操作系统的凭据库里，再通过 `NEXLLAMA_API_KEY` 交给守护进程，所以它既不出现在设置文件旁边，也不出现在进程命令行里。跨域请求只对应用自己的源应答；要加别的源，用 `--cors-origin <origin>`。
 
+token 保护的是**网络**，不是这台机器：从回环地址进来的请求不需要 token，所以本机的工具、以及容器里的 `host.docker.internal`（Docker Desktop 会把它代理成回环连接）都能直接调用，不用配 token。如果连本机进程也要校验，加 `--require-token-local`（设置 → *网络* → “本机调用也校验令牌”）。
+
 图片输入只允许 `data:` URL；应用的能力清单除 `opener:default` 外不授予任何权限。
 
 ---

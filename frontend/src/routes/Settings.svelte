@@ -47,6 +47,9 @@ const defaults = {
   serverParallel: 4,
   serverExe: '',
   apiKey: '',
+  // A token guards the network; local calls (including host.docker.internal)
+  // are answered without it unless this is on.
+  localTokenRequired: false,
 };
 
 function local() {
@@ -200,6 +203,7 @@ const OWNED = [
   'serverParallel',
   'serverExe',
   'apiKey',
+  'localTokenRequired',
 ];
 
 /// This page's own fields, layered onto whatever is on disk right now.
@@ -515,6 +519,12 @@ onMount(() => {
           <code>http://&lt;本机局域网 IP&gt;:{daemonInfo.port}/v1/chat/completions</code>
         </p>
       {/if}
+    {/if}
+    {#if settings.apiKey.trim()}
+      <label class="checkline" title={$t('settings.localTokenHint')}>
+        <input type="checkbox" bind:checked={settings.localTokenRequired} />
+        <span>{$t('settings.localToken')}</span>
+      </label>
     {/if}
     <label class="field">
       <span>{$t('settings.hfSource')}</span>

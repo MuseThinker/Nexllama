@@ -609,6 +609,13 @@ can load models and spend GPU time on them. Pass --api-key <token>, bind to
 127.0.0.1, or pass --allow-unauthenticated if something else guards the port
 ```
 
+The token guards the **network**, not the machine: a request that arrives over
+loopback is answered without it, so tools on the same machine — and containers
+calling `host.docker.internal`, which Docker Desktop proxies over a loopback
+connection — work without configuring a token. Pass `--require-token-local`
+(Settings → *Network* → "Require the token locally too") when even local
+processes must present it.
+
 `--allow-unauthenticated` exists for a container or reverse proxy that authenticates
 callers itself; an empty `--api-key ""` is an error rather than a quiet way to disable
 authentication. The application stores its token in the operating system's credential

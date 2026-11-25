@@ -38,6 +38,17 @@ struct Args {
     #[arg(long)]
     api_key: Option<String>,
 
+    /// Check the token for local callers too.
+    ///
+    /// By default a token guards the network, not the machine: a request that
+    /// arrives over loopback is answered without it, the way a local tool
+    /// would be. `host.docker.internal` counts as local — Docker Desktop
+    /// proxies container traffic through a loopback connection, so a container
+    /// calling the host is exempt as well. Pass this when even processes on
+    /// this machine must present the token.
+    #[arg(long, default_value_t = false)]
+    require_token_local: bool,
+
     /// Run on a routable interface without a token.
     ///
     /// The server has no accounts, no rate limit and no quota, so anyone who
@@ -324,7 +335,8 @@ async fn main() -> anyhow::Result<()> {
         .with_models_dir(args.models_dir.clone())
         .with_tts_bin(resolve_tts_bin(args.tts_bin.clone()))
         .with_tts_worker_bin(resolve_tts_worker_bin(args.tts_worker_bin.clone()))
-        .with_server(args.server_exe.clone(), args.server_parallel);
+        .with_server(args.server_exe.clone(), args.server_parallel)
+        .with_require_token_local(args.require_token_local);
 
     let mut first = true;
     for (i, model) in args.model.iter().enumerate() {
@@ -536,9 +548,16 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("infer-daemon listening on http://{addr}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Connect info is what lets the token check tell "this machine" from "the
+    // network": a loopback peer is exempt unless `--require-token-local` was
+    // asked for, which is how a container calling `host.docker.internal` gets
+    // in without the token while a browser on the LAN still has to present it.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }

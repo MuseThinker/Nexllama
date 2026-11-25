@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path as AxumPath, Request, State};
+use axum::extract::{ConnectInfo, Path as AxumPath, Request, State};
 use axum::http::{header, header::AUTHORIZATION, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -135,7 +135,10 @@ pub fn router(
             state.clone(),
             forward_to_server,
         ))
-        .route_layer(middleware::from_fn_with_state(api_key, require_key));
+        .route_layer(middleware::from_fn_with_state(
+            (api_key, state.require_token_local),
+            require_key,
+        ));
 
     let api = Router::new()
         .route("/openapi.json", get(openapi))
@@ -317,7 +320,33 @@ async fn ollama_tags(State(state): State<AppState>) -> Json<serde_json::Value> {
 /// it has no accounts of its own, so the token is the only thing standing
 /// between a stranger and someone's GPU. `/health` stays open for readiness
 /// probes; it exposes loaded model names and nothing more.
-async fn require_key(State(key): State<ApiKey>, request: Request, next: Next) -> Response {
+/// Whether the request came in over loopback.
+///
+/// `ConnectInfo` exists only when the server was started with
+/// `into_make_service_with_connect_info`, which `main` does. A request that
+/// carries no peer address (a test, or an embedding) is treated as remote —
+/// the safe answer.
+fn is_loopback_peer(request: &Request) -> bool {
+    request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().is_loopback())
+        .unwrap_or(false)
+}
+
+/// Reject a request that does not carry the configured token.
+///
+/// The token guards the *network*. A caller on this machine is answered without
+/// it unless `--require-token-local` was passed: a local process can already
+/// read the model files, and every local-first tool behaves this way. Docker
+/// Desktop proxies container traffic to the host over a loopback connection, so
+/// `host.docker.internal` arrives here as `127.0.0.1` and is covered too — while
+/// a browser on the LAN is not.
+async fn require_key(
+    State((key, require_local)): State<(ApiKey, bool)>,
+    request: Request,
+    next: Next,
+) -> Response {
     let Some(expected) = key else {
         return next.run(request).await;
     };
@@ -326,6 +355,10 @@ async fn require_key(State(key): State<ApiKey>, request: Request, next: Next) ->
     // layer to be answered. Rejecting it here would break every cross-origin
     // browser client that does send a token on the real request.
     if request.method() == Method::OPTIONS {
+        return next.run(request).await;
+    }
+
+    if !require_local && is_loopback_peer(&request) {
         return next.run(request).await;
     }
 
@@ -4494,7 +4527,12 @@ mod tests {
 
         let state = AppState::new(Duration::from_secs(0), LoadConfig::new(""));
         *state.server.lock().await = Some(ServerProc::for_test(child, port));
-        let app = router(state, Some(Arc::new("secret".to_string())), Vec::new(), None);
+        let app = router(
+            state,
+            Some(Arc::new("secret".to_string())),
+            Vec::new(),
+            None,
+        );
 
         let unauth = app
             .clone()
@@ -4544,6 +4582,84 @@ mod tests {
             status_of(Some("secret"), "/health", None).await,
             StatusCode::OK
         );
+    }
+
+    fn app_with_auth(key: Option<&str>, require_local: bool) -> Router {
+        let state = AppState::new(Duration::from_secs(0), LoadConfig::new(""))
+            .with_require_token_local(require_local);
+        router(
+            state,
+            key.map(|k| Arc::new(k.to_string())),
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// The same request with a peer address attached, the way `axum::serve`
+    /// does it through `ConnectInfo`.
+    fn probe_from(path: &str, token: Option<&str>, peer: &str) -> TestRequest {
+        let mut req = probe(path, token);
+        let addr: std::net::SocketAddr = peer.parse().expect("valid peer address");
+        req.extensions_mut().insert(ConnectInfo(addr));
+        req
+    }
+
+    /// A token guards the network, not the machine: a loopback caller is
+    /// answered without it. `host.docker.internal` lands here as loopback —
+    /// Docker Desktop proxies container traffic through one — so a container
+    /// calling the host works without the token too.
+    #[tokio::test]
+    async fn loopback_callers_skip_the_token() {
+        let app = app_with_auth(Some("secret"), false);
+
+        for peer in ["127.0.0.1:5000", "[::1]:5000"] {
+            let status = app
+                .clone()
+                .oneshot(probe_from("/v1/models", None, peer))
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(status, StatusCode::OK, "{peer} is this machine");
+        }
+
+        // The network still has to present it.
+        let status = app
+            .clone()
+            .oneshot(probe_from("/v1/models", None, "192.168.1.9:5000"))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let status = app
+            .clone()
+            .oneshot(probe_from("/v1/models", Some("secret"), "192.168.1.9:5000"))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// `--require-token-local` puts the machine behind the token as well.
+    #[tokio::test]
+    async fn require_token_local_checks_loopback_too() {
+        let app = app_with_auth(Some("secret"), true);
+
+        let unauth = app
+            .clone()
+            .oneshot(probe_from("/v1/models", None, "127.0.0.1:5000"))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(unauth, StatusCode::UNAUTHORIZED);
+
+        let authed = app
+            .clone()
+            .oneshot(probe_from("/v1/models", Some("secret"), "127.0.0.1:5000"))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(authed, StatusCode::OK);
     }
 
     #[tokio::test]
